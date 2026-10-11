@@ -1669,6 +1669,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.kv_unified_reserve = std::max(0, value);
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED_RESERVE").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    // [TAG_REQUEST_PRIORITY]
+    add_opt(common_arg(
+        { "--priority-trickle-ms" }, "N",
+        string_format(
+            "requests carry a \"priority\" (low, default, high, xhigh). while an xhigh request is processed, running requests of a\n"
+            "lower level are held. a held request that is generating still joins one pass every N ms, shared by all held ones,\n"
+            "so its client keeps seeing progress (default: %d, 0 = held requests get no pass until the xhigh request is done)",
+            params.priority_trickle_ms),
+        [](common_params & params, int value) {
+            params.priority_trickle_ms = std::max(0, value);
+        }
+    ).set_env("LLAMA_ARG_PRIORITY_TRICKLE_MS").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         { "--shared-pass" },
         { "--no-shared-pass" },

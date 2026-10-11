@@ -85,6 +85,7 @@ json task_params::to_json(bool only_metrics) const {
             {"adaptive_target",           sampling.adaptive_target},
             {"adaptive_decay",            sampling.adaptive_decay},
             {"max_tokens",                n_predict},
+            {"priority",                  server_task_priority_name(priority)}, // [TAG_REQUEST_PRIORITY]
             {"n_predict",                 n_predict}, // TODO: deduplicate?
             {"n_keep",                    n_keep},
             {"n_discard",                 n_discard},
@@ -139,6 +140,7 @@ json task_params::to_json(bool only_metrics) const {
         {"adaptive_decay",            sampling.adaptive_decay},
         {"stop",                      antiprompt},
         {"max_tokens",                n_predict},
+        {"priority",                  server_task_priority_name(priority)},
         {"n_predict",                 n_predict}, // TODO: deduplicate?
         {"n_keep",                    n_keep},
         {"n_discard",                 n_discard},

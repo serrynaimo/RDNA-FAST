@@ -354,6 +354,37 @@ struct server_slot {
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
 
+    // [TAG_REQUEST_PRIORITY] held = left out of the passes while an xhigh request is processed
+    bool    held         = false;
+    int64_t t_hold_start = 0; // ms, start of the current stretch
+    int64_t t_held_ms    = 0; // finished stretches
+    int32_t n_trickle    = 0; // passes taken while held
+
+    int32_t priority() const {
+        return task ? task->params.priority : (int32_t) SERVER_TASK_PRIORITY_DEFAULT;
+    }
+
+    void hold_set(bool hold, int64_t t_now_ms) {
+        if (hold == held) {
+            return;
+        }
+        held = hold;
+        if (hold) {
+            t_hold_start = t_now_ms;
+            SLT_INF(*this, "held: an xhigh request is being processed (this one is %s and %s)\n",
+                    server_task_priority_name(priority()),
+                    state == SLOT_STATE_GENERATING ? "generating" : "reading its prompt");
+        } else {
+            t_held_ms += t_now_ms - t_hold_start;
+            SLT_INF(*this, "resumes after %.1f s on hold, %d trickle passes so far\n",
+                    1e-3 * (double) (t_now_ms - t_hold_start), n_trickle);
+        }
+    }
+
+    int64_t held_ms(int64_t t_now_ms) const {
+        return t_held_ms + (held ? t_now_ms - t_hold_start : 0);
+    }
+
     // this is for printing timings with slot progress, not part of metrics
     int64_t t_print_last = 0;
     int32_t n_gen_last = 0;
@@ -387,6 +418,12 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+
+        // [TAG_REQUEST_PRIORITY]
+        held         = false;
+        t_hold_start = 0;
+        t_held_ms    = 0;
+        n_trickle    = 0;
 
         n_predict_max = -1;
 
@@ -664,6 +701,13 @@ struct server_slot {
                 "   graphs reused = %10d\n",
                 llama_perf_context(ctx_tgt).n_reused);
 
+        // [TAG_REQUEST_PRIORITY]
+        if (held_ms(ggml_time_ms()) > 0 || n_trickle > 0) {
+            SLT_INF(*this,
+                    "         on hold = %10.2f ms behind xhigh requests, %d trickle passes\n",
+                    (double) held_ms(ggml_time_ms()), n_trickle);
+        }
+
         const int32_t n_draft_total       = stats.n_draft_tokens;
         const int32_t n_draft_accepted    = stats.n_draft_accepted;
         const int32_t n_draft_verif_steps = stats.n_draft_verif_steps;
@@ -700,6 +744,8 @@ struct server_slot {
             {"n_ctx",         n_ctx},
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
+            {"priority",      server_task_priority_name(priority())}, // [TAG_REQUEST_PRIORITY]
+            {"is_held",       held},
         };
 
         const auto & ptask = task ? task : task_prev;
@@ -1371,6 +1417,17 @@ private:
             slots.emplace_back();
         }
 
+        // [TAG_REQUEST_PRIORITY]
+        if (params_base.priority_trickle_ms > 0) {
+            SRV_INF("request priority: low / default / high order the waiting requests, xhigh also holds running lower ones "
+                    "(a held request that generates joins one pass every %d ms)%s\n", params_base.priority_trickle_ms,
+                    params_base.n_parallel > 1 ? ", low leaves one slot free" : "");
+        } else {
+            SRV_INF("request priority: low / default / high order the waiting requests, xhigh also holds running lower ones "
+                    "until it is done (--priority-trickle-ms 0)%s\n",
+                    params_base.n_parallel > 1 ? ", low leaves one slot free" : "");
+        }
+
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
@@ -1416,7 +1473,11 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
-                queue_tasks.pop_deferred_task(id_slot);
+                // [TAG_REQUEST_PRIORITY] the highest level first, then by arrival; a low request stays
+                // where it is while starting it would take the last free slot
+                queue_tasks.pop_deferred_task(id_slot, [this](const server_task & task) {
+                    return priority_low_must_wait(task) ? -1 : task.params.priority - SERVER_TASK_PRIORITY_LOW;
+                });
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
@@ -1762,6 +1823,35 @@ private:
 
     int32_t kv_pool_reserve(const server_slot & slot) const {
         return kv_pool_reserve(slot.n_predict_max == -1 ? -1 : std::max(0, slot.n_remaining()));
+    }
+
+    // [TAG_REQUEST_PRIORITY] a low request leaves one slot free: it starts only while another slot stays idle
+    // afterwards, so a request of any other level finds a slot at once. With a single slot it starts whenever
+    // that slot is free.
+    bool priority_low_must_wait(const server_task & task) const {
+        if (task.params.priority > SERVER_TASK_PRIORITY_LOW || slots.size() < 2) {
+            return false;
+        }
+
+        switch (task.type) {
+            case SERVER_TASK_TYPE_COMPLETION:
+            case SERVER_TASK_TYPE_INFILL:
+            case SERVER_TASK_TYPE_EMBEDDING:
+            case SERVER_TASK_TYPE_RERANK:
+                break;
+            default:
+                return false;
+        }
+
+        size_t n_free = 0;
+        for (const auto & slot : slots) {
+            if (!slot.is_processing()) {
+                n_free++;
+            }
+        }
+
+        // the task and its children, plus the one that stays free
+        return n_free < task.child_tasks.size() + 2;
     }
 
     // true if the task has to wait: it does not fit into the pool beside the requests that are running
@@ -2264,7 +2354,8 @@ private:
         // reset server kill-switch counter
         n_empty_consecutive = 0;
 
-        SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
+        SLT_INF(slot, "processing task, is_child = %d, priority = %s\n", slot.task->is_child(),
+                server_task_priority_name(slot.priority())); // [TAG_REQUEST_PRIORITY]
         return true;
     }
 
@@ -3014,6 +3105,13 @@ private:
 
                     const int id_task = task.id;
 
+                    // [TAG_REQUEST_PRIORITY]
+                    if (priority_low_must_wait(task)) {
+                        SRV_INF("low priority request waits until one more slot is free, id_task = %d\n", id_task);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
                     // [TAG_KV_POOL] checked before a slot is picked: picking one already saves,
                     // restores and clears prompt cache state for the task
                     if (kv_pool_must_wait(task)) {
@@ -3414,6 +3512,10 @@ private:
     int64_t n_prof_tokens = 0; // tokens in the target batches
     const bool prof_on = getenv("LLAMA_DECODE_PROFILE") != nullptr && atoi(getenv("LLAMA_DECODE_PROFILE")) > 0;
 
+    // [TAG_REQUEST_PRIORITY]
+    bool    priority_hold_active  = false; // an xhigh request was being processed in the last pass
+    int64_t t_priority_trickle_ms = 0;     // last pass that held requests joined
+
     struct scoped_timer {
         int64_t * t = nullptr;
         int64_t * n = nullptr;
@@ -3616,6 +3718,37 @@ private:
         // start populating the batch for this iteration
         batch.clear();
 
+        // [TAG_REQUEST_PRIORITY] while an xhigh request is processed, the requests below xhigh are held: they keep
+        // their slot, their context and their connection and sit the passes out. Held requests that generate join
+        // one pass per --priority-trickle-ms, all of them the same pass, so their clients keep seeing progress and
+        // the cost for the xhigh request does not grow with the number of slots. A held request that still reads
+        // its prompt waits: one prompt batch would stall the xhigh request for a full pass, and its client sees no
+        // output in that phase anyway.
+        bool hold_trickle = false; // held requests that generate join this pass
+        const int64_t t_hold_now = ggml_time_ms();
+        {
+            bool hold_active = false;
+            for (const auto & slot : slots) {
+                if (slot.is_processing() && slot.priority() >= SERVER_TASK_PRIORITY_XHIGH) {
+                    hold_active = true;
+                    break;
+                }
+            }
+
+            if (hold_active && !priority_hold_active) {
+                // the xhigh request gets the first interval to itself
+                t_priority_trickle_ms = t_hold_now;
+            }
+            priority_hold_active = hold_active;
+
+            hold_trickle = hold_active && params_base.priority_trickle_ms > 0 &&
+                    t_hold_now - t_priority_trickle_ms >= params_base.priority_trickle_ms;
+
+            for (auto & slot : slots) {
+                slot.hold_set(hold_active && slot.is_processing() && slot.priority() < SERVER_TASK_PRIORITY_XHIGH, t_hold_now);
+            }
+        }
+
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
 
@@ -3626,6 +3759,15 @@ private:
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
                 return;
+            }
+
+            // [TAG_REQUEST_PRIORITY] a held request sits this pass out, unless it is the trickle pass
+            if (slot.held) {
+                if (!hold_trickle) {
+                    return;
+                }
+                slot.n_trickle++;
+                t_priority_trickle_ms = t_hold_now;
             }
 
             // check if we can batch this slot with the previous one
@@ -3780,6 +3922,11 @@ private:
                 }
 
                 if (!slot.is_processing()) {
+                    return;
+                }
+
+                // [TAG_REQUEST_PRIORITY] a held request does not read its prompt
+                if (slot.held && slot.state != SLOT_STATE_GENERATING) {
                     return;
                 }
 
@@ -5056,7 +5203,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     {
         const int n_max_queued = server_max_queued();
         if (n_max_queued > 0) {
-            const size_t n_queued = queue_tasks.queue_tasks_deferred_size();
+            // [TAG_REQUEST_PRIORITY] waiting requests of a lower level do not count: this one overtakes them
+            int32_t priority = SERVER_TASK_PRIORITY_DEFAULT;
+            if (data.contains("priority") && data.at("priority").is_string()) {
+                server_task_priority_from_name(data.at("priority").get<std::string>(), priority);
+            }
+            const size_t n_queued = queue_tasks.queue_tasks_deferred_count([priority](const server_task & task) {
+                return task.params.priority >= priority;
+            });
             if ((int) n_queued >= n_max_queued) {
                 SRV_WRN("rejecting request: %zu already queued (limit %d)\n", n_queued, n_max_queued);
                 res->error(format_error_response(

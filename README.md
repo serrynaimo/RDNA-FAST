@@ -31,6 +31,7 @@ GPU, ideal for Hermes.
 - **Vision** through the f16 `mmproj`, including after a cache restore.
 - **A decision classifier on the same port**: typed yes/no, choice and score
   answers with calibrated probabilities, from a small model on the CPU.
+- **Agent based `"priority"` request flag for maximum responsiveness.** [More](#request-priority)
 - **Fails fast when busy.** `LLAMA_MAX_QUEUED=n` rejects requests once `n` are
   already waiting, so a client can fall back to another server.
 
@@ -227,6 +228,30 @@ Each flag also reads `LLAMA_ARG_CACHE_DISK[_...]` from the environment.
   cache break: set its compaction trigger well below the context size.
   Auxiliary calls (titles, summaries, vision) take the slot too; the cache
   makes that cheap, not free.
+
+## Request priority
+
+Every request can carry `"priority"` in its body, so the agent you are talking
+to does not wait behind background work. A request without it is `default`.
+
+| `"priority"` | waiting for a slot | while it runs |
+|---|---|---|
+| `low` | behind everything else | always leaves one slot free: it starts only while another slot stays idle (with one slot it simply waits its turn) |
+| `default` | ahead of `low` | shares the card with whatever else runs |
+| `high` | ahead of `default` and `low` | shares the card with whatever else runs |
+| `xhigh` | at the front | requests of a lower level are held until it is done |
+
+A held request keeps its slot, its context and its connection. If it is
+generating it still joins one pass every 2 s (`--priority-trickle-ms`, shared
+by all held requests, `0` = none), so its client keeps seeing progress; if it
+is still reading its prompt it waits. Nothing is cancelled or restarted, and
+at temperature 0 the held request ends with the same text as an undisturbed
+one. With `LLAMA_MAX_QUEUED`, waiting requests of a lower level do not count
+against a new one.
+
+With an agent framework, set it per agent, e.g. in Hermes through
+`extra_body: {priority: xhigh}` in the provider entry of the agent you talk
+to. Tested with 1 to 4 slots: queue order, the free slot, hold and trickle.
 
 ## Decision classifier
 

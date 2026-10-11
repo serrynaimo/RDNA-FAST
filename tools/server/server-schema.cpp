@@ -41,6 +41,16 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(-1, INT32_MAX)
         ->set_desc("Interval in seconds between SSE comment pings emitted while the stream stays silent, -1 disables pings"));
 
+    // [TAG_REQUEST_PRIORITY]
+    add((new field_str("priority"))
+        ->set_desc("Scheduling level of the request: low, default, high or xhigh. Waiting requests start in this order; xhigh also holds running requests of a lower level; low leaves one slot free")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            if (!data.at("priority").is_string() ||
+                    !server_task_priority_from_name(data.at("priority").get<std::string>(), ctx.params.priority)) {
+                throw std::invalid_argument("priority must be one of: low, default, high, xhigh");
+            }
+        }));
+
     add((new field_num("n_predict", params.n_predict))
         ->set_hard_limits(-1, INT32_MAX)
         ->add_alias("max_completion_tokens")

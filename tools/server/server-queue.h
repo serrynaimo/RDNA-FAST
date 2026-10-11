@@ -65,6 +65,10 @@ public:
     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
     void pop_deferred_task(int id_slot);
 
+    // [TAG_REQUEST_PRIORITY] the same, but the waiting task with the highest rank moves (rank < 0: it keeps waiting).
+    // Equal ranks: a task that asked for this slot first, then the oldest. rank() must not call into the queue.
+    void pop_deferred_task(int id_slot, const std::function<int(const server_task &)> & rank);
+
     // if sleeping, request exiting sleep state and wait until it is done
     // returns immediately if not sleeping
     void wait_until_no_sleep();
@@ -107,6 +111,18 @@ public:
     size_t queue_tasks_deferred_size() {
         std::unique_lock<std::mutex> lock(mutex_tasks);
         return queue_tasks_deferred.size();
+    }
+
+    // [TAG_REQUEST_PRIORITY] number of waiting tasks that match
+    size_t queue_tasks_deferred_count(const std::function<bool(const server_task &)> & match) {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        size_t n = 0;
+        for (const auto & task : queue_tasks_deferred) {
+            if (match(task)) {
+                n++;
+            }
+        }
+        return n;
     }
 
     //

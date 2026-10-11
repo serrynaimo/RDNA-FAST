@@ -112,6 +112,36 @@ void server_queue::pop_deferred_task(int id_slot) {
     condition_tasks.notify_one();
 }
 
+// [TAG_REQUEST_PRIORITY]
+void server_queue::pop_deferred_task(int id_slot, const std::function<int(const server_task &)> & rank) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    auto best      = queue_tasks_deferred.end();
+    int  best_rank = -1;
+    for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ++it) {
+        const int r = rank(*it);
+        if (r < 0) {
+            continue; // not now, e.g. a low request while only one slot is free
+        }
+        bool better = best == queue_tasks_deferred.end() || r > best_rank;
+        if (!better && r == best_rank) {
+            const bool wants_slot      = it->id_slot   == id_slot;
+            const bool best_wants_slot = best->id_slot == id_slot;
+            better = wants_slot != best_wants_slot ? wants_slot : it->id < best->id;
+        }
+        if (better) {
+            best      = it;
+            best_rank = r;
+        }
+    }
+    if (best != queue_tasks_deferred.end()) {
+        QUE_DBG("pop deferred task (rank %d), id_task = %d\n", best_rank, best->id);
+        queue_tasks.emplace_front(std::move(*best));
+        queue_tasks_deferred.erase(best);
+    }
+    time_last_task = ggml_time_ms();
+    condition_tasks.notify_one();
+}
+
 void server_queue::wait_until_no_sleep() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     if (!sleeping) {

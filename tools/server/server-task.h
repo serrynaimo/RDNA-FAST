@@ -48,6 +48,35 @@ enum stop_type {
     STOP_TYPE_LIMIT,
 };
 
+// [TAG_REQUEST_PRIORITY] scheduling level of a request, set with "priority" in the request body.
+//   low, default, high   order the requests that wait for a slot (higher first, then by arrival)
+//   xhigh                also holds running requests of a lower level while it is processed
+//   low                  leaves one slot free: it starts only while another slot stays idle
+// A request without the field is "default".
+enum server_task_priority {
+    SERVER_TASK_PRIORITY_LOW     = -1,
+    SERVER_TASK_PRIORITY_DEFAULT =  0,
+    SERVER_TASK_PRIORITY_HIGH    =  1,
+    SERVER_TASK_PRIORITY_XHIGH   =  2,
+};
+
+inline const char * server_task_priority_name(int priority) {
+    switch (priority) {
+        case SERVER_TASK_PRIORITY_LOW:   return "low";
+        case SERVER_TASK_PRIORITY_HIGH:  return "high";
+        case SERVER_TASK_PRIORITY_XHIGH: return "xhigh";
+        default:                         return "default";
+    }
+}
+
+inline bool server_task_priority_from_name(const std::string & name, int32_t & priority) {
+    if (name == "low")     { priority = SERVER_TASK_PRIORITY_LOW;     return true; }
+    if (name == "default") { priority = SERVER_TASK_PRIORITY_DEFAULT; return true; }
+    if (name == "high")    { priority = SERVER_TASK_PRIORITY_HIGH;    return true; }
+    if (name == "xhigh")   { priority = SERVER_TASK_PRIORITY_XHIGH;   return true; }
+    return false;
+}
+
 struct task_params {
     bool stream          = false;
     bool include_usage   = false;
@@ -56,6 +85,8 @@ struct task_params {
     bool return_progress = false;
 
     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
+
+    int32_t priority = SERVER_TASK_PRIORITY_DEFAULT; // [TAG_REQUEST_PRIORITY]
 
     int32_t n_keep    =  0; // number of tokens to keep from initial prompt
     int32_t n_discard =  0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
