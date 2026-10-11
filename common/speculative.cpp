@@ -2004,6 +2004,8 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
 struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
     // n_seq configs
     std::vector<common_ngram_map> config;
+    // [TAG_NGRAM_MAP_SWITCH] per sequence: the tokens its map was built from (the prompt and what followed)
+    std::vector<llama_tokens> seen;
 
     common_speculative_impl_ngram_map_k(
             const common_ngram_map & config,
@@ -2014,6 +2016,7 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
         for (uint32_t i = 0; i < n_seq; i++) {
             this->config.push_back(config);
         }
+        seen.resize(n_seq);
 
         SPC_TRC("adding speculative implementation '%s'\n", common_speculative_type_to_str(this->type).c_str());
         SPC_TRC("- size_key=%d, size_value=%d, key_only=%d, min_hits=%d\n",
@@ -2022,6 +2025,24 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         GGML_ASSERT(seq_id < (llama_seq_id) n_seq);
+
+        // [TAG_NGRAM_MAP_SWITCH] The map stores token positions and is only told the new length, so it takes every
+        // position below that length as unchanged. On a slot that changes conversation it then kept the entries of the
+        // old conversation and never indexed the new prompt: nothing could be drafted from it for as long as the
+        // conversation stayed on the slot. Cut the map back to what the two prompts share first.
+        auto & known = seen[seq_id];
+        size_t n_same = 0;
+        const size_t n_both = std::min(known.size(), prompt.size());
+        while (n_same < n_both && known[n_same] == prompt[n_same]) {
+            n_same++;
+        }
+        if (n_same < known.size() && n_same < prompt.size()) {
+            LOG_INF("%s: seq %d: the prompt leaves the known tokens at %zu of %zu, n-gram map cut back\n",
+                    __func__, (int) seq_id, n_same, known.size());
+            const llama_tokens shared(prompt.begin(), prompt.begin() + n_same);
+            common_ngram_map_begin(config[seq_id], shared);
+        }
+        known = prompt;
 
         common_ngram_map_begin(config[seq_id], prompt);
     }
@@ -2038,6 +2059,12 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
                 continue;
+            }
+
+            // [TAG_NGRAM_MAP_SWITCH] the map reads up to here, so the next begin() has to compare against it
+            auto & known = seen[seq_id];
+            if (dp.prompt->size() > known.size()) {
+                known.insert(known.end(), dp.prompt->begin() + known.size(), dp.prompt->end());
             }
 
             common_ngram_map_draft(config[seq_id], *dp.prompt, dp.id_last, *dp.result);
