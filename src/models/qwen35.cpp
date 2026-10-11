@@ -652,9 +652,13 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     // [TAG_DRAFT_VOCAB_SEQ] a draft step has one row: with ROCMFPX_DRAFT_VOCAB=N it multiplies only the N candidate rows of
     // the LM head instead of all of them (1.03 GB at Q6 for this model). Rows that are not candidates get -inf. The target
-    // still verifies every drafted token against the full vocabulary.
-    auto draft_vocabulary = rocmfpx::draft_vocabulary_for(&model);
-    if (draft_vocabulary && ggml_nrows(cur) == 1 && !head_s && (loras == nullptr || loras->empty())) {
+    // still verifies every drafted token against the full vocabulary. The candidates belong to the MTP draft context
+    // (cparams.draft_vocab, one set per sequence), as for qwen4exp; for this architecture the budget is opt-in, see
+    // rocmfpx::draft_vocabulary_budget().
+    auto draft_vocabulary = cparams.draft_vocab;
+    if (draft_vocabulary && ggml_nrows(cur) == 1 && !head_s && (loras == nullptr || loras->empty()) &&
+            ggml_is_matrix(head_w) && ggml_is_contiguous(head_w) && ggml_is_contiguous(cur) &&
+            head_w->ne[1] == draft_vocabulary->vocabulary_size()) {
         auto projection = rocmfpx::build_draft_projection(ctx0, std::move(draft_vocabulary), head_w, cur);
         cur = projection.logits;
         res->add_input(std::move(projection.input));

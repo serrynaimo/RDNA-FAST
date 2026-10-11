@@ -1401,9 +1401,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<llama_sampler *> backend_chains;
 
     int32_t n_embd = 0;
-    // [TAG_DRAFT_VOCAB_SEQ] per sequence: the row of the last target batch whose logits rank the draft candidates
-    // (-1 = none: the sequence was not in that batch, its candidates stay as they are)
-    std::vector<int> draft_score_row;
+    // per sequence: the target logits row that selects its next draft candidates (-2: unknown)
+    std::vector<int32_t> draft_score_row;
     std::shared_ptr<rocmfpx::draft_vocabulary> candidate_vocabulary;
     std::shared_ptr<void> candidate_driver;
 
@@ -1439,8 +1438,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
 
-        candidate_vocabulary = rocmfpx::draft_vocabulary_for(llama_get_model(ctx_dft));
-        draft_score_row.assign(n_seq, -1);
+        candidate_vocabulary = rocmfpx::draft_vocabulary_for(ctx_dft);
         if (candidate_vocabulary) {
             candidate_driver = candidate_vocabulary->claim_driver();
             SPC_INF("ROCmFPX native draft vocabulary: %d rows; target verification uses the full vocabulary\n", candidate_vocabulary->size());
@@ -1513,6 +1511,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+        draft_score_row.assign(n_seq, -2);
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1531,7 +1530,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
-            draft_score_row[seq_id] = -1;
+            draft_score_row[seq_id] = -2;
         }
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
@@ -1554,7 +1553,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     bool process(const common_batch & batch_in) override {
         // a new target batch: the rows of the previous one are gone ([TAG_DRAFT_VOCAB_SEQ])
-        std::fill(draft_score_row.begin(), draft_score_row.end(), -1);
+        std::fill(draft_score_row.begin(), draft_score_row.end(), -2);
 
         if (batch_in.size() <= 0) {
             return true;
@@ -1665,10 +1664,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + n_rows - 1), row_bytes);
         }
 
-        // until accept() names the row of the sampled token: the last row of the sequence, if the target computed it
+        // the next candidates of a sequence come from its last row in this batch when that row has logits
+        // (accept() moves it to the last accepted verification row); otherwise they are unknown (-2)
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            const int32_t i_end = i_batch_end[seq_id];
-            draft_score_row[seq_id] = i_end >= 0 && batch_in.tokens[i_end].output ? i_end : -1;
+            const int32_t k = i_batch_end[seq_id];
+            draft_score_row[seq_id] = k >= 0 && batch_in.tokens[k].output ? k : -2;
         }
         return true;
     }
@@ -1689,12 +1689,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            if (candidate_vocabulary && draft_score_row[seq_id] >= 0) {
+            // without a known score row the sequence keeps its previous candidates
+            const float * scores = candidate_vocabulary && draft_score_row[seq_id] >= 0
+                ? llama_get_logits_ith(params.ctx_tgt, draft_score_row[seq_id]) : nullptr;
+            if (scores) {
                 const auto * target_model = llama_get_model(params.ctx_tgt);
-                const float * scores = llama_get_logits_ith(params.ctx_tgt, draft_score_row[seq_id]);
-                if (scores) {
-                    candidate_vocabulary->update(scores, llama_vocab_n_tokens(llama_model_get_vocab(target_model)), dp.id_last, seq_id);
-                }
+                candidate_vocabulary->update(scores,
+                    llama_vocab_n_tokens(llama_model_get_vocab(target_model)), dp.id_last, seq_id);
             }
             n_drafting++;
             drafting[seq_id] = true;
@@ -1751,6 +1752,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            // the candidate-row draft head only runs for a single-row step (see qwen4exp graph_mtp)
+            const bool candidate_step = batch.size() == 1;
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
@@ -1780,7 +1783,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // highest logit. Only bypass top-k for a finite unique maximum;
                 // ties and non-finite values retain the original sampler path.
                 const char * cumulative_cut = std::getenv("ROCMFPX_MTP_CUM_P");
-                const bool direct_choice = candidate_vocabulary && n_seq == 1 && !chain_heads && !dparams.at(seq_id).result_q &&
+                const bool direct_choice = candidate_vocabulary && candidate_step && !chain_heads && !dparams.at(seq_id).result_q &&
                     params.p_min == 0.0f && !params.backend_sampling &&
                     (!cumulative_cut || std::strtof(cumulative_cut, nullptr) <= 0.0f);
                 llama_token id = LLAMA_TOKEN_NULL;
@@ -1938,7 +1941,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
-        draft_score_row[seq_id] = -1;
+        draft_score_row[seq_id] = -2;
+        if (candidate_vocabulary) {
+            candidate_vocabulary->reset(seq_id);
+        }
         std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
         verify_h[seq_id].clear();
         verify_h_rows[seq_id] = 0;
