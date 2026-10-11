@@ -50,15 +50,15 @@ identical prompts (14 requests; an orchestrator grows from 4k to 41k tokens, a
 | | stock llama.cpp | stock + MTP draft | this runtime |
 |---|---:|---:|---:|
 | **the session, wall-clock** | **1,065 s** | **168 s** | **125 s** |
-| prefill t/s, cold 4k prompt | 174 | 636 | 650 |
-| prefill t/s, 4.3k new tokens at 17k depth | 67 | 592 | 622 |
-| prefill t/s, 4.0k new tokens at 41k depth | 32 | 458 | 503 |
-| decode t/s at 4k depth | 32.3 | 31.5 | 59.1 |
-| decode t/s at 17k depth | 17.8 | 30.9 | 56.1 |
-| decode t/s at 41k depth | 10.6 | 24.3 | 53.7 |
+| prefill t/s, cold 4k prompt | 174 | 636 | 641 |
+| prefill t/s, 4.3k new tokens at 17k depth | 67 | 592 | 621 |
+| prefill t/s, 4.0k new tokens at 41k depth | 32 | 458 | 506 |
+| decode t/s at 4k depth | 32.3 | 31.5 | 57.5 |
+| decode t/s at 17k depth | 17.8 | 30.9 | 57.5 |
+| decode t/s at 41k depth | 10.6 | 24.3 | 55.4 |
 | decode t/s, code edit that copies the prompt | | | 268 |
 
-<sub>10 October 2026. Stock is LM Studio's ROCm llama.cpp runtime 2.55.0 with
+<sub>October 2026. Stock is LM Studio's ROCm llama.cpp runtime 2.55.0 with
 `Qwen3.8-27B-Q4_K_M`, flash attention, a q4_0 KV cache and two sessions. The
 edit row is n-gram drafting (95 t/s without it); it was not measured on LM
 Studio.</sub>
