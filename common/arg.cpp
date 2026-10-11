@@ -4555,6 +4555,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ngram_map_k4v.min_hits = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-map-ramp"},
+        {"--no-spec-ngram-map-ramp"},
+        "ngram-map-k and ngram-map-k4v: a draft starts at 4 tokens and grows to 12, then 36, after each draft that is\n"
+        "accepted in full; a draft that is mostly rejected brings it back down. Disabled: every draft has the full\n"
+        "m-gram length (default: enabled)",
+        [](common_params & params, bool value) {
+            params.speculative.ngram_map_ramp = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     //
     // removed params

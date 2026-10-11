@@ -254,6 +254,7 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    bool spec_draft_ngram = false; // [TAG_NGRAM_MAP_RAMP] the draft being verified was found in the context
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
@@ -393,6 +394,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        spec_draft_ngram = false;
 
         last_nl_pos    = 0;
         generated      = {};
@@ -729,6 +731,13 @@ struct server_slot {
             SLT_INF(*this,
                     "draft acceptance = %0.5f (%5d accepted / %5d generated), mean len = %5.2f\n",
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
+            // [TAG_NGRAM_MAP_RAMP]
+            if (stats.n_drafts_ngram > 0) {
+                SLT_INF(*this,
+                        "   n-gram drafts = %5d accepted / %5d generated in %d drafts, %d replayed after a rejection\n",
+                        (int) stats.n_draft_accepted_ngram, (int) stats.n_draft_tokens_ngram,
+                        (int) stats.n_drafts_ngram, (int) stats.n_draft_replays);
+            }
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
@@ -3859,6 +3868,13 @@ private:
 
             slot.stats.n_draft_tokens += draft.size();
 
+            // [TAG_NGRAM_MAP_RAMP]
+            slot.spec_draft_ngram = !draft.empty() && common_speculative_last_is_ngram(spec.get(), slot.id);
+            if (slot.spec_draft_ngram) {
+                slot.stats.n_drafts_ngram++;
+                slot.stats.n_draft_tokens_ngram += draft.size();
+            }
+
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
@@ -4847,6 +4863,7 @@ private:
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
+                        slot.stats.n_draft_replays++;
                         slot.spec_draft = std::move(accepted);
 
                         const auto & ckpt = slot.spec_ckpt;
@@ -4890,6 +4907,9 @@ private:
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
+            if (slot.spec_draft_ngram) {
+                slot.stats.n_draft_accepted_ngram += n_accepted;
+            }
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {

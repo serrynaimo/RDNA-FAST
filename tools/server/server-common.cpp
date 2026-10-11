@@ -99,6 +99,11 @@ json server_slot_stats::to_json() const {
     if (n_draft_tokens > 0) {
         base["draft_n"]          = n_draft_tokens;
         base["draft_n_accepted"] = n_draft_accepted;
+        // [TAG_NGRAM_MAP_RAMP]
+        base["draft_ngram_n"]          = n_draft_tokens_ngram;
+        base["draft_ngram_n_accepted"] = n_draft_accepted_ngram;
+        base["draft_ngram_drafts"]     = n_drafts_ngram;
+        base["draft_replays"]          = n_draft_replays;
     }
 
     return base;

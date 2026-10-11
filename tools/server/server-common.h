@@ -387,6 +387,13 @@ struct server_slot_stats {
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
 
+    // [TAG_NGRAM_MAP_RAMP] the part of the above that came from an n-gram implementation, and how many drafts had to
+    // be replayed from a checkpoint after a rejection (a pass that produced nothing)
+    uint64_t n_drafts_ngram         = 0;
+    uint64_t n_draft_tokens_ngram   = 0;
+    uint64_t n_draft_accepted_ngram = 0;
+    uint64_t n_draft_replays        = 0;
+
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
     int64_t t_start       = 0;

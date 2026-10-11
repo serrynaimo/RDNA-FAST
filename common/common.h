@@ -385,6 +385,9 @@ struct common_params_speculative {
     common_params_speculative_ngram_map ngram_simple;
     common_params_speculative_ngram_map ngram_map_k;
     common_params_speculative_ngram_map ngram_map_k4v;
+    // [TAG_NGRAM_MAP_RAMP] ngram-map-k / ngram-map-k4v: a draft starts at 4 tokens and grows to 12, then 36, while the
+    // drafts are accepted in full
+    bool ngram_map_ramp = true;
 
     common_params_speculative_ngram_cache ngram_cache;
 

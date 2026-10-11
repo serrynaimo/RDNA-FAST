@@ -2007,16 +2007,35 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
     // [TAG_NGRAM_MAP_SWITCH] per sequence: the tokens its map was built from (the prompt and what followed)
     std::vector<llama_tokens> seen;
 
+    // [TAG_NGRAM_MAP_RAMP] A draft found in the context is a guess that the model repeats something. A wrong guess of
+    // full length costs a wide verification pass and, on a model with a recurrent state, a checkpoint, its restore
+    // and a replay pass, for one token. So a draft earns its length: 4 tokens first (no checkpoint needed), then 12,
+    // then 36, one step up after each draft that filled its size and was accepted in full. A draft of which less than
+    // half was accepted falls back to the smallest size that covers what held (the rule of the ngram-mod window).
+    static constexpr size_t ramp_sizes[]  = { 4, 12, 36 };
+    static constexpr int    ramp_levels   = 3;
+    const bool ramp;
+    struct ramp_state {
+        int    level     = 0;     // index into ramp_sizes
+        size_t n_drafted = 0;     // tokens of the draft that is being verified (0: none)
+        bool   cut       = false; // that draft was longer and was cut to the size
+    };
+    std::vector<ramp_state> ramps;
+
     common_speculative_impl_ngram_map_k(
             const common_ngram_map & config,
-            uint32_t n_seq)
+            uint32_t n_seq,
+            bool ramp)
         : common_speculative_impl(config.key_only ? COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K
-            : COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, n_seq, config.size_value)
+            : COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, n_seq,
+            ramp ? std::min<int32_t>(config.size_value, (int32_t) ramp_sizes[ramp_levels - 1]) : (int32_t) config.size_value)
+        , ramp(ramp)
     {
         for (uint32_t i = 0; i < n_seq; i++) {
             this->config.push_back(config);
         }
         seen.resize(n_seq);
+        ramps.resize(n_seq);
 
         SPC_TRC("adding speculative implementation '%s'\n", common_speculative_type_to_str(this->type).c_str());
         SPC_TRC("- size_key=%d, size_value=%d, key_only=%d, min_hits=%d\n",
@@ -2044,6 +2063,9 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
         }
         known = prompt;
 
+        // [TAG_NGRAM_MAP_RAMP] every request starts at the smallest size
+        ramps[seq_id] = {};
+
         common_ngram_map_begin(config[seq_id], prompt);
     }
 
@@ -2068,6 +2090,17 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
             }
 
             common_ngram_map_draft(config[seq_id], *dp.prompt, dp.id_last, *dp.result);
+
+            // [TAG_NGRAM_MAP_RAMP]
+            if (ramp) {
+                auto & r = ramps[seq_id];
+                const size_t n_size = ramp_sizes[r.level];
+                r.cut = dp.result->size() > n_size;
+                if (r.cut) {
+                    dp.result->resize(n_size);
+                }
+                r.n_drafted = dp.result->size();
+            }
         }
     }
 
@@ -2076,6 +2109,31 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
 
         if (is_other) {
             return;
+        }
+
+        // [TAG_NGRAM_MAP_RAMP]
+        if (ramp) {
+            auto & r = ramps[seq_id];
+            const size_t n_drafted = r.n_drafted;
+            const bool   cut       = r.cut;
+            r.n_drafted = 0;
+            r.cut       = false;
+
+            if (n_drafted > 0 && n_accepted >= n_drafted) {
+                if (n_drafted >= ramp_sizes[r.level] && r.level + 1 < ramp_levels) {
+                    r.level++;
+                }
+                if (cut) {
+                    // the map takes the accepted count as the reach of this continuation and would draft no further
+                    // from this place again; a draft that was cut and held says nothing about the rest
+                    return;
+                }
+            } else if (n_drafted > 0 && (size_t) n_accepted * 2 < n_drafted) {
+                r.level = 0;
+                while (r.level + 1 < ramp_levels && ramp_sizes[r.level] < (size_t) n_accepted + 1) {
+                    r.level++;
+                }
+            }
         }
 
         common_ngram_map_accept(config[seq_id], n_accepted);
@@ -2994,13 +3052,15 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K: {
                 impls.push_back(
                         std::make_unique<common_speculative_impl_ngram_map_k>(
-                            get_common_ngram_map(config.type, config.params.ngram_map_k), n_seq));
+                            get_common_ngram_map(config.type, config.params.ngram_map_k), n_seq,
+                            config.params.ngram_map_ramp));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: {
                 impls.push_back(
                         std::make_unique<common_speculative_impl_ngram_map_k>(
-                            get_common_ngram_map(config.type, config.params.ngram_map_k4v), n_seq));
+                            get_common_ngram_map(config.type, config.params.ngram_map_k4v), n_seq,
+                            config.params.ngram_map_ramp));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_MOD: {
@@ -3364,6 +3424,22 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         if (impl_other.get() != impl) {
             impl_other->accept(seq_id, n_accepted, true);
         }
+    }
+}
+
+bool common_speculative_last_is_ngram(const common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || seq_id < 0 || (size_t) seq_id >= spec->impl_last.size() || spec->impl_last[seq_id] == nullptr) {
+        return false;
+    }
+    switch (spec->impl_last[seq_id]->type) {
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+            return true;
+        default:
+            return false;
     }
 }
 
