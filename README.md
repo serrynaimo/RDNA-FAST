@@ -244,14 +244,21 @@ to does not wait behind background work. A request without it is `default`.
 A held request keeps its slot, its context and its connection. If it is
 generating it still joins one pass every 2 s (`--priority-trickle-ms`, shared
 by all held requests, `0` = none), so its client keeps seeing progress; if it
-is still reading its prompt it waits. Nothing is cancelled or restarted, and
-at temperature 0 the held request ends with the same text as an undisturbed
-one. With `LLAMA_MAX_QUEUED`, waiting requests of a lower level do not count
-against a new one.
+is still reading its prompt it waits. Nothing is cancelled or restarted. With
+`LLAMA_MAX_QUEUED`, waiting requests of a lower level do not count against a
+new one.
+
+On the RX 7900 XT with the 27B model, an `xhigh` request generated at 49.7 t/s
+beside a held one, against 48.6 t/s alone; the held one advanced by about one
+token per second for those 16 s and then continued at full speed. Without a
+draft model a held request ends with exactly the text of an undisturbed run at
+temperature 0; with MTP drafting the two can part late, as any two runs with a
+different draft pattern can.
 
 With an agent framework, set it per agent, e.g. in Hermes through
 `extra_body: {priority: xhigh}` in the provider entry of the agent you talk
-to. Tested with 1 to 4 slots: queue order, the free slot, hold and trickle.
+to. Tested with 1 to 4 slots on a small model and with 2 slots on the 27B
+model: queue order, the free slot, hold and trickle.
 
 ## Decision classifier
 
