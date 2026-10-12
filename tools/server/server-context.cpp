@@ -740,6 +740,9 @@ struct server_slot {
                 "   graphs reused = %10d\n",
                 llama_perf_context(ctx_tgt).n_reused);
 
+        SLT_INF(*this,
+                "  graph reallocs = %10d    / %5d        (same size) / (changed size)\n",
+                llama_perf_context(ctx_tgt).n_reallocs_same, llama_perf_context(ctx_tgt).n_reallocs_diff);
         // [TAG_REQUEST_PRIORITY]
         if (held_ms(ggml_time_ms()) > 0 || n_trickle > 0) {
             SLT_INF(*this,
