@@ -784,8 +784,6 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             llama_batch_allocr & balloc,
             uint32_t n_ubatch,
             bool embd_all) {
-    GGML_UNUSED(embd_all);
-
     do {
         balloc.split_reset();
 
@@ -793,7 +791,8 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
         while (true) {
             // [TAG_KV_LANES] one sequence per ubatch, so that each ubatch attends only to its own lane
             auto ubatch = lanes         ? balloc.split_equal(n_ubatch, false, 0, 1) :
-                          n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
+                          n_stream == 1 ? balloc.split_simple(n_ubatch) :
+                          embd_all      ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
 
             if (ubatch.n_tokens == 0) {
                 break;
