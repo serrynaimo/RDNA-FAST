@@ -390,9 +390,32 @@ struct server_slot_stats {
     // [TAG_NGRAM_MAP_RAMP] the part of the above that came from an n-gram implementation, and how many drafts had to
     // be replayed from a checkpoint after a rejection (a pass that produced nothing)
     uint64_t n_drafts_ngram         = 0;
+    uint64_t n_drafts_ngram_long    = 0; // of them: longer than the rollback window (they save a checkpoint)
     uint64_t n_draft_tokens_ngram   = 0;
     uint64_t n_draft_accepted_ngram = 0;
     uint64_t n_draft_replays        = 0;
+
+    // a run = n-gram drafts in a row that were accepted in full, plus the draft that ended it. Runs by the number of
+    // tokens accepted in them: 0, 1-8, 9-16, 17-32, 33-64, 65-128, 129+
+    static constexpr int n_ngram_run_buckets = 7;
+    uint64_t n_ngram_runs[n_ngram_run_buckets] = {};
+    uint64_t n_ngram_run    = 0;     // tokens accepted in the run that is open
+    bool     ngram_run_open = false;
+
+    static int ngram_run_bucket(uint64_t n) {
+        return n == 0 ? 0 : n <= 8 ? 1 : n <= 16 ? 2 : n <= 32 ? 3 : n <= 64 ? 4 : n <= 128 ? 5 : 6;
+    }
+    void ngram_run_close() {
+        if (ngram_run_open) {
+            n_ngram_runs[ngram_run_bucket(n_ngram_run)]++;
+        }
+        n_ngram_run    = 0;
+        ngram_run_open = false;
+    }
+    // the count of a bucket, the run that is still open included
+    uint64_t ngram_runs(int i) const {
+        return n_ngram_runs[i] + (ngram_run_open && ngram_run_bucket(n_ngram_run) == i ? 1 : 0);
+    }
 
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set

@@ -4558,9 +4558,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-ngram-map-ramp"},
         {"--no-spec-ngram-map-ramp"},
-        "ngram-map-k and ngram-map-k4v: a draft starts at 4 tokens and grows to 12, then 36, after each draft that is\n"
-        "accepted in full; a draft that is mostly rejected brings it back down. Disabled: every draft has the full\n"
-        "m-gram length (default: enabled)",
+        "ngram-map-k and ngram-map-k4v: a draft has 4 tokens until four such drafts in a row were accepted in full,\n"
+        "then up to 24 tokens; a draft that is not accepted in full goes back to 4. Disabled: every draft has the\n"
+        "full m-gram length (default: enabled)",
         [](common_params & params, bool value) {
             params.speculative.ngram_map_ramp = value;
         }

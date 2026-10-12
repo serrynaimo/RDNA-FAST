@@ -103,7 +103,13 @@ json server_slot_stats::to_json() const {
         base["draft_ngram_n"]          = n_draft_tokens_ngram;
         base["draft_ngram_n_accepted"] = n_draft_accepted_ngram;
         base["draft_ngram_drafts"]     = n_drafts_ngram;
+        base["draft_ngram_long"]       = n_drafts_ngram_long;
         base["draft_replays"]          = n_draft_replays;
+        json runs = json::array();
+        for (int i = 0; i < n_ngram_run_buckets; i++) {
+            runs.push_back(ngram_runs(i));
+        }
+        base["draft_ngram_runs"]       = runs;
     }
 
     return base;

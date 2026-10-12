@@ -255,6 +255,7 @@ struct server_slot {
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     bool spec_draft_ngram = false; // [TAG_NGRAM_MAP_RAMP] the draft being verified was found in the context
+    size_t spec_draft_n   = 0;     // and had this many tokens when it was made
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
@@ -737,6 +738,11 @@ struct server_slot {
                         "   n-gram drafts = %5d accepted / %5d generated in %d drafts, %d replayed after a rejection\n",
                         (int) stats.n_draft_accepted_ngram, (int) stats.n_draft_tokens_ngram,
                         (int) stats.n_drafts_ngram, (int) stats.n_draft_replays);
+                SLT_INF(*this,
+                        "     n-gram runs = %d long drafts; runs by accepted tokens (0 / 1-8 / 9-16 / 17-32 / 33-64 / 65-128 / 129+) = %d / %d / %d / %d / %d / %d / %d\n",
+                        (int) stats.n_drafts_ngram_long,
+                        (int) stats.ngram_runs(0), (int) stats.ngram_runs(1), (int) stats.ngram_runs(2), (int) stats.ngram_runs(3),
+                        (int) stats.ngram_runs(4), (int) stats.ngram_runs(5), (int) stats.ngram_runs(6));
             }
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
@@ -3870,9 +3876,17 @@ private:
 
             // [TAG_NGRAM_MAP_RAMP]
             slot.spec_draft_ngram = !draft.empty() && common_speculative_last_is_ngram(spec.get(), slot.id);
+            slot.spec_draft_n     = draft.size();
             if (slot.spec_draft_ngram) {
                 slot.stats.n_drafts_ngram++;
                 slot.stats.n_draft_tokens_ngram += draft.size();
+                if (draft.size() > llama_n_rs_seq(ctx_tgt)) {
+                    slot.stats.n_drafts_ngram_long++;
+                }
+                slot.stats.ngram_run_open = true;
+            } else {
+                // another drafter, or none, took this step: a run of n-gram drafts ends here
+                slot.stats.ngram_run_close();
             }
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
@@ -4909,6 +4923,10 @@ private:
             slot.stats.n_draft_verif_steps += 1;
             if (slot.spec_draft_ngram) {
                 slot.stats.n_draft_accepted_ngram += n_accepted;
+                slot.stats.n_ngram_run            += n_accepted;
+                if (n_accepted < slot.spec_draft_n) {
+                    slot.stats.ngram_run_close();
+                }
             }
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;

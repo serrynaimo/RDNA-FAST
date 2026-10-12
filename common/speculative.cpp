@@ -2007,16 +2007,18 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
     // [TAG_NGRAM_MAP_SWITCH] per sequence: the tokens its map was built from (the prompt and what followed)
     std::vector<llama_tokens> seen;
 
-    // [TAG_NGRAM_MAP_RAMP] A draft found in the context is a guess that the model repeats something. A wrong guess of
-    // full length costs a wide verification pass and, on a model with a recurrent state, a checkpoint, its restore
-    // and a replay pass, for one token. So a draft earns its length: 4 tokens first (no checkpoint needed), then 12,
-    // then 36, one step up after each draft that filled its size and was accepted in full. A draft of which less than
-    // half was accepted falls back to the smallest size that covers what held (the rule of the ngram-mod window).
-    static constexpr size_t ramp_sizes[]  = { 4, 12, 36 };
-    static constexpr int    ramp_levels   = 3;
+    // [TAG_NGRAM_MAP_RAMP] A draft found in the context is a guess that the model repeats something. On a model with
+    // a recurrent state every draft beyond the rollback window (4 tokens with an MTP draft of 4) saves a checkpoint
+    // first, and a rejection restores it and replays what held: two passes and two state copies for a few tokens.
+    // Most matches are short (a phrase, a path, a line), so a long draft there is a loss. A real copy shows itself
+    // for free: drafts of 4 tokens need no checkpoint. So a draft has probe_size tokens until probe_count of them in
+    // a row were accepted in full, then up to long_size; a draft that is not accepted in full closes the gate again.
+    static constexpr size_t probe_size  = 4;
+    static constexpr int    probe_count = 4;
+    static constexpr size_t long_size   = 24;
     const bool ramp;
     struct ramp_state {
-        int    level     = 0;     // index into ramp_sizes
+        int    n_held    = 0;     // probes in a row that were accepted in full; probe_count: the gate is open
         size_t n_drafted = 0;     // tokens of the draft that is being verified (0: none)
         bool   cut       = false; // that draft was longer and was cut to the size
     };
@@ -2028,7 +2030,7 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
             bool ramp)
         : common_speculative_impl(config.key_only ? COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K
             : COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, n_seq,
-            ramp ? std::min<int32_t>(config.size_value, (int32_t) ramp_sizes[ramp_levels - 1]) : (int32_t) config.size_value)
+            ramp ? std::min<int32_t>(config.size_value, (int32_t) long_size) : (int32_t) config.size_value)
         , ramp(ramp)
     {
         for (uint32_t i = 0; i < n_seq; i++) {
@@ -2063,7 +2065,7 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
         }
         known = prompt;
 
-        // [TAG_NGRAM_MAP_RAMP] every request starts at the smallest size
+        // [TAG_NGRAM_MAP_RAMP] every request starts with the gate closed
         ramps[seq_id] = {};
 
         common_ngram_map_begin(config[seq_id], prompt);
@@ -2094,12 +2096,22 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
             // [TAG_NGRAM_MAP_RAMP]
             if (ramp) {
                 auto & r = ramps[seq_id];
-                const size_t n_size = ramp_sizes[r.level];
-                r.cut = dp.result->size() > n_size;
-                if (r.cut) {
-                    dp.result->resize(n_size);
+                if (dp.result->empty()) {
+                    // nothing found at this step. A copy matches at every step, so probes on both sides of a gap
+                    // are not "in a row"; an open gate stays open until a draft is rejected
+                    if (r.n_held < probe_count) {
+                        r.n_held = 0;
+                    }
+                    r.n_drafted = 0;
+                    r.cut       = false;
+                } else {
+                    const size_t n_size = r.n_held >= probe_count ? long_size : probe_size;
+                    r.cut = dp.result->size() > n_size;
+                    if (r.cut) {
+                        dp.result->resize(n_size);
+                    }
+                    r.n_drafted = dp.result->size();
                 }
-                r.n_drafted = dp.result->size();
             }
         }
     }
@@ -2120,19 +2132,16 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
             r.cut       = false;
 
             if (n_drafted > 0 && n_accepted >= n_drafted) {
-                if (n_drafted >= ramp_sizes[r.level] && r.level + 1 < ramp_levels) {
-                    r.level++;
+                if (r.n_held < probe_count && n_drafted >= probe_size) {
+                    r.n_held++;
                 }
                 if (cut) {
                     // the map takes the accepted count as the reach of this continuation and would draft no further
                     // from this place again; a draft that was cut and held says nothing about the rest
                     return;
                 }
-            } else if (n_drafted > 0 && (size_t) n_accepted * 2 < n_drafted) {
-                r.level = 0;
-                while (r.level + 1 < ramp_levels && ramp_sizes[r.level] < (size_t) n_accepted + 1) {
-                    r.level++;
-                }
+            } else if (n_drafted > 0) {
+                r.n_held = 0;
             }
         }
 
