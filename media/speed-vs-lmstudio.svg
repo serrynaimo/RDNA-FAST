@@ -63,10 +63,10 @@
 <text x="765.8" y="780" fill="#9A9FA8" font-size="15">458 t/s</text>
 <text x="1136" y="773" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+11%</text>
 <rect x="40" y="820" width="1120" height="110" rx="14" fill="#141417" stroke="#26262B"/>
-<text x="64" y="851" fill="#ED1C24" font-size="17" font-weight="800" letter-spacing="2">CODE EDITS</text>
-<text x="210" y="851" fill="#9A9FA8" font-size="14">decode t/s when the answer copies the prompt (n-gram drafting)</text>
+<text x="64" y="851" fill="#ED1C24" font-size="17" font-weight="800" letter-spacing="2">TEXT COPY BOOST</text>
+<text x="276" y="851" fill="#9A9FA8" font-size="14">decode t/s when the answer copies the prompt (n-gram drafting)</text>
 <text x="64" y="893" fill="#F4F4F5" font-size="17">return a file with one small change</text>
 <rect x="420" y="881" width="470.0" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
-<text x="900.0" y="895" fill="#F4F4F5" font-size="17" font-weight="800">268 t/s</text>
+<text x="900.0" y="895" fill="#F4F4F5" font-size="17" font-weight="800">202 t/s</text>
 <text x="56" y="962" fill="#9A9FA8" font-size="13">RX 7900 XT 20 GB, October 2026. This runtime: Swift 1.5 Qwen3.8-27B MQ-Q4S, MTP draft. LM Studio: ROCm llama.cpp 2.55.0, Qwen3.8-27B Q4_K_M, MTP draft, q4_0 KV cache.</text>
 </svg>

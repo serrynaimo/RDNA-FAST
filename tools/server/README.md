@@ -288,6 +288,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-ngram-map-k4v-size-n N` | ngram size N for ngram-map-k4v speculative decoding, length of lookup n-gram (default: 12) |
 | `--spec-ngram-map-k4v-size-m N` | ngram size M for ngram-map-k4v speculative decoding, length of draft m-gram (default: 48) |
 | `--spec-ngram-map-k4v-min-hits N` | minimum hits for ngram-map-k4v speculative decoding (default: 1) |
+| `--spec-ngram-map-ramp, --no-spec-ngram-map-ramp` | ngram-map-k and ngram-map-k4v: a draft has 4 tokens until four such drafts in a row were accepted in full, then up to 24 tokens; a draft that is not accepted in full goes back to 4. Disabled: every draft has the full m-gram length (default: enabled) |
 | `--draft, --draft-n, --draft-max N` | the argument has been removed. use --spec-draft-n-max or --spec-ngram-mod-n-max<br/>(env: LLAMA_ARG_DRAFT_MAX) |
 | `--draft-min, --draft-n-min N` | the argument has been removed. use --spec-draft-n-min or --spec-ngram-mod-n-min<br/>(env: LLAMA_ARG_DRAFT_MIN) |
 | `--spec-ngram-size-n N` | the argument has been removed. use the respective --spec-ngram-*-size-n or --spec-ngram-mod-n-match |

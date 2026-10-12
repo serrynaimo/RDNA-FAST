@@ -13,8 +13,8 @@ GPU, ideal for Hermes.
   125 s here, 168 s on stock llama.cpp with its MTP draft and 17.7 min without
   it; decode is about twice as fast. [Numbers](#speed)
 - **Faster prefill AND decode.** The model's own MTP head drafts four tokens ahead: 50 t/s
-  on prose and 73 t/s on code, against 35 t/s without it. Code edits that copy
-  the prompt run at 250-270 t/s through n-gram drafting.
+  on prose and 73 t/s on code, against 35 t/s without it. Text copy boost: code
+  edits that copy the prompt run at about 200 t/s through n-gram drafting.
 - **100k tokens of context on a 20 GB card.** With Swift 1.5 (as high quality Q4 mixed magic quant) of Qwen3.8-27B, runs
   at `reasoning_effort: low`: 50 of 50 on our task set in 28% less time than
   at `xhigh`. [Recipe](docs/rocmfpx/swift-1.5-qwen3.8-27b-mq-q4s.md)
@@ -56,12 +56,12 @@ identical prompts (14 requests; an orchestrator grows from 4k to 41k tokens, a
 | decode t/s at 4k depth | 32.3 | 31.5 | 57.5 |
 | decode t/s at 17k depth | 17.8 | 30.9 | 57.5 |
 | decode t/s at 41k depth | 10.6 | 24.3 | 55.4 |
-| decode t/s, code edit that copies the prompt | | | 268 |
+| decode t/s, text copy boost: code edit that copies the prompt | | | 202 |
 
 <sub>October 2026. Stock is LM Studio's ROCm llama.cpp runtime 2.55.0 with
 `Qwen3.8-27B-Q4_K_M`, flash attention, a q4_0 KV cache and two sessions. The
-edit row is n-gram drafting (95 t/s without it); it was not measured on LM
-Studio.</sub>
+edit row is the text copy boost, n-gram drafting (95 t/s without it); it was
+not measured on LM Studio.</sub>
 
 Decode on the production server, 450-token answers at temperature 1:
 
@@ -76,7 +76,7 @@ Deep in a conversation, and on cold prompts at temperature 0:
 | | 17k | 41k |
 |---|---:|---:|
 | decode t/s at that depth | 54.7 | 55.9 |
-| decode t/s, verbatim copy of a passage | | 180 |
+| decode t/s, verbatim copy of a passage | | 124 |
 | prefill t/s, cold prompt, average over the prompt | 679 | 621 |
 | the same without the MTP draft | 701 | 640 |
 
@@ -148,7 +148,8 @@ Flags:
 | `--no-mmproj-offload` | the 0.9 GB vision projector was the whole paged share at two slots. Images cost 7-12 s to the first token instead of 3-5 s. |
 | `-ub 1024` | prefill +6% at 17k and +11% at 41k over 256, for 0.3 GB more paged memory; 512 gives +4% and +8% for 0.1 GB. Decode does not change with it (55.7 against 56.0 t/s on identical text). |
 | `--spec-type draft-mtp`, `--spec-draft-n-max 4` | +45% decode on prose, +112% on code, for 1.4 GB of VRAM and 3% of prefill speed. The draft head has its own KV cache; for prompt tokens only its K and V are computed, nothing else of the block is ever read. |
-| `--spec-type "...,ngram-map-k4v"` | n-gram drafting in front of MTP: where the last tokens repeat an earlier place of the context, the continuation found there is drafted, otherwise MTP drafts as before. Code edits that copy the prompt 95 -> 268 t/s, a verbatim copy at 41k 83 -> 180 t/s; ordinary text gives the same output at the same speed. Quote the value in a .cmd file: cmd splits arguments at commas. |
+| `--spec-type "...,ngram-map-k4v"` | text copy boost: n-gram drafting in front of MTP. Where the last tokens repeat an earlier place of the context, the continuation found there is drafted, otherwise MTP drafts as before. A draft has 4 tokens until four in a row were accepted in full, then up to 24, so a match that is only a phrase or a path costs no checkpoint. Code edits that copy the prompt 95 -> 202 t/s, a verbatim copy at 41k 83 -> 124 t/s. Quote the value in a .cmd file: cmd splits arguments at commas. |
+| `--no-spec-ngram-map-ramp` | not set here. Full-length n-gram drafts (48 tokens) from the first match: 268 t/s on code edits and 180 t/s on the copy at 41k, but slower on answers that only share phrases with the context, where a wrong long draft costs a checkpoint restore and a replay pass. |
 | `--ctx-checkpoints 8` | kept in host RAM, ~200 MiB each. When the list is full, the one whose removal leaves the smallest gap is dropped; the one at the first user message never is. |
 | `--cache-disk` | conversations and their checkpoints are kept on SSD. See [The SSD prompt cache](#the-ssd-prompt-cache). |
 | `--load-mode dio` | the default memory-mapped load keeps the 15 GB model file in system RAM. |
