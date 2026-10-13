@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <map>
+#include <vector>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -101,6 +102,13 @@ LLAMA_API uint32_t llama_kv_lanes_merge_max(const struct llama_context * ctx);
 // [TAG_SHARED_PASS] the shared pass is on by default in every context that supports it (slot ranges, Qwen3.x);
 // false gives every sequence its own pass again, true restores the default. No effect elsewhere.
 LLAMA_API void llama_kv_lanes_set_merge(struct llama_context * ctx, bool enable);
+
+// the backend buffers that a state write of this memory would touch - empty caches report none
+LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
+
+// Turn the KV cache attention rotation on or off for the contexts created from this model.
+// Useful for testing purposes.
+LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
