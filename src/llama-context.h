@@ -380,6 +380,10 @@ private:
     bool mtp_lean_reserve = false;
     bool mtp_lean_warned  = false;
 
+    // whether the reserve graph has a logits tensor, set in sched_reserve()
+    // true until then, because the first output_reserve() runs before any graph is reserved
+    bool graph_has_logits = true;
+
     // state of sched_copy_experts, reset before each graph compute
     struct copy_experts_info {
         const ggml_tensor *  ids = nullptr;
