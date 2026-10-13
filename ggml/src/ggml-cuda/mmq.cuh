@@ -111,7 +111,6 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
             return MMQ_Q8_1_DS_LAYOUT_D4;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 
@@ -1986,7 +1985,6 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             break;
         default:
             GGML_ABORT("unsupported J_best=%d", args.J_best);
-            break;
     }
 }
 
