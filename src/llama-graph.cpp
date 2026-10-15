@@ -2091,7 +2091,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * post_exp_norm,
+               float   post_exp_norm_eps) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2112,7 +2114,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        post_exp_norm,
+        post_exp_norm_eps
     );
 }
 
@@ -2140,7 +2144,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * post_exp_norm,
+               float   post_exp_norm_eps) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2330,7 +2336,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if ((int64_t) hparams.n_expert_used(il) != selected_experts->ne[0]) {
             form.n_used = (int32_t) hparams.n_expert_used(il);
         }
-        bool ok = form.act >= 0 && arch != LLM_ARCH_GROVEMOE;
+        // the host pool has no per-expert output norm (Muse Spark's post_exp_norm): such layers stay on the device
+        bool ok = form.act >= 0 && arch != LLM_ARCH_GROVEMOE && post_exp_norm == nullptr;
         if (ok && hdmd) {
             for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
                 ok = ok && (w == nullptr || hdmd->rot.find(w) == hdmd->rot.end());
@@ -2545,6 +2552,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         experts = slots ? ggml_add_id(ctx0, experts, build_cached_experts(down_exps_b), slots) // [TAG_EXPERT_HANDOFF] zero at the miss slot
                           : ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
+    }
+
+    // an expert output can be scaled by a norm weight, then normalized, before the router weights apply
+    if (post_exp_norm) {
+        experts = ggml_mul(ctx0, experts, post_exp_norm);
+        experts = ggml_rms_norm(ctx0, experts, post_exp_norm_eps);
+        cb(experts, "ffn_moe_post_exp_norm", il);
     }
 
     if (!weight_before_ffn) {
