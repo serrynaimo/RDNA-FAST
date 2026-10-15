@@ -166,3 +166,9 @@ LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, fl
 // rows of token i are keyed on window[i-1], window[i-2] (n-gram hash). posix_fadvise only: a wrong prediction
 // costs readahead and nothing else. No-op for models without lazy per-layer embeddings.
 LLAMA_API void llama_lazy_prefetch_window(struct llama_context * ctx, const llama_token * window, int32_t n, int32_t first);
+// same as above, but only the rows of the given tokens, in order (n_tokens * n_embd elements)
+// returns the number of elements written or 0 on error
+LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const llama_token * tokens, uint32_t n_tokens, float * out);
+
+// realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
+LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
