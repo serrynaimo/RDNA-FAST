@@ -366,6 +366,7 @@ MMPROJ_MODEL_MAP: dict[str, str] = {
     "MiniCPMOCRForSequenceClassification": "qwen3vl",
     "MiniCPMOcrForConditionalGeneration": "minicpm",
     "Mistral3ForConditionalGeneration": "llava",
+    "NemotronH_Omni_Reasoning_V3": "nemotron",
     "NemotronH_Nano_VL_V2": "nemotron",
     "MuseGlimmerForConditionalGeneration": "muse_glimmer",
     "PaddleOCRVisionModel": "ernie",
