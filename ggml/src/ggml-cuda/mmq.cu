@@ -9,66 +9,66 @@
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
-            mul_mat_q_case<GGML_TYPE_Q1_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q1_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q2_0:
-            mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q2_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q4_0:
-            mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q4_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q4_1:
-            mul_mat_q_case<GGML_TYPE_Q4_1>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q4_1, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q5_0:
-            mul_mat_q_case<GGML_TYPE_Q5_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q5_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q5_1:
-            mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q5_1, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q8_0:
-            mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q8_0, GGML_PREC_Q8>(ctx, args, stream);
             break;
 // -----------------------------------------------------------------------
         case GGML_TYPE_Q2_K:
-            mul_mat_q_case<GGML_TYPE_Q2_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q2_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q3_K:
-            mul_mat_q_case<GGML_TYPE_Q3_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q3_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q4_K:
-            mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q4_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q5_K:
-            mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q5_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q6_K:
-            mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q6_K, GGML_PREC_Q8>(ctx, args, stream);
             break;
 // -----------------------------------------------------------------------
         case GGML_TYPE_IQ1_S:
-            mul_mat_q_case<GGML_TYPE_IQ1_S>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ1_S, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ2_XXS:
-            mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ2_XXS, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ2_XS:
-            mul_mat_q_case<GGML_TYPE_IQ2_XS>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ2_XS, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ2_S:
-            mul_mat_q_case<GGML_TYPE_IQ2_S>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ2_S, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ3_XXS:
-            mul_mat_q_case<GGML_TYPE_IQ3_XXS>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ3_XXS, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ3_S:
-            mul_mat_q_case<GGML_TYPE_IQ3_S>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ3_S, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ4_XS:
-            mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ4_XS, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ4_NL:
-            mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_IQ4_NL, GGML_PREC_Q8>(ctx, args, stream);
             break;
 // -----------------------------------------------------------------------
         case GGML_TYPE_MXFP4:
@@ -77,35 +77,35 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
                 mul_mat_q_case<GGML_TYPE_MXFP4, GGML_PREC_Q4>(ctx, args, stream);
                 break;
             }
-            mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_MXFP4, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q4_0_ROCMFP4:
-            mul_mat_q_case<GGML_TYPE_Q4_0_ROCMFP4>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q4_0_ROCMFP4, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-            mul_mat_q_case<GGML_TYPE_Q4_0_ROCMFP4_FAST>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q4_0_ROCMI4:
-            mul_mat_q_case<GGML_TYPE_Q4_0_ROCMI4>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q4_0_ROCMI4, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q3_0_ROCMFPX:
-            mul_mat_q_case<GGML_TYPE_Q3_0_ROCMFPX>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q3_0_ROCMFPX, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q2_0_ROCMFPX:
-            mul_mat_q_case<GGML_TYPE_Q2_0_ROCMFPX>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q2_0_ROCMFPX, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q6_0_ROCMFPX:
-            mul_mat_q_case<GGML_TYPE_Q6_0_ROCMFPX>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q6_0_ROCMFPX, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q8_0_ROCMFPX:
-            mul_mat_q_case<GGML_TYPE_Q8_0_ROCMFPX>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_Q8_0_ROCMFPX, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_NVFP4:
             if (prec_src1 == GGML_PREC_Q4) {
                 mul_mat_q_case<GGML_TYPE_NVFP4, GGML_PREC_Q4>(ctx, args, stream);
                 break;
             }
-            mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, args, stream);
+            mul_mat_q_case<GGML_TYPE_NVFP4, GGML_PREC_Q8>(ctx, args, stream);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -220,11 +220,33 @@ void ggml_cuda_mul_mat_q(
             // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
             // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
             if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
-                ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+                // AMD-Ecosystem/llama.cpp #39 tiles over ~2x the per-expert average to cover routing imbalance;
+                // GGML_CUDA_MMQ_MOE_TILE_MULT selects the multiplier (default 1 = upstream behaviour)
+                static const int64_t moe_tile_mult = [] {
+                    const char * v = getenv("GGML_CUDA_MMQ_MOE_TILE_MULT");
+                    return v ? std::max<int64_t>(1, atoll(v)) : 1;
+                }();
+                ncols_opt = std::min<int64_t>(ne12, moe_tile_mult*((ne12*n_expert_used + ne02 - 1) / ne02));
             }
         }
 
         int ntiles_J_best = INT_MAX;
+
+        // ROCmFPX: the compact routed kernel (fork_compact_supported in mmq.cuh) picks its tile from the
+        // mean rows per expert instead of the fewest-tiles rule; keep that choice in sync with the padding
+        if (ids && !fallback && GGML_CUDA_CC_IS_RDNA3_5(cc) &&
+                (src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q4_0_ROCMI4 ||
+                 src0->type == GGML_TYPE_Q4_0_ROCMFP4_FAST || src0->type == GGML_TYPE_Q4_K) &&
+                ne02 == 512 && ne03 == 1 && ne13 == 1 && ne12 >= 16 && ne12 <= 32768 && ids->ne[0] == 10 &&
+                ((ne00 == 2560 && ne01 == 640) || (ne00 == 640 && ne01 == 2560))) {
+            const int64_t mean_rows = (ne12*ids->ne[0] + ne02 - 1) / ne02;
+            const int j = mean_rows <= 12 ? 16 : mean_rows <= 32 ? 48 : mean_rows <= 64 ? 64 : 128;
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, j, fallback, cc, prec_src1);
+            GGML_ASSERT(config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo);
+            J_best        = j;
+            nthreads_best = config.nthreads;
+            ntiles_J_best = 1;
+        }
 
         for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
             const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J, fallback, cc, prec_src1);
@@ -242,18 +264,6 @@ void ggml_cuda_mul_mat_q(
                 J_best = J;
                 nthreads_best = config.nthreads;
                 ntiles_J_best = ntiles_x;
-            }
-        }
-
-        // ROCmFPX routed compact MoE kernel: it uses its own tile width, so pick it here where the padding is computed.
-        if (ids && prec_src1 == GGML_PREC_Q8) {
-            const int64_t ne_get_rows = ne12 * ids->ne[0];
-            if (fork_compact_supported_shape(src0->type, fallback, cc, true, ne00, ne01, ne02, ne02, ne03, ne13, ne_get_rows, ne12)) {
-                const int j = fork_compact_J(ne_get_rows, ne02);
-                const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, j, fallback, cc);
-                GGML_ASSERT(config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo);
-                J_best        = j;
-                nthreads_best = config.nthreads;
             }
         }
     }
@@ -329,7 +339,8 @@ void ggml_cuda_mul_mat_q(
 
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
-    const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+    static const bool no_dedup = getenv("ROCMFPX_MMQ_NO_DEDUP") != nullptr && atoi(getenv("ROCMFPX_MMQ_NO_DEDUP")) != 0;
+    const bool dedup_bcast = ne11 == 1 && n_expert_used > 1 && !no_dedup;
 
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));

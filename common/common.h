@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <cstdio>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0A00
@@ -589,6 +590,7 @@ struct common_params {
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
+    bool load_mtp          = false; // load MTP/NextN layers
 
     bool single_turn       = false; // single turn chat conversation
 
@@ -627,7 +629,7 @@ struct common_params {
     std::string cls_sep    = "\t";  // separator of classification sequences
 
     // server params
-    int32_t port                = 8080;          // server listens on this network port
+    int32_t port                = 9931;          // server listens on this network port
     bool    reuse_port          = false;         // allow multiple sockets to bind to the same port
     int32_t timeout_read        = 3600;          // http read timeout in seconds
     int32_t timeout_write       = timeout_read;  // http write timeout in seconds
@@ -745,10 +747,11 @@ struct common_params {
     int32_t i_chunk     =  0; // start processing from this chunk
     int8_t  imat_dat    =  0; // whether the legacy imatrix.dat format should be output (gguf <= 0 < dat)
 
-    bool process_output  = false; // collect data for the output tensor
-    bool compute_ppl     = true;  // whether to compute perplexity
-    bool show_statistics = false; // show imatrix statistics per tensor
-    bool parse_special   = false; // whether to parse special tokens during imatrix tokenization
+    bool process_output         = false; // collect data for the output tensor
+    bool compute_ppl            = true;  // whether to compute perplexity
+    bool show_statistics        = false; // show imatrix statistics per tensor
+    bool activation_statistics  = false; // generate data to calculate activation based statistics
+    bool parse_special          = false; // whether to parse special tokens during imatrix tokenization
 
     // cvector-generator params
     int n_pca_batch = 100;
@@ -951,17 +954,6 @@ std::filesystem::path fs_get_cache_directory();
 std::filesystem::path fs_get_cache_file(const std::string & filename);
 std::filesystem::path fs_get_config_directory();
 
-struct common_file_info {
-    std::string path;
-    std::string name;
-    size_t      size = 0; // in bytes
-    bool        is_dir = false;
-};
-std::vector<common_file_info> fs_list(const std::string & path, bool include_directories);
-
-// fs open, also handle UTF8 on Windows
-std::ifstream fs_open_ifstream(const std::string & fname, std::ios_base::openmode mode);
-
 void fs_write_atomic(const std::filesystem::path & path, const std::string & data);
 
 //
@@ -972,11 +964,39 @@ void fs_write_atomic(const std::filesystem::path & path, const std::string & dat
 bool tty_can_use_colors();
 bool tty_enable_ansi(); // false when stdout or stderr is a console that cannot render ANSI sequences
 
+// Check if the given file is attached to a terminal
+bool common_is_tty(FILE * file);
+
 //
 // Model utils
 //
 
 struct common_sampler;
+
+// typed decision models, see "<arch>.decision.type" in the model metadata
+enum common_decision_type {
+    COMMON_DECISION_TYPE_NONE,    // not a decision model
+    COMMON_DECISION_TYPE_OPENJEV, // logits of one label token per option, read at the last prompt token
+    COMMON_DECISION_TYPE_LEV,     // same as openjev, noul is read from a rating scale
+    COMMON_DECISION_TYPE_KEV,     // dot product of the hidden states of the last token and of one end token per option
+    COMMON_DECISION_TYPE_NIMBLE,  // same as openjev, the prompt lists all the questions of the request
+    COMMON_DECISION_TYPE_LAYA,    // score of one marker token per option, read from the embeddings output
+    COMMON_DECISION_TYPE_CLEF,    // all questions in one prompt, score of option i read from the embeddings output at row i
+    COMMON_DECISION_TYPE_PPLX_DECIDER, // same as openjev, label codes of 1 or 2 letters
+    COMMON_DECISION_TYPE_LFM2_D1, // same as openjev, the labels depend on the question type
+    COMMON_DECISION_TYPE_LFM2_D1_OMNI, // same as laya, other prompt layout
+    COMMON_DECISION_TYPE_UNKNOWN, // a decision model of a type that is not supported
+};
+
+common_decision_type common_get_decision_type(const struct llama_model * model);
+
+// metadata of a GGUF file, read without loading the model
+struct common_gguf_info {
+    common_decision_type decision_type = COMMON_DECISION_TYPE_UNKNOWN; // UNKNOWN if the file is missing, unreadable, or invalid
+    uint32_t             n_ctx_train   = 0;                            // 0 if unknown
+};
+
+common_gguf_info common_get_gguf_info(const std::string & fname);
 
 // note: defines the model, context, samplers, ets. lifetimes
 struct common_init_result {
@@ -1074,7 +1094,9 @@ struct common_batch {
         llama_seq_id seq_id; // the first sequence id, see add_seq()
         bool         output;
         llama_embd   embd; // non-owning view of the data passed to add_embd()/set_embd(), data == NULL if none
+        llama_embd   state; // non-owning view of the data passed to set_embd_state(), data == NULL if none
         std::vector<llama_seq_id> seq_ids_extra; // see add_seq()
+        int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
     };
 
     std::vector<token> tokens; // mirror of the entries, tokens[i] describes batch index i
@@ -1109,6 +1131,9 @@ struct common_batch {
 
     // attach a token embedding to the entry at idx, can only be set once per entry
     bool set_embd(int32_t idx, llama_embd embd);
+
+    // attach a state embedding (e.g. the target hidden state for MTP) to the entry at idx, can only be set once per entry
+    bool set_embd_state(int32_t idx, llama_embd state);
 
     // add an embedding-only entry (no token id)
     // pos points to n_pos positions

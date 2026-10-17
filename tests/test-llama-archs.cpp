@@ -214,6 +214,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
 
+    if (arch == LLM_ARCH_K2_HORIZON) {
+        ms.add_kv(LLM_KV_ROPE_SCALING_YARN_BETA_FAST, 128.0f);
+        ms.add_kv(LLM_KV_ROPE_SCALING_YARN_BETA_SLOW,   4.0f);
+    }
+
     if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         std::vector<uint32_t> n_ff_per_layer;
         n_ff_per_layer.reserve(n_layer);
@@ -447,6 +452,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(4) : uint32_t(2)); // sqrtsoftplus : sigmoid
         ms.add_kv(LLM_KV_EXPERT_GROUP_SCALE,         1.0f);
         ms.add_kv(LLM_KV_EXPERTS_PER_GROUP,          uint32_t(1));
+        if (arch == LLM_ARCH_K2_HORIZON) {
+            ms.add_kv(LLM_KV_ATTENTION_VALUE_EXPERT_COUNT,      uint32_t(2));
+            ms.add_kv(LLM_KV_ATTENTION_VALUE_EXPERT_USED_COUNT, uint32_t(2));
+        }
     }
 
     ms.add_kv(LLM_KV_POSNET_EMBEDDING_LENGTH,   n_embd);
@@ -516,8 +525,9 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, bool mtp = false,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
+        bool mtp = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -629,14 +639,15 @@ static int test_qwen4exp_split_ple(const size_t seed, const float stdev) {
             std::fprintf(stderr, "FAIL MTP metadata/hidden extraction changed target logits on %s\n", ggml_backend_dev_name(dev));
             return 1;
         }
-        auto draft = get_model_and_ctx(with_mtp.get(), nullptr, seed, stdev, {dev}, LLAMA_SPLIT_MODE_LAYER, false, true);
+        auto draft = get_model_and_ctx(with_mtp.get(), nullptr, seed, stdev, {dev}, LLAMA_SPLIT_MODE_LAYER, false, nullptr, 0, true);
         llama_set_embeddings_nextn(draft.second.get(), true, true);
         const int n_embd = llama_model_n_embd_out(target.first.get());
         std::vector<float> hidden(n_embd);
         std::memcpy(hidden.data(), llama_get_embeddings_nextn_ith(target.second.get(), 0), n_embd * sizeof(float));
         common_batch batch(draft.second.get());
         const int32_t idx = batch.add(tokens[1], 0, 0, true);
-        batch.set_embd(idx, { hidden.data(), 1, (size_t) n_embd });
+        // the MTP head reads the target's hidden state through the batch's state embedding (upstream #29622 API)
+        batch.set_embd_state(idx, { hidden.data(), 1, (size_t) n_embd });
         const int status = llama_process(draft.second.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (status != 0) {
             throw std::runtime_error("qwen4exp MTP fixture decode failed");
@@ -648,6 +659,50 @@ static int test_qwen4exp_split_ple(const size_t seed, const float stdev) {
             }
         }
         std::printf("PASS MTP target hidden extraction and draft decode on %s\n", ggml_backend_dev_name(dev));
+    }
+    return 0;
+}
+
+// entries [n/4, n/2) are embd rows, decoded either as token/embd/token chunks or as one mixed batch
+// returns the llama_process() error code
+static int32_t get_logits_mixed(
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, const std::vector<float> & embd, bool mixed,
+        std::vector<float> & ret) {
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n_embd   = llama_model_n_embd_inp(model);
+    const uint32_t n_tokens = tokens.size();
+    const uint32_t i_embd_0 = n_tokens/4;
+    const uint32_t i_embd_1 = n_tokens/2;
+
+    const std::vector<uint32_t> bounds = mixed
+        ? std::vector<uint32_t>{0, n_tokens}
+        : std::vector<uint32_t>{0, i_embd_0, i_embd_1, n_tokens};
+
+    llama_memory_clear(llama_get_memory(lctx), true);
+    llama_batch_ext_ptr batch(llama_batch_ext_init(lctx));
+
+    ret.clear();
+    ret.reserve(n_tokens*n_vocab);
+    for (size_t c = 0; c + 1 < bounds.size(); c++) {
+        llama_batch_ext_clear(batch.get());
+        for (uint32_t i = bounds[c]; i < bounds[c + 1]; i++) {
+            const bool is_embd = i >= i_embd_0 && i < i_embd_1;
+            const int32_t idx = is_embd
+                ? llama_batch_ext_add_embd(batch.get(), 0, { embd.data() + (size_t) (i - i_embd_0)*n_embd, 1, n_embd })
+                : llama_batch_ext_add_token(batch.get(), 0, tokens[i]);
+            GGML_ASSERT(idx >= 0);
+            const llama_pos pos[4] = { (llama_pos) i, (llama_pos) i, (llama_pos) i, 0 };
+            llama_batch_ext_set_pos(batch.get(), idx, pos);
+            llama_batch_ext_set_output_logits(batch.get(), idx, true);
+        }
+        const int32_t err = llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        if (err != 0) {
+            return err;
+        }
+        for (uint32_t i = 0; i < bounds[c + 1] - bounds[c]; i++) {
+            const float * logits_ith = llama_get_logits_ith(lctx, i);
+            ret.insert(ret.end(), logits_ith, logits_ith + n_vocab);
+        }
     }
     return 0;
 }
@@ -767,6 +822,7 @@ static bool moe_implemented(const llm_arch arch) {
         case LLM_ARCH_GRANITE_MOE:
         case LLM_ARCH_MISTRAL3:
         case LLM_ARCH_LLAMA_EMBED:
+        case LLM_ARCH_K2_HORIZON:
             return true;
         default:
             return false;
@@ -789,7 +845,7 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_GRANITE_SWITCH) {
         return false; // FIXME adapter fixture
     }
-    if (arch == LLM_ARCH_LLAMA_EMBED || arch == LLM_ARCH_GEMMA_EMBEDDING || arch == LLM_ARCH_T5ENCODER) {
+    if (arch == LLM_ARCH_LLAMA_EMBED || arch == LLM_ARCH_GEMMA_EMBEDDING || arch == LLM_ARCH_GEMMA_EMBEDDING2 || arch == LLM_ARCH_T5ENCODER) {
         return false; // FIXME Embedding (?) models produce inconsistent results.
     }
     if (arch == LLM_ARCH_RWKV6 || arch == LLM_ARCH_RWKV6QWEN2 || arch == LLM_ARCH_RWKV7 || arch == LLM_ARCH_ARWKV7) {
@@ -801,6 +857,9 @@ static bool arch_supported(const llm_arch arch) {
     }
     if (arch == LLM_ARCH_PLM) {
         return false; // TODO tensor shapes
+    }
+    if (arch == LLM_ARCH_CLEF) {
+        return false; // TODO decision head tensors
     }
     if (arch == LLM_ARCH_DEEPSEEK2OCR) {
         return false;
@@ -975,15 +1034,15 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         max_arch_name_length = std::max(max_arch_name_length, strlen(llm_arch_name(arch)));
     }
 
-    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|\n";
+    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|%15s|\n";
     const std::string template_row_cfg = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|";
-    const std::string template_row_res = "%15s %10s|%20s|\n";
+    const std::string template_row_res = "%15s %10s|%20s|%15s %10s|\n";
 
     bool all_ok = true;
     size_t n_tests = 0;
     size_t n_failed = 0;
     common_log_flush(common_log_main());
-    LOG(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip");
+    LOG(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip", "Mixed batch");
     LOG("|");
     for (size_t i = 0; i < max_arch_name_length; i++) {
         LOG("-");
@@ -992,7 +1051,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     for (size_t i = 0; i < max_device_label_length; i++) {
         LOG("-");
     }
-    LOG("|------|---------------|---------|\n");
+    LOG("|------|---------------|---------|---------------|\n");
     for (const llm_arch & arch : llm_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
@@ -1036,6 +1095,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 std::vector<float> logits_dev;
                 std::string status_nmse      = "\033[1;33mSKIP\033[0m";
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
+                std::string status_mixed     = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
                 // The Meta backend keys its simple-tensor map by the original
                 // GGUF tensor address. Adding the typed PLE table copies that
@@ -1046,6 +1106,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                     arch == LLM_ARCH_QWEN4EXP && dc.split_mode == LLAMA_SPLIT_MODE_TENSOR;
                 bool skip = !arch_supported(arch) || ple_meta_incompatible ||
                     (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty());
+                char mixed_str[12] = {0};
                 bool test_executed = false;
                 bool test_ok = true;
                 if (!skip) {
@@ -1055,7 +1116,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         test_executed = true;
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, false, overrides, dc.moe_cache_size);
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
@@ -1064,6 +1125,43 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             test_ok = false;
                             status_nmse = "\033[1;31mFAIL\033[0m";
                         }
+
+                        // chunked decode matches a single batch only with causal attention over a memory
+                        llama_context * lctx_dev = model_and_ctx_dev.second.get();
+                        if (!encode && llama_get_memory(lctx_dev) != nullptr) {
+                            std::vector<float> embd_mixed((size_t) llama_model_n_embd_inp(model_and_ctx_dev.first.get())*tokens.size()/4);
+                            std::mt19937 gen(seed);
+                            std::normal_distribution<float> dis(0.0f, stdev);
+                            for (float & v : embd_mixed) {
+                                v = dis(gen);
+                            }
+                            std::vector<float> logits_mixed;
+                            std::vector<float> logits_chunks;
+                            if (llm_arch_supports_mixed_batch(arch)) {
+                                if (get_logits_mixed(model_and_ctx_dev.first.get(), lctx_dev, tokens, embd_mixed, false, logits_chunks) != 0 ||
+                                    get_logits_mixed(model_and_ctx_dev.first.get(), lctx_dev, tokens, embd_mixed, true,  logits_mixed)  != 0) {
+                                    throw std::runtime_error("failed to decode mixed batch");
+                                }
+                                const double nmse_mixed = nmse(logits_chunks, logits_mixed);
+                                snprintf(mixed_str, sizeof(mixed_str), "(%.2e)", nmse_mixed);
+                                status_mixed = "\033[1;32mOK\033[0m";
+                                if (nmse_mixed > 1e-4) {
+                                    test_ok = false;
+                                    status_mixed = "\033[1;31mFAIL\033[0m";
+                                }
+                            } else {
+                                // must be rejected as an invalid batch, mute the expected error log
+                                ud.verbosity = LOG_LEVEL_OUTPUT;
+                                const int32_t err = get_logits_mixed(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, embd_mixed, true, logits_mixed);
+                                ud.verbosity = verbosity;
+                                if (err != -1) {
+                                    test_ok = false;
+                                    status_mixed = "\033[1;31mFAIL\033[0m";
+                                }
+                            }
+                        }
+
+                        // runs after the mixed batch check, as it leaves the context with non-causal attention
                         if (!encode && !check_causal_attn_toggle(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens)) {
                             if (test_ok) {
                                 status_nmse = "\033[1;31mFAIL\033[0m (toggle)";
@@ -1084,7 +1182,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         ms.save(file);
                         rewind(file);
 
-                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, false, overrides, dc.moe_cache_size);
+                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size);
                         const std::vector<float> logits_roundtrip = get_logits(
                             model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
                         status_roundtrip = "\033[1;32mOK\033[0m";
@@ -1108,7 +1206,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 }
 
                 // log the results for this test case
-                LOG(template_row_res.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str());
+                LOG(template_row_res.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str(), status_mixed.c_str(), mixed_str);
             }
         }
     }
@@ -1129,6 +1227,7 @@ int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
     common_init();
+    llama_backend_init();
 
     std::random_device rd;
 

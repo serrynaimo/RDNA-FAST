@@ -104,7 +104,7 @@ struct common_speculative_config {
             const common_params_speculative & p = common_params_speculative{}) : type(t), params(p) {}
 };
 
-static bool common_speculative_are_compatible(
+bool common_speculative_are_compatible(
     const llama_model * model_tgt,
     const llama_model * model_dft) {
     const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
@@ -1534,6 +1534,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1559,8 +1560,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
-        // TODO: how to make it work with vision tokens?
-        if (!batch_in.has_token() || batch_in.has_embd()) {
+        if (!batch_in.has_token() && !batch_in.has_embd()) {
             return true;
         }
 
@@ -1599,15 +1599,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
 
             for (int k = 0; k < n_tokens; ++k) {
-                const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
+                const auto & t = batch_in.tokens[k];
 
-                const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
+                const llama_seq_id seq_id = t.seq_id;
+
+                // vision tokens carry an embedding instead of an id
+                const int32_t idx = t.id != LLAMA_TOKEN_NULL
+                    ? batch.add(t.id, t.pos[0], seq_id, false)
+                    : batch.add_embd(t.embd, t.pos.data(), seq_id, false);
 
                 const float * h_row = k == i_batch_beg[seq_id]
                     ? pending_h[seq_id].data()
                     : h_tgt + (size_t) (k - 1) * n_embd;
 
-                batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
+                batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1715,7 +1720,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
-            batch.set_embd(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+            batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
 
             i_last[seq_id] = idx;
 
@@ -1779,15 +1784,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
+                auto & dp = dparams.at(seq_id);
+
                 // With no probability cutoff, the MTP draft always takes the
                 // highest logit. Only bypass top-k for a finite unique maximum;
                 // ties and non-finite values retain the original sampler path.
+                // probabilistic drafts (result_q) need the full candidate list.
                 const char * cumulative_cut = std::getenv("ROCMFPX_MTP_CUM_P");
-                const bool direct_choice = candidate_vocabulary && candidate_step && !chain_heads && !dparams.at(seq_id).result_q &&
-                    params.p_min == 0.0f && !params.backend_sampling &&
+                const bool direct_choice = candidate_vocabulary && candidate_step && !chain_heads &&
+                    params.p_min == 0.0f && !params.backend_sampling && !dp.result_q &&
                     (!cumulative_cut || std::strtof(cumulative_cut, nullptr) <= 0.0f);
                 llama_token id = LLAMA_TOKEN_NULL;
                 float p_top = 0.0f;
+                const llama_token_data_array * cur_p = nullptr;
                 const bool used_exact = direct_choice && candidate_vocabulary->unique_max(
                     llama_get_logits_ith(ctx_dft, i_last[seq_id]), id, seq_id);
                 llama_token id_sampled = LLAMA_TOKEN_NULL;
@@ -1795,7 +1804,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (!used_exact) {
                 id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
 
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                cur_p = common_sampler_get_candidates(smpl, true);
 
                 for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
                     SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
@@ -1839,13 +1848,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     const char * env = std::getenv("ROCMFPX_MTP_CUM_P");
                     return (env && env[0]) ? std::strtof(env, nullptr) : 0.0f;
                 }();
+                // ROCMFPX_MTP_CUM_MIN / ROCMFPX_MTP_CUM_MAX bound the adaptive length (default 1 / 5): the cutoff
+                // can only stop after CUM_MIN tokens and always stops at CUM_MAX
+                static const int rocmfpx_cum_min = [] {
+                    const char * env = std::getenv("ROCMFPX_MTP_CUM_MIN");
+                    return (env && env[0]) ? std::max(1, atoi(env)) : 1;
+                }();
+                static const int rocmfpx_cum_max = [] {
+                    const char * env = std::getenv("ROCMFPX_MTP_CUM_MAX");
+                    return (env && env[0]) ? std::max(1, atoi(env)) : 5;
+                }();
                 if (rocmfpx_cum_p > 0.0f) {
                     float & cum = cum_hold[seq_id];
                     if (cum <= 0.0f) {
                         cum = 1.0f;
                     }
                     cum *= p_top;
-                    if (cum < rocmfpx_cum_p || result.size() >= 5) {
+                    // never exceed the depth the caller reserved outputs for (the server sizes n_outputs_max by n_max)
+                    const int cum_max = std::min(rocmfpx_cum_max, params.n_max);
+                    if ((cum < rocmfpx_cum_p && (int) result.size() >= rocmfpx_cum_min) || (int) result.size() >= cum_max) {
                         drafting[seq_id] = false;
                         n_drafting--;
                         continue;
@@ -1877,18 +1898,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     for (int t = 0; t < n_rows; ++t) {
                         const llama_token tok = (t == 0) ? dp.id_last : result[t - 1];
                         const int32_t idx = batch.add(tok, dp.pos0 + t, seq_id, t == n_rows - 1);
-                        batch.set_embd(idx, { chain_h[seq_id].data() + (size_t) t * n_embd, 1, (size_t) n_embd });
+                        batch.set_embd_state(idx, { chain_h[seq_id].data() + (size_t) t * n_embd, 1, (size_t) n_embd });
                         i_last[seq_id] = idx;
                     }
                 } else if (is_mem_shared) {
                     // note: with shared memory (e.g. Gemma4 assistants) we use the same position for all draft tokens
                     // ref: https://github.com/huggingface/transformers/blob/effde20942e3f82a1b97449f60b3a48c5ff96145/docs/source/en/model_doc/gemma4_assistant.md?plain=1#L36-L37
                     const int32_t idx = batch.add(id, dp.pos0, seq_id, true);
-                    batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
+                    batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
                     i_last[seq_id] = idx;
                 } else {
                     const int32_t idx = batch.add(id, dp.pos0 + i + 1, seq_id, true);
-                    batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
+                    batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
                     i_last[seq_id] = idx;
                 }
             }
@@ -3332,8 +3353,8 @@ void common_speculative_draft(common_speculative * spec) {
                         SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
                         result.resize(dp.n_max);
 
-                        // the candidates are one per drafted token and must be cut with them
-                        if (dp.result_q) {
+                        // trim the candidates only if the drafter produced them (n-gram drafters do not)
+                        if (dp.result_q && !dp.result_q->empty()) {
                             dp.result_q->resize(dp.n_max);
                         }
                     }

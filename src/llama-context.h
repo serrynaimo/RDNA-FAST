@@ -422,6 +422,8 @@ private:
     // [TAG_NODE_DUMP] LLAMA_NODE_DUMP=1: every tensor named by the graph callback is kept (marked as an output) and a
     // fingerprint of each is logged after every ubatch, to find the first tensor that differs between two runs
     bool node_dump = false;
+    // true after the prism.hadamard coverage check passes on a reserved graph
+    bool hadamard_verified = false;
 
     // perf
     mutable int64_t t_start_us  = 0;

@@ -78,6 +78,7 @@ extern "C" {
         LLAMA_VOCAB_TYPE_RWKV   = 5, // RWKV tokenizer based on greedy tokenization
         LLAMA_VOCAB_TYPE_PLAMO2 = 6, // PLaMo-2 tokenizer based on Aho-Corasick with dynamic programming
         LLAMA_VOCAB_TYPE_TEST   = 7, // Dummy tokenizer for testing: rolling hash of fixed-size chunks -> tokens, tokens -> hex
+        LLAMA_VOCAB_TYPE_PLAMO3 = 8, // PLaMo-3 tokenizer with pre-segmentation and dynamic programming
     };
 
     enum llama_rope_type {
@@ -1081,6 +1082,7 @@ extern "C" {
     // "state" here means extra hidden state carried over from a previous stage, e.g.:
     //   - MTP: state from N layers of the target model
     //   - Qwen3 VL (deepstack): state from N layers of the vision encoder
+    // Returns false if the context does not take a state embedding (currently only MTP contexts do)
     LLAMA_API bool llama_batch_ext_set_embd_state(
                                 struct llama_batch_ext * batch,
                                                int32_t   idx,
@@ -1102,7 +1104,7 @@ extern "C" {
 
     // Set custom position for the token at index idx in the batch
     // For M-RoPE models:
-    //     - Embedding tokens must have multiple positions per token
+    //     - Embedding tokens must have n_pos_per_embd positions per token, in order [t, y, x, z]; t is also the KV cache position
     //     - Text token only requires one single position per token
     LLAMA_API bool llama_batch_ext_set_pos(
                                 struct llama_batch_ext * batch,

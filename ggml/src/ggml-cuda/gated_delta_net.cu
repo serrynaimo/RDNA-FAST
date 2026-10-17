@@ -30,7 +30,15 @@ static __device__ __forceinline__ float gdn_warp_reduce_sum(const float x) {
     return warp_reduce_sum<width>(x);
 }
 
+#if defined(GGML_USE_HIP)
+// ROCmFPX: one state column per warp on HIP. The <16-token kernel must stay bit-identical to the RDNA3.5
+// tiled kernel that takes over at 16+ tokens, or a 1-4 token decode step and a 16+ token speculative verify
+// batch disagree in the last bit and n-gram replays of a cached answer stop being accepted (measured on
+// Qwen3.8-Flash-Next: json replay 136 -> 46 t/s). Four columns per warp changes the reduction width.
+constexpr int gdn_cols_per_warp = 1;
+#else
 constexpr int gdn_cols_per_warp = 4;
+#endif
 
 template <int S_v, bool KDA, bool keep_rs_t, int cols_per_warp = gdn_cols_per_warp>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
@@ -717,8 +725,8 @@ static void launch_gated_delta_net(
         float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-    // four columns per warp (see the kernel); shrink the CTA when the wider CTA would leave
-    // SMs without a CTA, so small head counts keep the device filled
+    // gdn_cols_per_warp columns per warp (four on CUDA, one on HIP; see the kernel); shrink the CTA when the
+    // wider CTA would leave SMs without a CTA, so small head counts keep the device filled
     const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
     const int cols_per_warp = gdn_cols_per_warp;
     int num_warps = 4;

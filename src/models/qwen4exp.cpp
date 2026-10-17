@@ -733,10 +733,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     graph(model, params, no_build_t{}) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN4EXP MTP requires n_layer_nextn > 0");
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN4EXP MTP currently only supports a single MTP block");
-    GGML_ASSERT(ubatch.token && "QWEN4EXP MTP requires token input");
+    // token rows arrive as ids; multimodal (mtmd) rows arrive as projected embeddings, both are accepted
+    GGML_ASSERT((ubatch.token || ubatch.embd) && "QWEN4EXP MTP requires token or embedding input");
 
     const int64_t hc     = hparams.dsv4_hc_mult;
     const int64_t hc_dim = hc * n_embd;
+    const int64_t n_embd_inp = hparams.n_embd_inp();
     GGML_ASSERT(hparams.n_embd_out() == (uint32_t) hc_dim && "QWEN4EXP MTP hidden width mismatch");
 
     const int il = hparams.n_layer();
@@ -760,12 +762,13 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hc_dim);
+    // the embedding rows are n_embd_inp wide (mtmd projection width); the state rows are hc_dim wide
+    auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd_inp, hc_dim);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
 
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
     ggml_set_input(inp->embd);
 
     inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
@@ -776,7 +779,14 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     if (tok_embd_w == nullptr) {
         tok_embd_w = qwen4exp_shared_model(cparams, model, "token_embd.weight").tok_embd;
     }
-    ggml_tensor * tok_embd   = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+    ggml_tensor * tok_embd = nullptr;
+    if (ubatch.token) {
+        tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+    } else {
+        // image rows: the target encoder already projected them into the token-embedding space
+        GGML_ASSERT(n_embd_inp == tok_embd_w->ne[0] && "QWEN4EXP MTP: mtmd embedding width != token embedding width");
+        tok_embd = inp->embd;
+    }
     cb(tok_embd, "mtp_tok_embd", il);
 
     ggml_tensor * h_state = ggml_reshape_3d(ctx0, inp->h, n_embd, hc, n_tokens);
@@ -800,7 +810,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             // the MTP graph has no recurrent layers, so the hybrid input's recurrent tensors are never used and the
             // allocator skips them -- set_input would then hit a null buffer. Give them a trivial use.
             auto * rs = inp_hyb->get_recr();
-            for (ggml_tensor * t : { rs->s_copy, rs->s_copy_main, rs->s_copy_extra }) {
+            for (ggml_tensor * t : { rs->s_copy, rs->s_copy_main, rs->s_copy_tail }) {
                 if (t) { ggml_build_forward_expand(gf, ggml_scale(ctx0, ggml_cast(ctx0, t, GGML_TYPE_F32), 0.0f)); }
             }
         }
@@ -1017,10 +1027,39 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
 // The original `!ubatch.embd` guard was aimed at pure-embedding (vision) batches, which are already
 // excluded by requiring ubatch.token; keeping it shut the draft out of block selection, and with it out of
 // the maskless/packed-key layout and the qsa3 attention kernel.
+// Decode-sized ubatches (1..8 tokens) go to the bounded sparse decode kernel (ggml-cuda/qsa-decode.cuh) when
+// ROCMFPX_QWEN4_QSA_DECODE=1; build_qsa_top_k and build_attn_qsa must agree on it, so both ask here.
+static bool qwen4exp_qsa_decode_direct(int64_t n_tokens, int64_t n_query, int64_t n_kv) {
+#if defined(GGML_USE_HIP)
+    static const bool enabled = [] {
+        const char * v = getenv("ROCMFPX_QWEN4_QSA_DECODE");
+        return v && strcmp(v, "1") == 0;
+    }();
+    return enabled && n_tokens >= 1 && n_tokens <= 8 && n_query >= 1 && n_query <= 8 && n_kv >= 8192;
+#else
+    GGML_UNUSED(n_tokens); GGML_UNUSED(n_query); GGML_UNUSED(n_kv);
+    return false;
+#endif
+}
+
+// Block selection for those decode ubatches as well: the decode kernel skips the -1 sentinels of the complete-block
+// list, so it can take the same top-k-of-blocks selection prefill uses instead of the per-cell top-k over the whole
+// context (per-cell score expansion, mask add and a top-k over n_kv cells per layer, plus the O(n_kv) CPU block scan
+// per ubatch; ~18 ms per token at 165k on gfx1151). The masked dense attention path cannot (set_rows on -1), so this
+// is tied to the decode kernel. ROCMFPX_QWEN4_QSA_DECODE_BLOCKS=0 keeps the per-cell selection.
+static bool qwen4exp_qsa_decode_blocks(int64_t n_tokens, int64_t n_stream, int64_t n_kv) {
+    static const bool enabled = [] {
+        const char * v = getenv("ROCMFPX_QWEN4_QSA_DECODE_BLOCKS");
+        return !v || strcmp(v, "0") != 0;
+    }();
+    return enabled && n_stream == 1 && qwen4exp_qsa_decode_direct(n_tokens, n_tokens, n_kv);
+}
+
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams) {
     return blk_bias && n_stream==1 && ratio>1 && hparams.indexer_top_k%ratio==0 &&
-        n_kv>hparams.indexer_top_k+ratio-1 && n_kv<=16777216 && ubatch.token && ubatch.n_tokens >= 128 &&
+        n_kv>hparams.indexer_top_k+ratio-1 && n_kv<=16777216 && ubatch.token &&
+        (ubatch.n_tokens >= 128 || qwen4exp_qsa_decode_blocks(ubatch.n_tokens, n_stream, n_kv)) &&
         cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias==0.0f &&
         !hparams.attn_soft_cap && hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256;
 }
@@ -1047,6 +1086,20 @@ static std::vector<int64_t> qwen4exp_score_key_limits(const llama_memory_hybrid_
     }
     auto limits = qsa_prefix_limits(ubatch.pos,ubatch.n_tokens,strip,ratio,blocks,budget);
     return limits;
+}
+
+// Decode-sized ubatches (fewer than 128 tokens, cell-expanded selection) read the pooled-key cache as well: without
+// it every decode step gathers, pools, normalizes and rotates every indexer block of the context again, which grows
+// linearly with the context (~15 ms per token at 48k on gfx1151). The cache rows are the prefix's logical blocks and
+// qsa_decode_cacheable guarantees the generic block ids coincide with them. ROCMFPX_QWEN4_QSA_DECODE_CACHE=0 disables it.
+static bool qwen4exp_qsa_decode_cached(const llama_memory_hybrid_idx_context * mctx, const llama_ubatch & ubatch,
+        uint32_t ratio, bool compact, int64_t n_stream) {
+    static const bool enabled = [] {
+        const char * v = getenv("ROCMFPX_QWEN4_QSA_DECODE_CACHE");
+        return !v || strcmp(v, "0") != 0;
+    }();
+    return enabled && ratio == 4 && !compact && n_stream == 1 && ubatch.n_tokens < 128 &&
+        mctx->qsa_decode_cacheable(ubatch);
 }
 
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
@@ -1077,6 +1130,7 @@ public:
         const int64_t n_blocks = ((int64_t) mctx->qsa_n_kv_window() + ratio - 1)/ratio;
 
         bool res = incremental_prefix == (ratio == 4 && mctx->qsa_prefix_matches(params.ubatch));
+        res &= decode_cached == qwen4exp_qsa_decode_cached(mctx, params.ubatch, ratio, compact, n_stream);
 
         res &= params.ubatch.n_tokens % n_stream == 0;
 
@@ -1113,6 +1167,7 @@ public:
 
     ggml_tensor * tail_idxs = nullptr;
     bool incremental_prefix = false;
+    bool decode_cached = false;
     bool compact = false;
     bool maskless = false;
     int64_t score_strip = 0;
@@ -1274,6 +1329,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             cparams.causal_attn && hparams.n_swa==0 && mctx_hyb->qsa_scalar_visibility(ubatch);
         qsa->incremental_prefix = r == 4 && mctx_hyb->qsa_prefix_matches(ubatch);
         qsa->compact = scalar;
+        qsa->decode_cached = qwen4exp_qsa_decode_cached(mctx_hyb, ubatch, (uint32_t) r, scalar, n_stream);
         qsa->maskless = scalar;
         qsa->score_strip=qwen4exp_query_strip(n_tps,n_stream);
         qsa->score_key_limits=qwen4exp_score_key_limits(mctx_hyb,ubatch,n_blocks,qsa->score_strip,r,
@@ -1311,7 +1367,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
     k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
 
-    ggml_tensor * cached = r == 4 && inp->compact && mctx_hyb->qsa_prefix_matches(ubatch)
+    ggml_tensor * cached = r == 4 && (inp->compact || inp->decode_cached) && mctx_hyb->qsa_prefix_matches(ubatch)
             ? mctx_hyb->qsa_cache(ctx0, il) : nullptr;
     const bool fast_cache = cached && mctx_hyb->qsa_fast(il, ubatch);
     const int64_t prep_blocks = fast_cache ? (n_tokens+3)/4+1 : n_blocks;
@@ -1536,17 +1592,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         // unsupported shapes below. Keep the original path for short caches:
         // the sparse WMMA path changes rounding and only benefits longer scans.
         // The default path is unchanged.
-        bool decode_direct = false;
-#if defined(GGML_USE_HIP)
-        const char * decode_direct_env = getenv("ROCMFPX_QWEN4_QSA_DECODE");
-        decode_direct = decode_direct_env && strcmp(decode_direct_env, "1") == 0 &&
-            n_tokens >= 1 && n_tokens <= 8 && n_query <= 8 &&
-            kq_mask->ne[0] >= 8192;
-#endif
+        const bool decode_direct = qwen4exp_qsa_decode_direct(n_tokens, n_query, kq_mask->ne[0]);
         const bool direct_indices =
             (n_tokens >= 128 || decode_direct) &&
             n_stream == 1 && cparams.flash_attn && cparams.offload_kqv &&
             hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap;
+        // a complete-block list (compact selection) carries -1 sentinels that only the index-consuming kernels skip
+        GGML_ASSERT(direct_indices || shared_qsa == qsa_inps.end() || !shared_qsa->second->compact);
         ggml_tensor * kq_mask_top_k = kq_mask;
         if (!direct_indices) {
         // prepare new kq mask - starts filled with -INFINITY
@@ -1586,7 +1638,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         // TODO: enable sparse attention when we are ready
         // ref: https://github.com/ggml-org/llama.cpp/pull/27970
         //ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
-        const int64_t n_kv_max = top_k->ne[0];
         ggml_tensor * cur;
         if (direct_indices) {
             GGML_ASSERT(q->ne[0] == 256 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
@@ -2005,7 +2056,8 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         ? (llama_token) hp.ple_image_token_id
         : (llama_token) hp.ple_eos_token_id;
     auto tok_of = [&](int64_t k) -> llama_token {
-        return ubatch->token ? ubatch->token[k] : img_tok;
+        const bool is_embd = !ubatch->token || (ubatch->is_mixed() && ubatch->type[k]);
+        return is_embd ? img_tok : ubatch->token[k];
     };
 
     const int64_t n_tokens = ubatch->n_tokens;

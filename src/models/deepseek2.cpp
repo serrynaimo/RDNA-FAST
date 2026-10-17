@@ -206,7 +206,7 @@ llama_model_deepseek2::graph_mtp::graph_mtp(const llama_model & model, const llm
     GGML_ASSERT(layer.ffn_down_shexp);
     GGML_ASSERT(layer.ffn_up_shexp);
 
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hparams.n_embd);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
@@ -215,6 +215,7 @@ llama_model_deepseek2::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_set_input(inp->embd);
 
     ggml_tensor * tok_embd;
+    ASSERT_EMBD_OR_TOKEN(ubatch);
     if (ubatch.token) {
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens
                 ? layer.nextn.embed_tokens

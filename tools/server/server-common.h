@@ -106,6 +106,20 @@ std::string gen_tool_call_id();
 const char * get_media_marker();
 
 //
+// model output modalities
+//
+
+// output modalities for architecture.output_modalities in GET /models
+std::vector<std::string> server_model_output_modalities(common_decision_type decision_type);
+
+// architecture object of GET /models; shared by the direct server and the router
+json server_model_architecture_json(
+        bool inp_image,
+        bool inp_audio,
+        bool inp_video,
+        const std::vector<std::string> & output_modalities);
+
+//
 // lora utils
 //
 
@@ -276,6 +290,12 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
 // if validate_utf8(text) == text.size(), then the whole text is valid utf8
 size_t validate_utf8(const std::string& text);
 
+// load a media file from an URL (http, file, data) or from raw base64 data
+void handle_media(
+        std::vector<raw_buffer> & out_files,
+        const std::string & url,
+        const std::string & media_path);
+
 // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
 // if is_placeholder is true, the media chunk will be treated as placeholder for counting tokens; the output tokens are not usable for actual inference (e.g. for submitting a task to server_queue)
 server_tokens process_mtmd_prompt(
@@ -341,9 +361,11 @@ json oaicompat_completion_params_parse(const json & body);
 
 // used by /chat/completions endpoint
 json oaicompat_chat_params_parse(
+    const llama_vocab * vocab,
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files);
+    std::vector<raw_buffer> & out_files,
+    common_chat_session & out_session);
 
 // used by /embeddings endpoint, content has the same format as a chat message content array
 server_tokens tokenize_oai_content_array(

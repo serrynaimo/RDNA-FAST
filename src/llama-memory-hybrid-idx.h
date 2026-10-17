@@ -128,6 +128,9 @@ public:
     void qsa_invalidate();
     bool qsa_prefix_matches(const llama_ubatch & ubatch) const;
     bool qsa_fast(int il, const llama_ubatch & ubatch) const;
+    // the cell-expanded (decode-sized) scorer addresses blocks by set_input_qsa_impl's ids, which equal the prefix's
+    // logical blocks (position/ratio) only while the indexer cache holds exactly the prefix sequence's cells
+    bool qsa_decode_cacheable(const llama_ubatch & ubatch) const;
     ggml_tensor * qsa_cache(ggml_context * ctx, int il, int64_t blocks) const;
     void qsa_fill_updates(ggml_tensor * members, ggml_tensor * positions, ggml_tensor * rows) const;
     void qsa_commit(int il) const;
@@ -158,9 +161,6 @@ private:
 
     // unique_ptr because kpool_layout is incomplete here
     std::unique_ptr<kpool_layout> kpool_lay;
-
-    // whether the current layout has cells shared between sequences (kpool_layout is incomplete here, so out of line)
-    bool kpool_layout_shared() const;
 
     // seq_id < 0 stales every sequence, p0 < 0 stales the sequence from its first position
     void mem_idx_stale_set(llama_seq_id seq_id, llama_pos p0);
@@ -227,6 +227,7 @@ public:
     const llama_kv_cache_context * get_idx() const;
     bool qsa_prefix_matches(const llama_ubatch & u) const { return mem && mem->qsa_prefix_matches(u); }
     bool qsa_fast(int il, const llama_ubatch & u) const { return mem && mem->qsa_fast(il, u); }
+    bool qsa_decode_cacheable(const llama_ubatch & u) const { return mem && mem->qsa_decode_cacheable(u); }
     // cells the block metadata must cover: the KV view is sized by occupied cells, but a cache whose positions
     // run ahead of its cells (an MTP draft never receives the image cells an M-RoPE image pins to one position)
     // has blocks past that view. Never below get_n_kv(), padded like it so graph reuse keeps its cadence.
@@ -246,12 +247,11 @@ public:
     // glm5-next and qwen4exp, complete pools of kpool cells per sequence, scored as whole pools.
     uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
     uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.
-    bool get_kpool_cache_safe() const;
     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
-    ggml_tensor * gather_mla_rows(ggml_context * ctx, ggml_tensor * idxs, int64_t n_rows, int64_t n_embd, int32_t il) const;
+    // sel_mask (F32 [n_sel, 1, 1, n_tokens], can be null): 0 for the live selection slots, -inf for the dead ones
     // new_pool_pos (I32 [4*n_new]): M-RoPE position of each new pool's first member, for pooled keys rotated at pooling time
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
-                         ggml_tensor * gather_mask, bool gather, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
+                         ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
                          const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
