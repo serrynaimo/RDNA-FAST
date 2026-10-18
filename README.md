@@ -10,7 +10,7 @@ GPU, ideal for Hermes.
 ## Highlights
 
 - **Quicker agentic loops than LM Studio on the same card.** A two-agent session takes
-  125 s here, 168 s on stock llama.cpp with its MTP draft and 17.7 min without
+  123 s here, 168 s on stock llama.cpp with its MTP draft and 17.7 min without
   it; decode is about twice as fast. [Numbers](#speed)
 - **Faster prefill AND decode.** The model's own MTP head drafts four tokens ahead: 50 t/s
   on prose and 73 t/s on code, against 35 t/s without it. Text copy boost: code
@@ -49,13 +49,13 @@ identical prompts (14 requests; an orchestrator grows from 4k to 41k tokens, a
 
 | | stock llama.cpp | stock + MTP draft | this runtime |
 |---|---:|---:|---:|
-| **the session, wall-clock** | **1,065 s** | **168 s** | **125 s** |
-| prefill t/s, cold 4k prompt | 174 | 636 | 641 |
-| prefill t/s, 4.3k new tokens at 17k depth | 67 | 592 | 621 |
-| prefill t/s, 4.0k new tokens at 41k depth | 32 | 458 | 506 |
+| **the session, wall-clock** | **1,065 s** | **168 s** | **123 s** |
+| prefill t/s, cold 4k prompt | 174 | 636 | 665 |
+| prefill t/s, 4.3k new tokens at 17k depth | 67 | 592 | 634 |
+| prefill t/s, 4.0k new tokens at 41k depth | 32 | 458 | 519 |
 | decode t/s at 4k depth | 32.3 | 31.5 | 57.5 |
-| decode t/s at 17k depth | 17.8 | 30.9 | 57.5 |
-| decode t/s at 41k depth | 10.6 | 24.3 | 55.4 |
+| decode t/s at 17k depth | 17.8 | 30.9 | 57.2 |
+| decode t/s at 41k depth | 10.6 | 24.3 | 55.3 |
 | decode t/s, text copy boost: code edit that copies the prompt | | | 202 |
 
 <sub>October 2026. Stock is LM Studio's ROCm llama.cpp runtime 2.55.0 with
