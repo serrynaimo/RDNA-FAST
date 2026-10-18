@@ -2591,7 +2591,10 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
 
     // mixed path (ubatch.is_mixed()): set_rows the token rows into a copy of the embd rows, with its own inputs as select branches must not share tensors
     // TODO: use inp->tokens and inp->embd once ggml_build_forward_select allows it
-    const bool has_mixed = llm_arch_supports_mixed_batch(arch) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
+    // ROCmFPX: built only for a mixed ubatch (the batch allocator lets one through only where the arch supports it), so the
+    // worst-case reserve of a text-only server does not hold the branch (+40 MiB device and pinned host on a 5120 x 1024 ubatch);
+    // the first mixed ubatch re-reserves the compute buffer, allow_reuse() already keys on is_mixed()
+    const bool has_mixed = ubatch.is_mixed();
 
     const int64_t n_tok_rows = has_mixed ? llm_graph_n_tok_rows(ubatch) : 0;
 
