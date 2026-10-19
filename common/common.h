@@ -653,6 +653,10 @@ struct common_params {
     int32_t cache_disk_checkpoints = -1;   // max context checkpoints persisted with each SSD entry (-1 = all, 0 = none)
     int32_t cache_disk_prefix_step = 4096; // spacing of the shared system-prompt prefix entries (0 = disable them)
 
+    // llama-connect params
+    bool        server_connect      = false;
+    std::string server_connect_code = "";
+
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT

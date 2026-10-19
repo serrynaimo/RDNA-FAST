@@ -137,6 +137,7 @@ option(LLAMA_BUILD_APP       "llama: build the unified binary"                  
 option(LLAMA_BUILD_UI        "llama: build the embedded Web UI for server"                                       OFF)
 option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when available" ON)
 option(ROCMFPX_VULKAN_PLUGIN "ROCmFPX: build the optional Charlie Vulkan backend plugin" OFF)
+option(LLAMA_CONNECT         "llama: include the llama-connect tool (downloads a prebuilt binary)"               OFF)
 
 option(LLAMA_TOOLS_INSTALL "llama: install tools" ${LLAMA_TOOLS_INSTALL_DEFAULT})
 option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
