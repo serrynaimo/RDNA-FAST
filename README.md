@@ -178,13 +178,14 @@ the stock behaviour.
   server and do not depend on the GPU. The tree builds with gcc and the Vulkan
   backend (checked on 10 October 2026).
 - **AMD cards with HIP.** The GPU backend builds for the gfx11 targets: RDNA3
-  (RX 7000 series) and RDNA3.5 (gfx1151, checked on 10 October 2026). It does
-  not build for RDNA2 or RDNA4 targets, because the bf16 matmul file inherited
-  from ROCmFPX uses RDNA3-only instructions. That limit predates the work
-  described here.
+  (RX 7000 series) and RDNA3.5 (gfx1151, checked on 10 October 2026). Since
+  the merge of ROCmFPX main on 19 October 2026 it also builds for RDNA4
+  (gfx1201, checked by the ROCmFPX project), where the ROCmFPX weight types
+  use the RDNA3 matmul tiles. RDNA2 targets have not been checked again.
 - **Fast paths for the RX 7900 series.**
-  - Attention that reads a q4_0 KV cache directly is on by default only for
-    RDNA3 desktop cards (RX 7900, 7800, 7700, 7600). `GGML_HIP_FA_Q4_TILE=1`
+  - Attention that reads a q4_0 KV cache directly is on by default for RDNA3
+    desktop cards (RX 7900, 7800, 7700, 7600) and RDNA4 (RX 9000, AI PRO
+    R9700); it was measured on the RX 7900 XT only. `GGML_HIP_FA_Q4_TILE=1`
     turns it on for any HIP card, `=0` turns it off everywhere.
   - `GGML_HIP_FA_GQA6=1` (six query heads per attention block) is opt-in and
     runs on RDNA cards only. Its thread layouts and block counts were tuned on

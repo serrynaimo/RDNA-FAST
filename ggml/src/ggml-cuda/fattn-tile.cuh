@@ -520,9 +520,11 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
 // a handful of decode tokens (measured on gfx1100 at 41k cells, 4 queries: 0.49 ms of 0.99 ms), and the vector kernel,
 // which also reads q4_0 directly, loads every K/V row once per query head instead of once per GQA group.
 //
-// Measured on gfx1100 (RX 7900 XT) only, so it is on by default for that device family alone (RDNA3 desktop: RX 7900,
-// 7800, 7700, 7600). Every other card keeps the stock routing: the vector kernel for small batches and an f16 copy of
-// the cache for the tile kernel. GGML_HIP_FA_Q4_TILE=1 turns it on for any HIP card, =0 off for all of them.
+// Measured on gfx1100 (RX 7900 XT). On by default for RDNA3 desktop (RX 7900, 7800, 7700, 7600) and RDNA4 (RX 9000,
+// AI PRO R9700): both are wave32 with the same tile layout, the code uses no gfx11-only instructions, and what it saves
+// (the f16 copy of the whole cache per call) is memory traffic, which RDNA4 has less of. RDNA4 speed is not measured.
+// Every other card keeps the stock routing: the vector kernel for small batches and an f16 copy of the cache for the
+// tile kernel. GGML_HIP_FA_Q4_TILE=1 turns it on for any HIP card, =0 off for all of them.
 static inline bool ggml_cuda_fattn_tile_reads_q4_0(const int cc, const ggml_tensor * dst) {
 #if defined(GGML_USE_HIP) && defined(FAST_FP16_AVAILABLE)
     static const int mode = [] {
@@ -530,7 +532,7 @@ static inline bool ggml_cuda_fattn_tile_reads_q4_0(const int cc, const ggml_tens
         return env ? atoi(env) : -1;
     }();
 
-    if (mode >= 0 ? mode == 0 : !GGML_CUDA_CC_IS_RDNA3_0(cc)) {
+    if (mode >= 0 ? mode == 0 : !(GGML_CUDA_CC_IS_RDNA3_0(cc) || GGML_CUDA_CC_IS_RDNA4(cc))) {
         return false;
     }
 
