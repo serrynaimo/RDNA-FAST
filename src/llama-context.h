@@ -280,6 +280,9 @@ private:
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
 
+    // outputs of the prompt-sized worst-case reserve: none with mtp_lean_reserve (the K/V-only shape)
+    uint32_t reserve_n_outputs_pp(uint32_t n_tokens) const;
+
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
@@ -361,6 +364,10 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+
+    // [TAG_MTP_LEAN_RESERVE] set in the constructor
+    bool mtp_lean_reserve = false;
+    bool mtp_lean_warned  = false;
 
     // state of sched_copy_experts, reset before each graph compute
     struct copy_experts_info {

@@ -224,6 +224,24 @@ llama_context::llama_context(
             cparams.draft_vocab = std::make_shared<rocmfpx::draft_vocabulary>(model.vocab.n_tokens(), budget);
             LLAMA_LOG_INFO("%s: MTP draft head over %d candidate rows (ROCMFPX_DRAFT_VOCAB=0 disables)\n", __func__, budget);
         }
+
+        // [TAG_MTP_LEAN_RESERVE] The draft context of a single-block Qwen3.5/3.8 MTP head runs two shapes only: the
+        // catch-up over prompt and verify batches, which has no output rows and takes the K/V-only graph
+        // ([TAG_MTP_KV_ONLY]: no attention, no FFN, no LM head), and a draft step of one token per drafting sequence.
+        // The stock worst case, n_ubatch tokens with outputs, reserves the full block for n_ubatch tokens instead,
+        // with an f16 copy of the whole draft KV cache for its attention and an n_ubatch x n_ctx mask: 784 MiB at
+        // -ub 1024 and -c 106496 for a graph that never runs. Reserve the two real shapes. A ubatch with outputs
+        // that is larger than a draft step still runs (the scheduler grows the buffer to fit it) and is logged once.
+        // Chained heads (more than one MTP block) draft several rows per sequence and keep the stock reserve.
+        // ROCMFPX_MTP_LEAN_RESERVE=0 restores the stock reserve.
+        if (model.arch == LLM_ARCH_QWEN35 && hparams.n_layer_nextn == 1 && hparams.router_layer < 0) {
+            const char * env = getenv("ROCMFPX_MTP_LEAN_RESERVE");
+            mtp_lean_reserve = !(env && atoi(env) == 0);
+            if (mtp_lean_reserve) {
+                LLAMA_LOG_INFO("%s: MTP draft context reserves the K/V-only catch-up and the one-token draft step "
+                        "(ROCMFPX_MTP_LEAN_RESERVE=0 reserves the full block)\n", __func__);
+            }
+        }
     }
     cparams.rope_scaling_type = params.rope_scaling_type;
     cparams.pooling_type      = params.pooling_type;
@@ -728,6 +746,11 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     return (int) users.size();
 }
 
+uint32_t llama_context::reserve_n_outputs_pp(uint32_t n_tokens) const {
+    // [TAG_MTP_LEAN_RESERVE] the prompt-sized ubatches of this context are the catch-up, which has no outputs
+    return mtp_lean_reserve ? 0 : std::min(n_tokens, cparams.n_outputs_max);
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -784,7 +807,7 @@ void llama_context::sched_reserve() {
     int n_inputs_tg        = -1;
     int n_input_tensors_tg = -1;
 
-    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+    const uint32_t n_outputs_pp = reserve_n_outputs_pp(n_tokens);
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
@@ -1019,9 +1042,9 @@ bool llama_context::memory_update(bool optimize) {
         const uint32_t n_seqs = cparams.n_seq_max;
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
-        const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
+        const uint32_t n_outputs_pp = reserve_n_outputs_pp(n_tokens);
 
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
+        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
         }
@@ -2155,6 +2178,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             n_outputs = n_outputs_new;
         }
 
+        // [TAG_MTP_LEAN_RESERVE] the reserve covered draft steps of one token per sequence
+        if (mtp_lean_reserve && n_outputs > 0 && ubatch.n_tokens > cparams.n_seq_max && !mtp_lean_warned) {
+            mtp_lean_warned = true;
+            LLAMA_LOG_WARN("%s: MTP draft context: a ubatch of %u tokens with outputs is larger than the reserved draft "
+                    "step (%u tokens), the compute buffer grows to fit it (ROCMFPX_MTP_LEAN_RESERVE=0 reserves the full "
+                    "block)\n", __func__, ubatch.n_tokens, cparams.n_seq_max);
+        }
+
         ggml_status status;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
@@ -2782,7 +2813,7 @@ static void ubatch_prepare_reserve(
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
-    GGML_ASSERT(n_outputs >= 1);
+    GGML_ASSERT(n_outputs >= 1 || mtp_lean_reserve); // [TAG_MTP_LEAN_RESERVE] the K/V-only catch-up has none
 
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
