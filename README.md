@@ -15,9 +15,10 @@ GPU, ideal for Hermes.
 - **Faster prefill AND decode.** The model's own MTP head drafts four tokens ahead: 50 t/s
   on prose and 73 t/s on code, against 35 t/s without it. Text copy boost: code
   edits that copy the prompt run at about 200 t/s through n-gram drafting.
-- **100k tokens of context on a 20 GB card.** With Swift 1.5 (as high quality Q4 mixed magic quant) of Qwen3.8-27B, runs
-  at `reasoning_effort: low`: 50 of 50 on our task set in 28% less time than
-  at `xhigh`. [Recipe](docs/rocmfpx/swift-1.5-qwen3.8-27b-mq-q4s.md)
+- **100k tokens of context on a 20 GB card.** With Qwen3.8-27B-pi, a fine-tune for
+  agent loops, in our high-quality mixed Q4 quant at `reasoning_effort: low`:
+  50 of 50 on our task set, tool-calling tasks done with 16% fewer tokens than
+  Swift 1.5. [Recipe](docs/rocmfpx/qwen3.8-27b-pi-mq-q4s.md)
 - **Switching conversations costs seconds, not minutes.** A conversation is
   written to SSD with its checkpoints and restored when it returns: 2.9 s for
   40-53k tokens instead of a 77-105 s re-prefill. [More](#the-ssd-prompt-cache)
@@ -96,10 +97,13 @@ Both slots busy: 35 t/s each, 67 t/s in total. See
 
 ## Quick start
 
-**1. Model.** `Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S` (~15 GB): ROCmFP4
-weights and the MTP head, with 61 sensitive tensors promoted to
-`Q6_0_ROCMFPX`, plus the f16 `mmproj` for vision. The
-[recipe and its tensor policy file](docs/rocmfpx/swift-1.5-qwen3.8-27b-mq-q4s.md)
+**1. Model.** `Qwen3.8-27B-pi-ROCMFPX-MQ-Q4S` (~15 GB):
+[bytkim's Qwen3.8-27B-pi](https://huggingface.co/bytkim/Qwen3.8-27B-pi), a
+Qwen3.8-27B fine-tune for tool-driven work in the Pi agent harness, as ROCmFP4
+weights and the MTP head, with 61
+sensitive tensors promoted to `Q6_0_ROCMFPX`, plus the f16 `mmproj` of the base
+model for vision. The
+[recipe and its tensor policy file](docs/rocmfpx/qwen3.8-27b-pi-mq-q4s.md)
 are in this repository.
 
 **2. Build** (ROCm 7.2 clang, Ninja; about 3 minutes):
@@ -121,12 +125,12 @@ cmake --build build-hip --target llama-server -j 12
 set "PATH=%HIP_PATH%bin;%PATH%"
 set GGML_CUDA_NO_PINNED=1
 set LLAMA_MAX_QUEUED=3
-set ROCMFPX_DRAFT_VOCAB=16384
+set ROCMFPX_DRAFT_VOCAB=24576
 set GGML_HIP_FA_GQA6=1
 
-llama-server -m Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S.gguf --mmproj mmproj-Qwen3.8-27B-f16.gguf ^
+llama-server -m Qwen3.8-27B-pi-ROCMFPX-MQ-Q4S.gguf --mmproj mmproj-Qwen3.8-27B-f16.gguf ^
   -dev ROCm0 -ngl 999 -fa on --jinja --load-mode dio --gpu-keepalive-ms 2000 ^
-  -c 81920 -np 2 --kv-unified --kv-unified-reserve 12288 --no-cache-idle-slots ^
+  -c 106496 -np 2 --kv-unified --kv-unified-reserve 12288 --no-cache-idle-slots ^
   -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -b 2048 -ub 1024 --no-mmproj-offload ^
   --ctx-checkpoints 8 --checkpoint-min-step 2048 ^
   --cache-ram 0 --cache-disk D:\llama-cache --cache-disk-limit 65536 --cache-disk-checkpoints 4 ^
@@ -142,12 +146,12 @@ Flags:
 
 | flag | why |
 |---|---|
-| `-c 81920`, `-ctk q4_0 -ctv q4_0` | about what a 20 GB card holds; KV costs ~18 KB/token. Whatever does not fit, Windows silently pages to system RAM. We run `-c 106496` in production: 18.9 GB resident, 0.8 GB paged. |
+| `-c 106496`, `-ctk q4_0 -ctv q4_0` | what a 20 GB card holds with these settings: 18.9 GB resident, nothing paged. KV costs ~18 KB/token. Whatever does not fit, Windows silently pages to system RAM. |
 | `-np 2 --kv-unified --kv-unified-reserve 12288` | two slots share one pool instead of splitting it. The reserve admits a second request only while both can still generate 12k tokens, else it waits in the queue. See [Several slots on one GPU](#several-slots-on-one-gpu). |
 | `--no-cache-idle-slots` | keeps the idle conversation resident; the default saves and clears it at every new task, which leaves one live conversation. |
 | `--no-mmproj-offload` | the 0.9 GB vision projector was the whole paged share at two slots. Images cost 7-12 s to the first token instead of 3-5 s. |
-| `-ub 1024` | prefill +6% at 17k and +11% at 41k over 256, for 0.3 GB more paged memory; 512 gives +4% and +8% for 0.1 GB. Decode does not change with it (55.7 against 56.0 t/s on identical text). |
-| `--spec-type draft-mtp`, `--spec-draft-n-max 4` | +45% decode on prose, +112% on code, for 1.4 GB of VRAM and 3% of prefill speed. The draft head has its own KV cache; for prompt tokens only its K and V are computed, nothing else of the block is ever read. |
+| `-ub 1024` | prefill +6% at 17k and +11% at 41k over 256, for 0.3 GB more VRAM; 512 gives +4% and +8% for 0.1 GB. Decode does not change with it (55.7 against 56.0 t/s on identical text). |
+| `--spec-type draft-mtp`, `--spec-draft-n-max 4` | +45% decode on prose, +112% on code, for about 0.7 GB of VRAM and 3% of prefill speed. The draft head has its own KV cache; for prompt tokens only its K and V are computed, nothing else of the block is ever read. |
 | `--spec-type "...,ngram-map-k4v"` | text copy boost: n-gram drafting in front of MTP. Where the last tokens repeat an earlier place of the context, the continuation found there is drafted, otherwise MTP drafts as before. A draft has 4 tokens until four in a row were accepted in full, then up to 24, so a match that is only a phrase or a path costs no checkpoint. Code edits that copy the prompt 95 -> 202 t/s, a verbatim copy at 41k 83 -> 124 t/s. Quote the value in a .cmd file: cmd splits arguments at commas. |
 | `--no-spec-ngram-map-ramp` | not set here. Full-length n-gram drafts (48 tokens) from the first match: 268 t/s on code edits and 180 t/s on the copy at 41k, but slower on answers that only share phrases with the context, where a wrong long draft costs a checkpoint restore and a replay pass. |
 | `--ctx-checkpoints 8` | kept in host RAM, ~200 MiB each. When the list is full, the one whose removal leaves the smallest gap is dropped; the one at the first user message never is. |
@@ -163,8 +167,9 @@ Environment variables:
 |---|---|
 | `GGML_CUDA_NO_PINNED=1` | pinned host memory makes more of the model page out, for no speed gain. |
 | `LLAMA_MAX_QUEUED=3` | a request is rejected once three are already waiting, so a client can fall back to another server instead of queueing. |
-| `ROCMFPX_DRAFT_VOCAB=16384` | a drafted token is scored against 16,384 candidate tokens instead of all 248,320: half fixed, half the main model's own top tokens at the previous position, per slot. 0.12 ms instead of 1.9 ms per drafted token; the main model still verifies each one against the full vocabulary. Decode +9% on a short context, +3 to 5% at 41k. A verbatim copy drafts slightly less (acceptance 0.99 to 0.96), ordinary text the same. |
+| `ROCMFPX_DRAFT_VOCAB=24576` | a drafted token is scored against 24,576 candidate tokens instead of all 248,320: half fixed, half the main model's own top tokens at the previous position, per slot. The main model still verifies each drafted token against the full vocabulary. Measured at 16,384: 0.12 ms instead of 1.9 ms per drafted token, decode +9% on a short context and +3 to 5% at 41k, a verbatim copy drafts slightly less (acceptance 0.99 to 0.96), ordinary text the same. 24,576 accepts 3.50 drafted tokens per verify pass against 3.43 at 16,384, at the same speed. |
 | `GGML_HIP_FA_GQA6=1` | attention for decode batches of 1 to 5 tokens: one GPU block per KV head with all six of its query heads, instead of three groups of two and a batch padded to 8. Decode +10 to 12% at 41k, +2 to 6% at 17k, nothing at a short context. Qwen3.5/3.8-27B on RDNA only (head size 256, 24 query heads on 4 KV heads). |
+| `ROCMFPX_MTP_LEAN_RESERVE` | not set here, on by default: the MTP draft context reserves memory for the two shapes it runs (the K/V-only pass over prompt tokens and a one-token draft step), 80 MiB instead of 784 MiB, which is what lets `-c 106496` fit. `=0` restores the full reserve. |
 
 ## Other cards
 
