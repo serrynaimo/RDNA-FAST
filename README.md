@@ -17,8 +17,7 @@ GPU, ideal for Hermes.
   edits that copy the prompt run at about 200 t/s through n-gram drafting.
 - **100k tokens of context on a 20 GB card.** With Qwen3.8-27B-pi, a fine-tune for
   agent loops, in our high-quality mixed Q4 quant at `reasoning_effort: low`:
-  50 of 50 on our task set, tool-calling tasks done with 16% fewer tokens than
-  Swift 1.5. [Recipe](docs/rocmfpx/qwen3.8-27b-pi-mq-q4s.md)
+  50 of 50 on our task set. [Recipe](docs/rocmfpx/qwen3.8-27b-pi-mq-q4s.md)
 - **Switching conversations costs seconds, not minutes.** A conversation is
   written to SSD with its checkpoints and restored when it returns: 2.9 s for
   40-53k tokens instead of a 77-105 s re-prefill. [More](#the-ssd-prompt-cache)

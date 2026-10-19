@@ -68,5 +68,5 @@
 <text x="64" y="893" fill="#F4F4F5" font-size="17">return a file with one small change</text>
 <rect x="420" y="881" width="470.0" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
 <text x="900.0" y="895" fill="#F4F4F5" font-size="17" font-weight="800">202 t/s</text>
-<text x="56" y="962" fill="#9A9FA8" font-size="13">RX 7900 XT 20 GB, October 2026. This runtime: Swift 1.5 Qwen3.8-27B MQ-Q4S, MTP draft. LM Studio: ROCm llama.cpp 2.55.0, Qwen3.8-27B Q4_K_M, MTP draft, q4_0 KV cache.</text>
+<text x="56" y="962" fill="#9A9FA8" font-size="13">RX 7900 XT 20 GB, October 2026. This runtime: Qwen3.8-27B MQ-Q4S, MTP draft. LM Studio: ROCm llama.cpp 2.55.0, Qwen3.8-27B Q4_K_M, MTP draft, q4_0 KV cache.</text>
 </svg>
