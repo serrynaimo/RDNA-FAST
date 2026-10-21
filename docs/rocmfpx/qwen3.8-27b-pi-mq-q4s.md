@@ -109,6 +109,22 @@ Speed and memory are those of the recipe and the runtime, not of the model:
 see the [speed tables in the README](../../README.md#speed), measured with
 Swift 1.5 in this recipe.
 
+## Reasoning cap
+
+In production this model runs with `--reasoning-budget 4096`. Over its first
+42 hours of agent traffic (567 model calls) it thought 86 tokens per call at
+the median; 95% of the calls stayed under 1,636 tokens and 99% under 4,393, and
+the longest took 12,480. A cap of 4,096 reaches about 1% of the calls and 9% of
+all thinking tokens. Most of that was one coding task in which the model
+re-read code and re-planned the same delegation over four calls (12.5k, 6.4k,
+5.6k and 4.8k tokens); genuine analysis such as a feasibility review or a
+research ingest stayed under 4.4k. A cap of 2,000 would have cut those too.
+
+When the budget runs out, the server forces the budget message and the end of
+thinking, and the model answers. With a 150-token budget on a number puzzle it
+finished the working in its visible answer and still got it right, in 17.5 s
+instead of 59 s.
+
 ## Notes
 
 - If a variant of this recipe spills VRAM on your card, drop the eight

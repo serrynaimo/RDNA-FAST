@@ -135,6 +135,7 @@ llama-server -m Qwen3.8-27B-pi-ROCMFPX-MQ-Q4S.gguf --mmproj mmproj-Qwen3.8-27B-f
   --cache-ram 0 --cache-disk D:\llama-cache --cache-disk-limit 65536 --cache-disk-checkpoints 4 ^
   --spec-type "draft-mtp,ngram-map-k4v" --spec-draft-n-max 4 --spec-draft-p-min 0.60 ^
   --chat-template-kwargs "{\"reasoning_effort\":\"low\"}" ^
+  --reasoning-budget 4096 --reasoning-budget-message "I have thought enough, so I will act on my plan now." ^
   --reasoning-preserve --temp 1 --sleep-idle-seconds -1 ^
   --alias qwen/qwen3.8-27b --host 0.0.0.0 --port 1234 --api-key-file api-keys.txt
 ```
@@ -157,6 +158,7 @@ Flags:
 | `--cache-disk` | conversations and their checkpoints are kept on SSD. See [The SSD prompt cache](#the-ssd-prompt-cache). |
 | `--load-mode dio` | the default memory-mapped load keeps the 15 GB model file in system RAM. |
 | `--gpu-keepalive-ms 2000` | an idle card on a nearly full VRAM budget loses its resident memory and the next request crawls. |
+| `--reasoning-budget 4096` | caps the thinking of one answer. Over the model's first 42 hours of agent traffic (567 calls) the median answer thought 86 tokens and 99% stayed under 4.4k; the cap reaches about 1% of the calls, the long re-planning ones (up to 12.5k tokens, three and a half minutes), and cuts 9% of all thinking. When it runs out, the server forces `--reasoning-budget-message` and the end of thinking, and the model answers. A client can set its own per request with `reasoning_budget_tokens`. |
 | `--reasoning-preserve` | with a client that does not echo thinking, every past assistant turn renders as an empty think block (~4 tokens). Without it the template renders the previous turn differently once a new user message arrives, so a tool-using turn was re-prefilled (median 5k tokens) on every exchange. |
 | `--temp 1` | Qwen3.8 degrades under greedy decoding. |
 
