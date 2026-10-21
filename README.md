@@ -15,9 +15,10 @@ GPU, ideal for Hermes.
 - **Faster prefill AND decode.** The model's own MTP head drafts four tokens ahead: 50 t/s
   on prose and 73 t/s on code, against 35 t/s without it. Text copy boost: code
   edits that copy the prompt run at about 200 t/s through n-gram drafting.
-- **100k tokens of context on a 20 GB card.** With Qwen3.8-27B-pi, a fine-tune for
-  agent loops, in our high-quality mixed Q4 quant at `reasoning_effort: low`:
-  50 of 50 on our task set. [Recipe](docs/rocmfpx/qwen3.8-27b-pi-mq-q4s.md)
+- **100k tokens of context on a 20 GB card.** With Swift 1.5, a Qwen3.8-27B
+  fine-tune, in our high-quality mixed Q4 quant at `reasoning_effort: low`: 25 of
+  26 replayed turns of our own agent chats, 13.5 s per reply at the median.
+  [Recipe](docs/rocmfpx/swift-1.5-qwen3.8-27b-mq-q4s.md)
 - **Switching conversations costs seconds, not minutes.** A conversation is
   written to SSD with its checkpoints and restored when it returns: 2.9 s for
   40-53k tokens instead of a 77-105 s re-prefill. [More](#the-ssd-prompt-cache)
@@ -96,13 +97,12 @@ Both slots busy: 35 t/s each, 67 t/s in total. See
 
 ## Quick start
 
-**1. Model.** `Qwen3.8-27B-pi-ROCMFPX-MQ-Q4S` (~15 GB):
-[bytkim's Qwen3.8-27B-pi](https://huggingface.co/bytkim/Qwen3.8-27B-pi), a
-Qwen3.8-27B fine-tune for tool-driven work in the Pi agent harness, as ROCmFP4
-weights and the MTP head, with 61
-sensitive tensors promoted to `Q6_0_ROCMFPX`, plus the f16 `mmproj` of the base
-model for vision. The
-[recipe and its tensor policy file](docs/rocmfpx/qwen3.8-27b-pi-mq-q4s.md)
+**1. Model.** `Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S` (~15 GB):
+[UkisAI's Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b), a
+Qwen3.8-27B fine-tune, as ROCmFP4 weights and the MTP head, with 61 sensitive
+tensors promoted to `Q6_0_ROCMFPX`, plus the f16 `mmproj` of the base model for
+vision. The
+[recipe and its tensor policy file](docs/rocmfpx/swift-1.5-qwen3.8-27b-mq-q4s.md)
 are in this repository.
 
 **2. Build** (ROCm 7.2 clang, Ninja; about 3 minutes):
@@ -127,7 +127,7 @@ set LLAMA_MAX_QUEUED=3
 set ROCMFPX_DRAFT_VOCAB=24576
 set GGML_HIP_FA_GQA6=1
 
-llama-server -m Qwen3.8-27B-pi-ROCMFPX-MQ-Q4S.gguf --mmproj mmproj-Qwen3.8-27B-f16.gguf ^
+llama-server -m Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S.gguf --mmproj mmproj-Qwen3.8-27B-f16.gguf ^
   -dev ROCm0 -ngl 999 -fa on --jinja --load-mode dio --gpu-keepalive-ms 2000 ^
   -c 106496 -np 2 --kv-unified --kv-unified-reserve 12288 --no-cache-idle-slots ^
   -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -b 2048 -ub 1024 --no-mmproj-offload ^

@@ -114,7 +114,7 @@ requests without a known `"model"` to NAME, like a single-model server.
 version = 1
 
 [qwen/qwen3.8-27b]
-model = Qwen3.8-27B-pi-ROCMFPX-MQ-Q4S.gguf
+model = Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S.gguf
 load-on-startup = true
 gpu-keepalive-ms = 2000
 
