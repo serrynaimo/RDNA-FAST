@@ -11,38 +11,44 @@ FP4/FP6 weight formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
 ## Highlights
 
-- **Quicker agentic loops than LM Studio on the same card.** A two-agent session takes
-  103 s here at the same 64k context (107 s at 106k),
-  168 s on stock llama.cpp with its MTP draft and 17.7 min without it; decode is
-  about twice as fast. [Numbers](#speed)
-- **Faster prefill AND decode.** The model's own MTP head drafts four tokens ahead: 50 t/s
-  on prose and 73 t/s on code, against 35 t/s without it. Text copy boost: code
-  edits that copy the prompt run at about 187 t/s through n-gram drafting.
-- **Prompts on the matrix cores at full speed.** Prompt-sized products of the FP4/FP6
-  weights run through a WMMA GEMM ([rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm)
-  by Adel Johar) instead of the int8 path: 1.3-1.5x per product, cold prompts
-  +35% at 17k and +31% at 41k (923 and 815 t/s). Gated to gfx1100 and gfx1151.
-  [More](#prompts-through-a-wmma-gemm)
-- **96k tokens of context on a 20 GB card.** With Swift 1.5, a Qwen3.8-27B
-  fine-tune, in our high-quality mixed Q4 quant at `reasoning_effort: low`: 25 of
-  26 replayed turns of our own agent chats, 13.5 s per reply at the median.
+- **Faster agent loops than LM Studio on the same card.** A scripted two-agent
+  session finishes in 103 s instead of 168 s, with about twice the decode speed.
+  [Numbers](#speed)
+
+- **Multi-token prediction.** The model's own MTP head drafts tokens ahead:
+  about 50 t/s on prose and 73 t/s on code. When an answer repeats text from
+  the prompt, as code edits do, n-gram drafting copies it at about 187 t/s.
+
+- **Prompts on the matrix cores.** Prompt processing runs on RDNA3's WMMA units
+  through [rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) by Adel
+  Johar, about a third faster on long prompts. [More](#prompts-through-a-wmma-gemm)
+
+- **96k tokens of context on a 20 GB card**, with Swift 1.5, a Qwen3.8-27B
+  fine-tune, in our high-quality mixed Q4 quant.
   [Recipe](docs/rocmfpx/swift-1.5-qwen3.8-27b-mq-q4s.md)
-- **Switching conversations costs seconds, not minutes.** A conversation is
-  written to SSD with its checkpoints and restored when it returns: 2.9 s for
-  40-53k tokens instead of a 77-105 s re-prefill. [More](#the-ssd-prompt-cache)
-- **Several agents on one GPU.** Two slots share one KV pool. An idle
-  conversation costs the active one nothing, and two busy slots decode at
-  67 t/s combined instead of 46. [More](#several-slots-on-one-gpu)
-- **Shared system prompts.** States are saved every 4096 tokens inside the
-  system prompt + tools block; a conversation that starts with the same tokens
-  resumes from the deepest state it shares.
-- **Survives restarts.** Cache entries left by a previous run are adopted.
-- **Vision** through the f16 `mmproj`, including after a cache restore.
-- **A decision classifier on the same port**: typed yes/no, choice and score
-  answers with calibrated probabilities, from a small model on the CPU.
-- **Agent based `"priority"` request flag for maximum responsiveness.** [More](#request-priority)
-- **Fails fast when busy.** `LLAMA_MAX_QUEUED=n` rejects requests once `n` are
-  already waiting, so a client can fall back to another server.
+
+- **Switching conversations costs seconds, not minutes.** Conversations are
+  saved to SSD and restored when they come back, in about 3 s instead of a
+  minute or more of re-reading. [More](#the-ssd-prompt-cache)
+
+- **Several agents on one GPU.** Two conversations share one memory pool, so a
+  second agent runs beside the first, and an idle one costs nothing.
+  [More](#several-slots-on-one-gpu)
+
+- **Shared system prompts.** Conversations that start with the same system
+  prompt and tools pick up from the state they share.
+
+- **Survives restarts.** The prompt cache carries over to the next run.
+
+- **Vision** for screenshots and photos.
+
+- **A decision classifier on the same port**: yes/no, choice and score answers
+  with calibrated probabilities, from a small model on the CPU.
+
+- **Request priority**, so the most urgent agent goes first. [More](#request-priority)
+
+- **Fails fast when busy.** Requests are turned away once a few are waiting, so
+  a client can fall back to another server.
 
 Measured on one machine: RX 7900 XT 20 GB, Ryzen 9 7900, 32 GB RAM,
 Windows 11, ROCm 7.2 HIP SDK, one NVMe for models and cache. Nothing here has
