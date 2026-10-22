@@ -11541,6 +11541,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // ROCmFPX [TAG_WMMA_GEMM]: prompt-sized FP4/FP6 products that take the WMMA GEMM on gfx1100/gfx1151 (rows and width
+    // in whole 256s, 256+ tokens), with token counts that are not whole tiles. ROCMFPX_WMMA_GEMM_SCRATCH_MB=1 makes the
+    // 1280-row case go through the chunked path (512 rows of K 1024 per chunk).
+    for (ggml_type type : {GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_Q6_0_ROCMFPX}) {
+        for (int n : {256, 300, 1031}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1280, n, 1024, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  512, n, 2048, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+        }
+    }
+
     // test large experts*tokens
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, b, 32, 1024, 16));
@@ -12610,14 +12620,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
     // ROCmFPX: the prefill GEMM shapes of Qwen3.8-27B (embedding 5120, ffn 17408, attention/GDN projections 6144)
-    // at the production ubatch of 256 and at 512, for the fork's FP4/FP6 weight types against vanilla Q4_0.
+    // at ubatches of 256, 512 and the production 1024, for the fork's FP4/FP6 weight types against vanilla Q4_0.
     for (ggml_type t : {GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q6_0_ROCMFPX, GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_Q4_0, GGML_TYPE_F16}) {
-        for (int64_t n : {256, 512}) {
+        for (int64_t n : {256, 512, 1024}) {
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, n,  5120, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  5120, n, 17408, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  6144, n,  5120, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  5120, n,  6144, {1, 1}, {1, 1}));
         }
+    }
+    // ROCmFPX [TAG_WMMA_GEMM]: the other prompt-sized products of the model (attn_qkv, attn_q, attn_k / attn_v) and all of
+    // them at 2048 tokens (-ub 2048)
+    for (ggml_type t : {GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q6_0_ROCMFPX}) {
+        for (int64_t n : {1024, 2048}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 10240, n,  5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 12288, n,  5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  1024, n,  5120, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, 2048,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  5120, 2048, 17408, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  6144, 2048,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  5120, 2048,  6144, {1, 1}, {1, 1}));
     }
 
     // ROCmFPX: decode-sized attention at depth: 1 and 4 queries (a draft step, a verify batch) over 16k and 41k cells,

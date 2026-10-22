@@ -28,6 +28,7 @@ jobs:
           cp build/bin/llama-cli build/bin/llama-server build/bin/llama-bench build/bin/llama-quantize stage/bin/
           cp include/rocmfpx-plugin.h stage/include/rocmfpx/
           cp LICENSE NOTICE stage/share/rocmfpx/
+          cp -a licenses stage/share/rocmfpx/licenses
           cp -a docs/rocmfpx stage/share/rocmfpx/docs
           tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -czf rocmfpx-linux-x86_64.tar.gz -C stage .
           sha256sum rocmfpx-linux-x86_64.tar.gz > rocmfpx-linux-x86_64.tar.gz.sha256

@@ -1,0 +1,132 @@
+/*
+ * MIT License
+ *
+ * Copyright (c) 2024 Adel Johar
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+#ifndef ROCM_WMMA_GEMM_KERNEL_LAUNCHER_HPP
+#define ROCM_WMMA_GEMM_KERNEL_LAUNCHER_HPP
+
+#include <rocm_wmma_gemm/kernel/config_generated.hpp>
+#include <rocm_wmma_gemm/kernel_lookup.hpp>
+#include <stdexcept>
+#include <type_traits>
+
+namespace rocm_wmma_gemm
+{
+
+/**
+ * @brief Selects and launches the appropriate compiled GEMM kernel dynamically.
+ *
+ * @tparam T The data type of the output matrix C.
+ * @tparam U The data type of the input matrices A and B.
+ * @tparam layout_C The memory layout of the output matrix C.
+ * @tparam layout_A The memory layout of the input matrix A.
+ * @tparam layout_B The memory layout of the input matrix B.
+ */
+template<class T, class U, m_layout layout_C, m_layout layout_A, m_layout layout_B>
+struct kernel_launcher
+{
+    using kernel_func_ptr = void (*)(T*, const U*, const U*, int, int, int);
+
+    /**
+     * @brief Launches the selected kernel on the GPU.
+     *
+     * @param config_idx The tuning configuration index to select the kernel.
+     * @param C Pointer to the output matrix C.
+     * @param A Pointer to the input matrix A.
+     * @param B Pointer to the input matrix B.
+     * @param M Number of rows of matrices C and A.
+     * @param N Number of columns of matrices C and B.
+     * @param K Number of columns of matrix A and rows of matrix B.
+     * @param grid_dim Grid dimensions for the kernel launch.
+     * @param block_dim Block dimensions for the kernel launch.
+     * @param stream The HIP stream to execute the kernel on.
+     */
+    static void launch(size_t       config_idx,
+                       T*           C,
+                       const U*     A,
+                       const U*     B,
+                       size_t       M,
+                       size_t       N,
+                       size_t       K,
+                       int          block_m,
+                       int          block_n,
+                       dim3         grid_dim,
+                       dim3         block_dim,
+                       hipStream_t& stream)
+    {
+        // Compute the group-local type index (0-1), keyed on the input type U.
+        // Each accumulator group's lookup table has two type slots: U=half -> 0,
+        // U=__hip_bfloat16 -> 1 (see generated kernel_lookup.cpp).
+        constexpr size_t type_idx = std::is_same_v<U, __hip_bfloat16> ? 1 : 0;
+
+        // Compute layout index (0-7) based on (A,B,C) order to match lookup table
+        constexpr size_t layout_idx
+            = (layout_A == m_layout::row_major && layout_B == m_layout::row_major
+               && layout_C == m_layout::row_major)
+                  ? 0
+              : (layout_A == m_layout::row_major && layout_B == m_layout::row_major
+                 && layout_C == m_layout::col_major)
+                  ? 1
+              : (layout_A == m_layout::row_major && layout_B == m_layout::col_major
+                 && layout_C == m_layout::row_major)
+                  ? 2
+              : (layout_A == m_layout::row_major && layout_B == m_layout::col_major
+                 && layout_C == m_layout::col_major)
+                  ? 3
+              : (layout_A == m_layout::col_major && layout_B == m_layout::row_major
+                 && layout_C == m_layout::row_major)
+                  ? 4
+              : (layout_A == m_layout::col_major && layout_B == m_layout::row_major
+                 && layout_C == m_layout::col_major)
+                  ? 5
+              : (layout_A == m_layout::col_major && layout_B == m_layout::col_major
+                 && layout_C == m_layout::row_major)
+                  ? 6
+              : (layout_A == m_layout::col_major && layout_B == m_layout::col_major
+                 && layout_C == m_layout::col_major)
+                  ? 7
+                  : 0;
+
+        const size_t alignment_idx = (M % block_m == 0 && N % block_n == 0) ? 1 : 0;
+
+        // Lookup kernel function pointer from static table
+        void* kernel_ptr = lookup_kernel(config_idx, type_idx, layout_idx, alignment_idx);
+
+        // Check for null pointer (kernel not available for this config/layout combination)
+        if(kernel_ptr == nullptr)
+        {
+            // This should not happen if config selection is working correctly
+            // Fall back to a default kernel or throw an error
+            throw std::runtime_error(
+                "No kernel available for the requested configuration and layout");
+        }
+
+        // Cast to correct function pointer type and launch
+        auto kernel_func = reinterpret_cast<kernel_func_ptr>(kernel_ptr);
+        kernel_func<<<grid_dim, block_dim, 0, stream>>>(C, A, B, M, N, K);
+    }
+};
+
+} // namespace rocm_wmma_gemm
+
+#endif // ROCM_WMMA_GEMM_KERNEL_LAUNCHER_HPP

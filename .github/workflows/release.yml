@@ -1093,7 +1093,9 @@ jobs:
             .\build\bin\Release\ggml-hip.dll `
             .\build\bin\Release\amdhip64_7.dll `
             .\build\bin\Release\rocm_kpack.dll `
-            .\build\bin\Release\amd_comgr.dll
+            .\build\bin\Release\amd_comgr.dll `
+            .\build\bin\Release\rocm_wmma_gemm_*_accf32.dll `
+            .\licenses\LICENSE-rocm_wmma_gemm
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
