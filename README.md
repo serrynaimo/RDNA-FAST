@@ -245,7 +245,10 @@ t/s at 41k. Decode does not change (the same text at temperature 0: 56.1 and
 58.6 t/s at 17k). The scratch costs 0.24 GB of VRAM and nothing more is paged.
 f16 activations are more precise than the 8-bit ones of the int8 path; the
 needle test, the two-slot test and 118 of 118 matrix product tests against the
-CPU pass. Below 512 tokens the unpacking costs about what the GEMM saves, so
+CPU pass. Quality is unchanged: wikitext-2 perplexity 6.5080 with it and
+6.5077 without (Swift 1.5, `-c 2048 -ub 1024`), and against the int8 path a
+mean KL divergence of 0.0024 with the same top token 99.0% of the time.
+Below 512 tokens the unpacking costs about what the GEMM saves, so
 smaller batches stay on the int8 path.
 
 The build makes one library per GPU architecture, `rocm_wmma_gemm_<arch>_accf32`,
