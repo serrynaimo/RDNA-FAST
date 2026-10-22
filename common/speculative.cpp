@@ -2035,15 +2035,43 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
     // for free: drafts of 4 tokens need no checkpoint. So a draft has probe_size tokens until probe_count of them in
     // a row were accepted in full, then up to long_size; a draft that is not accepted in full closes the gate again.
     static constexpr size_t probe_size  = 4;
-    static constexpr int    probe_count = 4;
+    // [TAG_NGRAM_MAP_SHADOW] probes in a row that open the gate: 4 until 2026-10-20 (a sent probe cost a pass, so few);
+    // shadow probes are free, and on agent text 63% of them held, so four in a row came by chance (9 openings in 2 h,
+    // 37% of the long drafts accepted). 6 since 2026-10-20 (Thomas); ROCMFPX_NGRAM_PROBES overrides it.
+    const int               probe_count;
     static constexpr size_t long_size   = 24;
     const bool ramp;
+    // [TAG_NGRAM_MAP_SHADOW] A probe that is sent takes MTP's place in that pass, and on real traffic (2026-10-12..20)
+    // most probes lost to the MTP draft they replaced: short answers came out up to 20% slower and the n-gram drafter
+    // was about break-even overall. With the gate closed the probe is therefore not sent: MTP drafts the pass and the
+    // probe is scored against the tokens that come out, at the next draft() call. Only an open gate sends n-gram
+    // drafts. ROCMFPX_NGRAM_SHADOW=0 sends the probes again (the 2026-10-12 gate).
+    const bool shadow;
     struct ramp_state {
         int    n_held    = 0;     // probes in a row that were accepted in full; probe_count: the gate is open
         size_t n_drafted = 0;     // tokens of the draft that is being verified (0: none)
         bool   cut       = false; // that draft was longer and was cut to the size
+        // [TAG_NGRAM_MAP_SHADOW] the probe that was not sent: its tokens follow the id_last of the pass it was made for,
+        // which is prompt[probe_at] once that pass is in the prompt
+        llama_tokens probe;
+        size_t       probe_at  = 0;
+        bool         probe_cut = false; // the map's draft was longer than the probe
+        int          n_probes  = 0;     // per request, for the timing log
+        int          n_probes_held = 0;
+        int          n_opened  = 0;
     };
     std::vector<ramp_state> ramps;
+
+    static bool shadow_enabled() {
+        const char * value = std::getenv("ROCMFPX_NGRAM_SHADOW");
+        return !(value && std::atoi(value) == 0);
+    }
+
+    static int probes_to_open() {
+        const char * value = std::getenv("ROCMFPX_NGRAM_PROBES");
+        const int n = value ? std::atoi(value) : 0;
+        return n >= 1 && n <= 64 ? n : 6;
+    }
 
     common_speculative_impl_ngram_map_k(
             const common_ngram_map & config,
@@ -2052,7 +2080,9 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
         : common_speculative_impl(config.key_only ? COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K
             : COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, n_seq,
             ramp ? std::min<int32_t>(config.size_value, (int32_t) long_size) : (int32_t) config.size_value)
+        , probe_count(probes_to_open())
         , ramp(ramp)
+        , shadow(ramp && shadow_enabled())
     {
         for (uint32_t i = 0; i < n_seq; i++) {
             this->config.push_back(config);
@@ -2063,6 +2093,49 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
         SPC_TRC("adding speculative implementation '%s'\n", common_speculative_type_to_str(this->type).c_str());
         SPC_TRC("- size_key=%d, size_value=%d, key_only=%d, min_hits=%d\n",
                 config.size_key, config.size_value, config.key_only, config.min_hits);
+        if (ramp) {
+            LOG_INF("%s: n-gram gate: %s probes of %zu tokens, %d in a row open it, then drafts of up to %zu\n", __func__,
+                    shadow ? "shadow (not sent)" : "sent", probe_size, probe_count, long_size);
+        }
+    }
+
+    // [TAG_NGRAM_MAP_SHADOW] Score the pending probe against what came out since it was made: prompt[probe_at] is the
+    // id_last it continued, then the accepted tokens, then the new id_last. Returns false while too few tokens are out.
+    bool score_probe(llama_seq_id seq_id, const llama_tokens & prompt, llama_token id_last) {
+        auto & r = ramps[seq_id];
+        if (prompt.size() <= r.probe_at) {
+            r.probe.clear(); // the prompt did not grow past the probe's pass: nothing to score it against
+            return true;
+        }
+        const size_t n_out = prompt.size() - r.probe_at; // prompt[probe_at + 1 ..] and id_last
+        const size_t n_cmp = std::min(n_out, r.probe.size());
+        size_t n_match = 0;
+        while (n_match < n_cmp) {
+            const size_t k = r.probe_at + 1 + n_match;
+            const llama_token out = k < prompt.size() ? prompt[k] : id_last;
+            if (out != r.probe[n_match]) {
+                break;
+            }
+            n_match++;
+        }
+        if (n_match == n_cmp && n_cmp < r.probe.size()) {
+            return false; // all of it so far, but not all out yet
+        }
+        if (n_match == r.probe.size()) {
+            r.n_probes_held++;
+            if (r.n_held < probe_count && ++r.n_held == probe_count) {
+                r.n_opened++;
+            }
+            if (!r.probe_cut) {
+                common_ngram_map_accept(config[seq_id], (uint16_t) n_match);
+            }
+            // a cut probe that held says nothing about the rest of the continuation (as for sent probes)
+        } else {
+            r.n_held = 0;
+            common_ngram_map_accept(config[seq_id], (uint16_t) n_match);
+        }
+        r.probe.clear();
+        return true;
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -2112,6 +2185,11 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
                 known.insert(known.end(), dp.prompt->begin() + known.size(), dp.prompt->end());
             }
 
+            // [TAG_NGRAM_MAP_SHADOW] a probe still waiting for its tokens: MTP drafts this pass too
+            if (shadow && !ramps[seq_id].probe.empty() && !score_probe(seq_id, *dp.prompt, dp.id_last)) {
+                continue;
+            }
+
             common_ngram_map_draft(config[seq_id], *dp.prompt, dp.id_last, *dp.result);
 
             // [TAG_NGRAM_MAP_RAMP]
@@ -2125,6 +2203,15 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
                     }
                     r.n_drafted = 0;
                     r.cut       = false;
+                } else if (shadow && r.n_held < probe_count) {
+                    // [TAG_NGRAM_MAP_SHADOW] gate closed: keep the probe, send nothing
+                    r.probe_cut = dp.result->size() > probe_size;
+                    r.probe.assign(dp.result->begin(), dp.result->begin() + std::min(probe_size, dp.result->size()));
+                    r.probe_at  = dp.prompt->size();
+                    r.n_probes++;
+                    dp.result->clear();
+                    r.n_drafted = 0;
+                    r.cut       = false;
                 } else {
                     const size_t n_size = r.n_held >= probe_count ? long_size : probe_size;
                     r.cut = dp.result->size() > n_size;
@@ -2132,6 +2219,9 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
                         dp.result->resize(n_size);
                     }
                     r.n_drafted = dp.result->size();
+                    if (!shadow && r.n_held < probe_count) {
+                        r.n_probes++; // sent probe, counted for the log only
+                    }
                 }
             }
         }
@@ -2154,7 +2244,10 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
 
             if (n_drafted > 0 && n_accepted >= n_drafted) {
                 if (r.n_held < probe_count && n_drafted >= probe_size) {
-                    r.n_held++;
+                    r.n_probes_held++; // a sent probe (shadow mode never sends one with the gate closed)
+                    if (++r.n_held == probe_count) {
+                        r.n_opened++;
+                    }
                 }
                 if (cut) {
                     // the map takes the accepted count as the reach of this continuation and would draft no further
@@ -3455,6 +3548,30 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl_other->accept(seq_id, n_accepted, true);
         }
     }
+}
+
+// [TAG_NGRAM_MAP_SHADOW] this request's n-gram gate counters for the timing log; false without an n-gram gate
+bool common_speculative_ngram_gate_stats(const common_speculative * spec, llama_seq_id seq_id,
+        int & n_probes, int & n_probes_held, int & n_opened, bool & shadow) {
+    if (spec == nullptr || seq_id < 0) {
+        return false;
+    }
+    for (const auto & impl : spec->impls) {
+        if (impl->type != COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K && impl->type != COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V) {
+            continue;
+        }
+        const auto * ng = static_cast<const common_speculative_impl_ngram_map_k *>(impl.get());
+        if (!ng->ramp || (size_t) seq_id >= ng->ramps.size()) {
+            return false;
+        }
+        const auto & r = ng->ramps[seq_id];
+        n_probes      = r.n_probes;
+        n_probes_held = r.n_probes_held;
+        n_opened      = r.n_opened;
+        shadow        = ng->shadow;
+        return true;
+    }
+    return false;
 }
 
 bool common_speculative_last_is_ngram(const common_speculative * spec, llama_seq_id seq_id) {

@@ -99,6 +99,11 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 // by a draft model or head)
 bool common_speculative_last_is_ngram(const common_speculative * spec, llama_seq_id seq_id);
 
+// this request's n-gram gate counters (probes made, probes that held, times the gate opened) and whether probes are
+// shadowed (scored, not sent); false when no n-gram gate runs
+bool common_speculative_ngram_gate_stats(const common_speculative * spec, llama_seq_id seq_id,
+        int & n_probes, int & n_probes_held, int & n_opened, bool & shadow);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);

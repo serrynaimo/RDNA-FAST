@@ -780,6 +780,15 @@ struct server_slot {
                         (int) stats.ngram_runs(0), (int) stats.ngram_runs(1), (int) stats.ngram_runs(2), (int) stats.ngram_runs(3),
                         (int) stats.ngram_runs(4), (int) stats.ngram_runs(5), (int) stats.ngram_runs(6));
             }
+            // [TAG_NGRAM_MAP_SHADOW]
+            {
+                int n_probes = 0, n_probes_held = 0, n_opened = 0;
+                bool shadow = false;
+                if (common_speculative_ngram_gate_stats(spec, id, n_probes, n_probes_held, n_opened, shadow) && n_probes > 0) {
+                    SLT_INF(*this, "     n-gram gate = %d %s probes, %d held in full, opened %d times\n",
+                            n_probes, shadow ? "shadow" : "sent", n_probes_held, n_opened);
+                }
+            }
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
