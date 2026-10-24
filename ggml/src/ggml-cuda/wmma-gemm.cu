@@ -109,6 +109,15 @@ bool ggml_cuda_should_use_wmma_gemm(const ggml_tensor * src0, const ggml_tensor 
         case GGML_TYPE_Q4_0_ROCMFP4:
         case GGML_TYPE_Q4_0_ROCMFP4_FAST:
         case GGML_TYPE_Q6_0_ROCMFPX:
+        // [TAG_WMMA_GEMM_STOCK] stock quants, against int8 MMQ (their path on gfx1100 since TAG_MMB_RDNA3_0_MMQ), RX
+        // 7900 XT 2026-10-24, 4096 x 14336 at 512 rows: Q4_0 48.1 vs 47.5 TFLOPS, Q4_K 47.2 vs 42.3, Q5_K 45.2 vs 38.7,
+        // Q6_K 46.7 vs 42.8, IQ4_NL 48.0 vs 46.4, IQ4_XS 48.0 vs 46.5; Qwen3.8-27B IQ4_XS cold 17k prompt 864 vs 781 t/s
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ4_NL:
             break;
         default:
             return false;
@@ -146,6 +155,8 @@ void ggml_cuda_mul_mat_wmma_gemm(ggml_backend_cuda_context & ctx, const ggml_ten
 
     // weights: a chunk of whole rows at a time, unpacked to f16 into one scratch of at most ROCMFPX_WMMA_GEMM_SCRATCH_MB
     // (64): a full f16 copy of a 17408 x 5120 matrix is 178 MB, which a 20 GB card running a 15 GB model has not got.
+    // Reading the FP4 codes inside the GEMM instead (2026-10-23) was bit-exact but slower, 14-49 vs 54-67 TFLOPS:
+    // every block of activation rows decodes its weight tiles again (8-22x the unpacks), where this unpacks once.
     static const int64_t budget = (int64_t) std::max(1, wmma_gemm_env("ROCMFPX_WMMA_GEMM_SCRATCH_MB", 64)) << 20;
     const int64_t rows = std::min<int64_t>(N, std::max<int64_t>(256, budget / (K*(int64_t) sizeof(half)) / 256 * 256));
     const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(src0->type);
