@@ -28,7 +28,7 @@ FP4/FP6 weight formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
   [Swift 1.5 IQ4_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf),
   UkisAI's Qwen3.8-27B fine-tune, our recommended model. For slightly faster
   prompts, our ROCmFPX-optimised quant of the same model:
-  [MQ-Q4S recipe](docs/rocmfpx/swift-1.5-qwen3.8-27b-mq-q4s.md)
+  [ROCmFP4-FP6 recipe](docs/rocmfpx/swift-1.5-qwen3.8-27b-rocmfp4-fp6.md)
 
 - **Switching conversations costs seconds, not minutes.** Conversations are
   saved to SSD and restored when they come back, in about 3 s instead of a
@@ -108,10 +108,10 @@ model for vision. Against the model's Q8_0 it picks the same top token 93.5% of
 the time (mean KL divergence 0.021, wikitext-2).
 
 The ROCmFPX-optimised alternative is our quant of the same model,
-`Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S` (16.1 GB): ROCmFP4 weights with 61
+`Swift-1.5-Qwen3.8-27B-ROCmFP4-FP6` (16.1 GB): ROCmFP4 weights with 61
 sensitive tensors in `Q6_0_ROCMFPX`. Its prompts run 2-5% faster, at 92.8% the
 same top token (KL divergence 0.026). The
-[recipe and its tensor policy file](docs/rocmfpx/swift-1.5-qwen3.8-27b-mq-q4s.md)
+[recipe and its tensor policy file](docs/rocmfpx/swift-1.5-qwen3.8-27b-rocmfp4-fp6.md)
 are in this repository.
 
 **2. Build** (ROCm 7.2 clang, Ninja; about 3 minutes):
@@ -155,7 +155,7 @@ Flags:
 
 | flag | why |
 |---|---|
-| `-c 98304`, `-ctk q4_0 -ctv q4_0` | about what a 20 GB card holds with these settings: 18.1 GB resident, 0.7 GB paged with IQ4_XS (18.6 GB with the MQ-Q4S quant). KV costs ~18 KB/token. Whatever does not fit, Windows silently pages to system RAM. |
+| `-c 98304`, `-ctk q4_0 -ctv q4_0` | about what a 20 GB card holds with these settings: 18.1 GB resident, 0.7 GB paged with IQ4_XS (18.6 GB with the ROCmFP4-FP6 quant). KV costs ~18 KB/token. Whatever does not fit, Windows silently pages to system RAM. |
 | `-np 2 --kv-unified --kv-unified-reserve 12288` | two slots share one pool instead of splitting it. The reserve admits a second request only while both can still generate 12k tokens, else it waits in the queue. See [Several slots on one GPU](#several-slots-on-one-gpu). |
 | `--no-cache-idle-slots` | keeps the idle conversation resident; the default saves and clears it at every new task, which leaves one live conversation. |
 | `--no-mmproj-offload` | the 0.9 GB vision projector was the whole paged share at two slots. Images cost 7-12 s to the first token instead of 3-5 s. |

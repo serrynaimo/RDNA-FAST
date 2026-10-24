@@ -1,4 +1,4 @@
-# Swift-1.5-Qwen3.8-27B ROCMFPX-MQ-Q4S
+# Swift-1.5-Qwen3.8-27B ROCmFP4-FP6
 
 A 4-bit ROCmFP4 quantization of
 [Swift 1.5 Qwen3.8-27B](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b)
@@ -16,9 +16,9 @@ the quickest and most often right of the three settings (see
 
 ## Lane
 
-- Public name: `Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S`
+- Public name: `Swift-1.5-Qwen3.8-27B-ROCmFP4-FP6`
 - Policy: `Q4_0_ROCMFP4` bulk, 61 whole-tensor promotions to `Q6_0_ROCMFPX`
-- Tensor policy file: [`qwen3.8-27b-mq-q4s.tensor-types.txt`](qwen3.8-27b-mq-q4s.tensor-types.txt)
+- Tensor policy file: [`qwen3.8-27b-rocmfp4-fp6.tensor-types.txt`](qwen3.8-27b-rocmfp4-fp6.tensor-types.txt)
 - Tensor inventory: 360 F32, 445 `Q4_0_ROCMFP4`, 61 `Q6_0_ROCMFPX` (866 total)
 - Size: 16,075,544,864 bytes (14.97 GiB), 4.70 BPW over the quantized tensors
 - Loads only in ROCmFPX builds: the two tensor types do not exist in stock
@@ -55,9 +55,9 @@ a low-bit file.
 ```bash
 llama-quantize \
   --imatrix ukisai_Swift-1.5-Qwen3.8-27b-imatrix.gguf \
-  --tensor-type-file docs/rocmfpx/qwen3.8-27b-mq-q4s.tensor-types.txt \
+  --tensor-type-file docs/rocmfpx/qwen3.8-27b-rocmfp4-fp6.tensor-types.txt \
   ukisai_Swift-1.5-Qwen3.8-27b-bf16-00001-of-00002.gguf \
-  Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S.gguf \
+  Swift-1.5-Qwen3.8-27B-ROCmFP4-FP6.gguf \
   Q4_0_ROCMFP4 24
 ```
 
@@ -86,7 +86,7 @@ Perplexity, wikitext-2 test, 580 chunks, `-c 512 -b 512 -fa on`, f16 KV:
 
 | file | PPL | size GiB |
 | --- | ---: | ---: |
-| `MQ-Q4S` (61 tensors) | 7.1516 ± 0.048 | 14.97 |
+| `ROCmFP4-FP6` (61 tensors) | 7.1516 ± 0.048 | 14.97 |
 
 Speed and memory on 9 and 10 October 2026, served with `-c 106496` on two
 slots, q4_0 KV, MTP draft `n-max 4` over 16,384 candidate tokens
