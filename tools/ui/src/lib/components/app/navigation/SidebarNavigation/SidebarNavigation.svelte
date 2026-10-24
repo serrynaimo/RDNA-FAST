@@ -6,7 +6,7 @@
 		ActionIcon,
 		DialogConversationDelete,
 		DialogConversationRename,
-		DialogManageModels,
+		DialogDiscoverModels,
 		DialogMcpServers,
 		DialogModelInformation,
 		DialogSettingsChat,
@@ -487,7 +487,7 @@
 
 <DialogMcpServers bind:open={mcpDialogOpen} />
 
-<DialogManageModels bind:open={uiStore.manageModelsOpen} />
+<DialogDiscoverModels bind:open={uiStore.discoverModelsOpen} />
 
 <DialogModelInformation />
 
