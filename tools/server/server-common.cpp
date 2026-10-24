@@ -16,7 +16,9 @@
 #include <limits>
 #include <cstring>
 #include <type_traits>
+#include <atomic>
 #include <chrono>
+#include <iostream>
 #include <thread>
 
 #ifdef _WIN32
@@ -2227,4 +2229,82 @@ void server_subproc::waiter::wait(const std::vector<server_subproc *> & procs, s
         }
     }
 #endif
+}
+
+//
+// server_role
+//
+
+server_role::server_role() {
+    if (is_managed_by_router()) {
+        cmd_out = server_reserve_stdout();
+    }
+}
+
+server_role::~server_role() {
+    if (cmd_out) {
+        fclose(cmd_out);
+    }
+}
+
+bool server_role::is_managed_by_router() {
+    return std::getenv(SERVER_ENV_ROUTER_PORT) != nullptr;
+}
+
+server_role_type server_role::get_role() {
+    const char * role = std::getenv(SERVER_ENV_CHILD_ROLE);
+    return server_role_type_from_str(role ? role : "");
+}
+
+std::thread server_role::setup(const std::function<void(int)> & shutdown_handler) {
+    // setup thread for monitoring stdin
+    return std::thread([shutdown_handler]() {
+        // wait for EOF on stdin
+        SRV_INF("%s", "child server monitoring thread started, waiting for EOF on stdin...\n");
+        bool eof = false;
+        while (true) {
+            std::string line;
+            if (!std::getline(std::cin, line)) {
+                // EOF detected, that means the router server is unexpectedly exit or killed
+                eof = true;
+                break;
+            }
+            if (line.find(CMD_ROUTER_TO_CHILD_EXIT) != std::string::npos) {
+                SRV_INF("%s", "exit command received, exiting...\n");
+                shutdown_handler(0);
+                break;
+            }
+        }
+        if (eof) {
+            // Shut down the same way as on the exit command. exit(1) here ended the process with the
+            // model still allocated, and on Windows + HIP that exit does not finish: the process stays
+            // for tens of minutes with its exit code already set, one thread spinning and several GB
+            // of VRAM still allocated, so the next instance loads into a card that is partly taken and
+            // stays spilled into shared memory. Tools that skip "already exited" processes (PowerShell
+            // Stop-Process) never remove it; a real TerminateProcess clears it in 2 s.
+            // (RX 7900 XT, 27B: 4.7 GB still held 31 min after the router was killed; next load 4.8 GB shared)
+            SRV_INF("%s", "EOF on stdin detected, shutting down...\n");
+            // no router is left to enforce stop-timeout, so do not hang around if the shutdown stalls
+            std::thread([]() {
+                std::this_thread::sleep_for(std::chrono::seconds(30));
+                fprintf(stderr, "shutdown not finished 30 s after EOF on stdin, terminating\n");
+#ifdef _WIN32
+                TerminateProcess(GetCurrentProcess(), 1);   // not exit(): that is the call that hangs
+#else
+                std::_Exit(1);
+#endif
+            }).detach();
+            shutdown_handler(0);
+        }
+    });
+}
+
+void server_role::notify_to_router(const std::string & state, const json & payload) {
+    json data = {
+        {"state", state},
+        {"payload", payload},
+    };
+    std::lock_guard<std::mutex> lk(mtx_stdout);
+    fprintf(cmd_out, "%s%s\n", CMD_CHILD_TO_ROUTER_STATE, safe_json_to_str(data).c_str());
+    fflush(cmd_out);
 }
