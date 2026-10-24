@@ -755,6 +755,19 @@ int    mmb_shadow_mode(){ return 2; }
 bool   mmb_shadow()    { return mmb_shadow_mode() != 0; }
 bool   mmb_shadow_q6k(){ return mmb_shadow_mode() >= 1; }
 size_t mmb_shadow_cap(){ return (size_t) 6144 << 20; }
+// [TAG_MMB_SHADOW_FITS] a shadow is made only while it fits in the free device memory with 1 GiB to spare (the pool
+// grows during compute, the desktop takes its share). On Windows cudaMalloc does not fail past the card, it lands in
+// shared memory: the Q6_K shadows of a stock Q4_K_M 27B pushed 7.5 GB out of a 20 GB RX 7900 XT (2026-10-24).
+// Once one does not fit, no more are tried.
+static bool g_mmb_shadow_full = false;
+static bool mmb_shadow_fits(const ggml_tensor * w, size_t bytes) {
+    if (g_mmb_shadow_full) return false;
+    size_t free = 0, total = 0;
+    if (cudaMemGetInfo(&free, &total) == cudaSuccess && free >= bytes + ((size_t) 1 << 30)) return true;
+    GGML_LOG_WARN("MMB_SHADOW: %.0f MiB free on the device, %s and later weights stay quantized\n", free / 1048576.0, w->name);
+    g_mmb_shadow_full = true;
+    return false;
+}
 static bool mmb_is_resident_q6k(const ggml_tensor * w) { return w && w->type == GGML_TYPE_Q6_K && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w) && w->ne[0] % 256 == 0 && w->ne[1] <= 32768; }
 static bool mmb_is_resident_iq4(const ggml_tensor * w) { return w && w->type == GGML_TYPE_IQ4_NL && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w); }
 static bool mmb_is_row_concat(const ggml_tensor * w) {
@@ -821,6 +834,7 @@ void ggml_cuda_mmb_release_all() {
     g_mmb_shadow.clear();
     g_mmb_shadow_pair.clear();
     g_mmb_shadow_bytes = 0;
+    g_mmb_shadow_full = false;
 }
 uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n) {
     if (!mmb_enabled() || ggml_nrows(t) < mmb_min_t()) return nullptr;
@@ -1027,13 +1041,15 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Called from graph_optimize (outside stream capture): create the shadow for an eligible IQ4_NL dense weight.
+// Called from graph_compute before the graph runs (outside stream capture, every buffer of the graph allocated): create
+// the shadow for an eligible Q6_K or IQ4_NL dense weight.
 void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
     if (!w) return;
     if (mmb_is_resident_q6k(w)) {
         if (!mmb_shadow_q6k() || g_mmb_shadow.count(w->data) > 0) return;
         const size_t n = (size_t) w->ne[0] * w->ne[1], bytes = n * 2;
         if (g_mmb_shadow_bytes + bytes > mmb_shadow_cap()) { GGML_LOG_INFO("MMB_SHADOW cap reached; %s stays Q6_K\n", w->name); return; }
+        if (!mmb_shadow_fits(w, bytes)) return;
         uint16_t * buf = nullptr;
         if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { GGML_LOG_WARN("MMB_SHADOW alloc failed (%zu bytes)\n", bytes); return; }
         mmb_dq_q6k_bf16_kernel<<<(unsigned) ((n / 256 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->data, buf, n / 256);
@@ -1048,6 +1064,7 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
     const size_t n = (size_t) w->ne[0] * w->ne[1];
     const size_t bytes = n * 2;
     if (g_mmb_shadow_bytes + bytes > mmb_shadow_cap()) { static bool warned = false; if (!warned) { GGML_LOG_INFO("MMB_SHADOW cap reached at %.1f MB; further weights stay IQ4_NL\n", g_mmb_shadow_bytes / 1048576.0); warned = true; } return; }
+    if (!mmb_shadow_fits(concat ? w->src[0] : w, bytes)) return;
     uint16_t * buf = nullptr;
     if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { GGML_LOG_WARN("MMB_SHADOW alloc failed (%zu bytes)\n", bytes); return; }
     if (concat) {
