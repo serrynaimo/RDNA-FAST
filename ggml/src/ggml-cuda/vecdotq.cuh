@@ -770,11 +770,40 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp7_q8_1(
     return vec_dot_rocmfpx_linear_q8_1<block_rocmfp7, 7, VDR_ROCMFP7_Q8_1_MMVQ>(vbq, bq8_1, kbx, iqs);
 }
 
+// [TAG_FP6_MMVQ_FAST] 4 FP6 codes (6-bit sign-magnitude, -0 meaning -32) in the low 24 bits -> 4 int8 lanes,
+// branch-free: the codes are spread to one byte each, and a negative lane is ((32 - mag) & 31) | 0xE0, which is
+// -mag, or -32 for mag 0 (no borrow crosses a byte: mag <= 31).
+static __device__ __forceinline__ int rocmfpx_fp6_bits24_to_i8x4(const uint32_t x) {
+    const uint32_t b   = (x & 0x3Fu) | ((x << 2) & 0x3F00u) | ((x << 4) & 0x3F0000u) | ((x << 6) & 0x3F000000u);
+    const uint32_t m   = b & 0x1F1F1F1Fu;
+    const uint32_t s   = ((b >> 5) & 0x01010101u) * 0xFFu;
+    const uint32_t neg = ((0x20202020u - m) & 0x1F1F1F1Fu) | 0xE0E0E0E0u;
+    return (int) ((m & ~s) | (neg & s));
+}
+
 static __device__ __forceinline__ float vec_dot_rocmfpx_fp6_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
     const block_rocmfp6_device * bq6 = (const block_rocmfp6_device *) vbq + kbx;
 
+#if !GGML_ROCMFP6_EXPANDED_DEVICE && VDR_ROCMFP6_Q8_1_MMVQ == 4
+    // [TAG_FP6_MMVQ_FAST] with 4 ints per call iqs is 0 or 4 (qi 8): the 16 codes are the 12 bytes at 3*iqs, all
+    // under one scale. Only those are read, as 2-byte halves (blocks are 26 bytes), and taken apart with fixed
+    // shifts; the products and the float order are the ones of the general path below, so results are bit-identical.
+    const uint16_t * q16 = (const uint16_t *) (bq6->qs + 3*iqs);
+    const uint32_t w0 = q16[0] | ((uint32_t) q16[1] << 16);
+    const uint32_t w1 = q16[2] | ((uint32_t) q16[3] << 16);
+    const uint32_t w2 = q16[4] | ((uint32_t) q16[5] << 16);
+    const int * u = (const int *) bq8_1->qs + iqs;
+
+    int sumi = ggml_cuda_dp4a(rocmfpx_fp6_bits24_to_i8x4(w0),                     u[0], 0);
+    sumi     = ggml_cuda_dp4a(rocmfpx_fp6_bits24_to_i8x4((w0 >> 24) | (w1 <<  8)), u[1], sumi);
+    sumi     = ggml_cuda_dp4a(rocmfpx_fp6_bits24_to_i8x4((w1 >> 16) | (w2 << 16)), u[2], sumi);
+    sumi     = ggml_cuda_dp4a(rocmfpx_fp6_bits24_to_i8x4(w2 >>  8),                u[3], sumi);
+
+    const float db = __low2float(bq8_1->ds);
+    return db * (rocmfpx_ue4m3_to_fp32_finite(bq6->e[iqs >= QK_ROCMFP6/8]) * sumi);
+#else
 #if !GGML_ROCMFP6_EXPANDED_DEVICE
     uint32_t qs0, qs1, qs2, qs3, qs4, qs5;
     memcpy(&qs0, bq6->qs +  0, 4);
@@ -829,6 +858,7 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp6_q8_1(
 
     const float db = __low2float(bq8_1->ds);
     return db * (rocmfpx_ue4m3_to_fp32_finite(bq6->e[0]) * sumi0 + rocmfpx_ue4m3_to_fp32_finite(bq6->e[1]) * sumi1);
+#endif // !GGML_ROCMFP6_EXPANDED_DEVICE && VDR_ROCMFP6_Q8_1_MMVQ == 4
 }
 
 static __device__ __forceinline__ float vec_dot_rocmfpx_fp8_q8_1(
