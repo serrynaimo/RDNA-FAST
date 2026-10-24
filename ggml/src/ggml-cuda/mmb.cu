@@ -849,6 +849,13 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
     if (src0->type == GGML_TYPE_Q8_0) return false;
 #endif // defined(GGML_USE_HIP)
     const bool quant = mmb_quant_type(src0->type);
+#if defined(GGML_USE_HIP)
+    // [TAG_MMB_RDNA3_0_MMQ] on gfx1100 (RDNA3.0) quantized dense weights go to the int8 MMQ kernels instead: the
+    // dequantising WMMA path was tuned on gfx1151. RX 7900 XT, 4096 x 14336 at 512 rows (2026-10-24): MMQ against
+    // this path Q4_0 47.3 vs 17.4 TFLOPS, Q4_K 42.1 vs 14.1, Q6_K 42.4 vs 12.3, IQ4_XS 46.2 vs 6.7; a cold 17k
+    // prompt on a Qwen3.8-27B IQ4_XS 780 vs 166 t/s.
+    if (quant && GGML_CUDA_CC_IS_RDNA3_0(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) return false;
+#endif // defined(GGML_USE_HIP)
     const bool bf16w = src0->type == GGML_TYPE_BF16 && mmb_bf16w();
     const bool f32w  = src0->type == GGML_TYPE_F32 && mmb_f32split();
     if (quant && src0->ne[0] % ggml_blck_size(src0->type) != 0) return false;
