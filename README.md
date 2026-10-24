@@ -12,20 +12,23 @@ FP4/FP6 weight formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
 ## Highlights
 
 - **Faster agent loops than LM Studio on the same card.** A scripted two-agent
-  session finishes in 103 s instead of 168 s, with about twice the decode speed.
+  session finishes in 105 s instead of 168 s, with twice the decode speed.
   [Numbers](#speed)
 
-- **Multi-token prediction.** The model's own MTP head drafts tokens ahead:
-  about 50 t/s on prose and 73 t/s on code. When an answer repeats text from
-  the prompt, as code edits do, n-gram drafting copies it at about 240 t/s.
+- **Multi-token prediction.** The model's own MTP head drafts tokens ahead: up
+  to 54 t/s on prose and 88 t/s on code. When an answer repeats text from the
+  prompt, as code edits do, n-gram drafting copies it at up to 263 t/s.
 
 - **Prompts on the matrix cores.** Prompt processing runs on RDNA3's WMMA units
   through [rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) by Adel
-  Johar, about a third faster on long prompts. [More](#prompts-through-a-wmma-gemm)
+  Johar, for the stock 4-bit quants as well as the ROCmFPX formats.
+  [More](#prompts-through-a-wmma-gemm)
 
-- **96k tokens of context on a 20 GB card**, with Swift 1.5, a Qwen3.8-27B
-  fine-tune, in our high-quality mixed Q4 quant.
-  [Recipe](docs/rocmfpx/swift-1.5-qwen3.8-27b-mq-q4s.md)
+- **96k tokens of context on a 20 GB card** with
+  [Swift 1.5 IQ4_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf),
+  UkisAI's Qwen3.8-27B fine-tune, our recommended model. For slightly faster
+  prompts, our ROCmFPX-optimised quant of the same model:
+  [MQ-Q4S recipe](docs/rocmfpx/swift-1.5-qwen3.8-27b-mq-q4s.md)
 
 - **Switching conversations costs seconds, not minutes.** Conversations are
   saved to SSD and restored when they come back, in about 3 s instead of a
@@ -62,64 +65,52 @@ Against stock llama.cpp on the same card: one scripted two-agent session with
 identical prompts (14 requests; an orchestrator grows from 4k to 41k tokens, a
 10k-token worker is called twice in between):
 
-| | stock llama.cpp | stock + MTP draft | this runtime, 64k | this runtime, 106k |
-|---|---:|---:|---:|---:|
-| **the session, wall-clock** | **1,065 s** | **168 s** | **103 s** | **107 s** |
-| prefill t/s, cold 4k prompt | 174 | 636 | 960 | 882 |
-| prefill t/s, 4.3k new tokens at 17k depth | 67 | 592 | 823 | 800 |
-| prefill t/s, 4.0k new tokens at 41k depth | 32 | 458 | 665 | 639 |
-| decode t/s at 4k depth | 32.3 | 31.5 | 55.5 | 55.3 |
-| decode t/s at 17k depth | 17.8 | 30.9 | 56.7 | 55.1 |
-| decode t/s at 41k depth | 10.6 | 24.3 | 52.0 | 52.1 |
-| decode t/s, text copy boost: code edit that copies the prompt | | | 187 | 187 |
+| | stock llama.cpp | stock + MTP draft | this runtime |
+|---|---:|---:|---:|
+| **the session, wall-clock** | **1,065 s** | **168 s** | **105 s** |
+| prefill t/s, cold 4k prompt | 174 | 636 | 904 |
+| prefill t/s, 4.3k new tokens at 17k depth | 67 | 592 | 764 |
+| prefill t/s, 4.0k new tokens at 41k depth | 32 | 458 | 626 |
+| decode t/s at 4k depth | 32.3 | 31.5 | 63.2 |
+| decode t/s at 17k depth | 17.8 | 30.9 | 61.1 |
+| decode t/s at 41k depth | 10.6 | 24.3 | 56.6 |
+| decode t/s, text copy boost: code edit that copies the prompt | | | 263 |
 
 <sub>October 2026. Stock is LM Studio's ROCm llama.cpp runtime 2.55.0 with
 `Qwen3.8-27B-Q4_K_M`, flash attention, a q4_0 KV cache, two sessions,
-`-c 65536` and batch 2048 / 1024. This runtime at the same context with
-`-b 2048 -ub 2048` (the chart, mean of two runs), and at `-c 106496 -ub 1024`
-(mean of four runs), where `-ub 2048` does not fit. The
-edit row is the text copy boost, n-gram drafting (95 t/s without it); it was
-not measured on LM Studio. Since the n-gram drafts grew from 24 to 48 tokens,
-the production server makes 239 t/s on the same edit.</sub>
+`-c 65536` and batch 2048 / 1024. This runtime runs Swift 1.5 IQ4_XS with the
+quick start below (`-c 98304 -ub 1024`), the better of two runs for each value.
+The edit row is the text copy boost, n-gram drafting, the best of three edits;
+it was not measured on LM Studio.</sub>
 
-Decode on the production server, 450-token answers at temperature 1:
+Decode, 450-token answers at temperature 1, the best of nine:
 
-| decode t/s | median | peak | lowest | draft accepted |
-|---|---:|---:|---:|---:|
-| prose | 50.1 | 53.2 | 45.9 | 0.60 |
-| code | 72.6 | 86.4 | 57.0 | 0.72 |
-| without MTP, prose or code | 34.6 | 34.7 | | |
+| decode t/s | peak |
+|---|---:|
+| prose | 54.0 |
+| code | 88.2 |
+| without MTP, prose or code | 36.8 |
 
-Deep in a conversation, and on cold prompts at temperature 0:
+Cold prompts, each followed by a 300-token answer at that depth:
 
-| | 17k | 41k |
-|---|---:|---:|
-| decode t/s at that depth | 54.7 | 55.9 |
-| decode t/s, verbatim copy of a passage | | 124 |
-| prefill t/s, cold prompt, average over the prompt | 923 | 815 |
-| the same with the int8 path for prompts (`ROCMFPX_WMMA_GEMM=0`) | 682 | 621 |
-
-Real agent traffic by context depth:
-
-| context depth | decode median | decode peak | prefill median | prefill peak |
-|---|---:|---:|---:|---:|
-| under 8k | 63.5 | 70.3 | 333 | 451 |
-| 8-20k | 47.1 | 67.0 | 536 | 608 |
-| 20-40k | 43.4 | 66.3 | 495 | 571 |
-| 40-60k | 41.5 | 51.9 | 414 | 465 |
-| 60-80k | 33.3 | 40.2 | 420 | 436 |
-| all | 43.7 | 70.3 | 500 | 608 |
-
-Both slots busy: 35 t/s each, 67 t/s in total. See
-[Several slots on one GPU](#several-slots-on-one-gpu).
+| | 17k | 41k | 69k |
+|---|---:|---:|---:|
+| prefill t/s, average over the prompt | 875 | 782 | 689 |
+| decode t/s at that depth | 51.3 | 49.2 | 43.7 |
 
 ## Quick start
 
-**1. Model.** `Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S` (~15 GB):
-[UkisAI's Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b), a
-Qwen3.8-27B fine-tune, as ROCmFP4 weights and the MTP head, with 61 sensitive
-tensors promoted to `Q6_0_ROCMFPX`, plus the f16 `mmproj` of the base model for
-vision. The
+**1. Model.**
+[`Swift-1.5-Qwen3.8-27B-IQ4_XS`](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf)
+(15.5 GB): [UkisAI's Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b),
+a Qwen3.8-27B fine-tune, with its MTP head, plus the f16 `mmproj` of the base
+model for vision. Against the model's Q8_0 it picks the same top token 93.5% of
+the time (mean KL divergence 0.021, wikitext-2).
+
+The ROCmFPX-optimised alternative is our quant of the same model,
+`Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S` (16.1 GB): ROCmFP4 weights with 61
+sensitive tensors in `Q6_0_ROCMFPX`. Its prompts run 2-5% faster, at 92.8% the
+same top token (KL divergence 0.026). The
 [recipe and its tensor policy file](docs/rocmfpx/swift-1.5-qwen3.8-27b-mq-q4s.md)
 are in this repository.
 
@@ -145,7 +136,7 @@ set LLAMA_MAX_QUEUED=3
 set ROCMFPX_DRAFT_VOCAB=24576
 set GGML_HIP_FA_GQA6=1
 
-llama-server -m Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S.gguf --mmproj mmproj-Qwen3.8-27B-f16.gguf ^
+llama-server -m Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf --mmproj mmproj-Qwen3.8-27B-f16.gguf ^
   -dev ROCm0 -ngl 999 -fa on --jinja --load-mode dio --gpu-keepalive-ms 2000 ^
   -c 98304 -np 2 --kv-unified --kv-unified-reserve 12288 --no-cache-idle-slots ^
   -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -b 2048 -ub 1024 --no-mmproj-offload ^
@@ -164,13 +155,13 @@ Flags:
 
 | flag | why |
 |---|---|
-| `-c 98304`, `-ctk q4_0 -ctv q4_0` | about what a 20 GB card holds with these settings: 18.7 GB resident, 0.7 GB paged. KV costs ~18 KB/token. Whatever does not fit, Windows silently pages to system RAM; at 106,496 (18.9 GB + 0.8 GB paged) cold prompts are 2-3% slower than at 65,536, which pages nothing. |
+| `-c 98304`, `-ctk q4_0 -ctv q4_0` | about what a 20 GB card holds with these settings: 18.1 GB resident, 0.7 GB paged with IQ4_XS (18.6 GB with the MQ-Q4S quant). KV costs ~18 KB/token. Whatever does not fit, Windows silently pages to system RAM. |
 | `-np 2 --kv-unified --kv-unified-reserve 12288` | two slots share one pool instead of splitting it. The reserve admits a second request only while both can still generate 12k tokens, else it waits in the queue. See [Several slots on one GPU](#several-slots-on-one-gpu). |
 | `--no-cache-idle-slots` | keeps the idle conversation resident; the default saves and clears it at every new task, which leaves one live conversation. |
 | `--no-mmproj-offload` | the 0.9 GB vision projector was the whole paged share at two slots. Images cost 7-12 s to the first token instead of 3-5 s. |
 | `-ub 1024` | prefill +6% at 17k and +11% at 41k over 256, for 0.3 GB more VRAM; 512 gives +4% and +8% for 0.1 GB. Decode does not change with it (55.7 against 56.0 t/s on identical text). The WMMA GEMM for prompts takes batches of 512 tokens or more only, so at `-ub 256` it never runs. `-ub 2048` does not fit beside `-c 106496` on 20 GB (2.3 GB paged, prefill falls to 162 t/s); at `-c 65536` it fits but gains only 1-2% on cold prompts (949 / 836 against 932 / 821 t/s at 17k / 41k). |
 | `--spec-type draft-mtp`, `--spec-draft-n-max 4` | +45% decode on prose, +112% on code, for about 0.7 GB of VRAM and 3% of prefill speed. The draft head has its own KV cache; for prompt tokens only its K and V are computed, nothing else of the block is ever read. |
-| `--spec-type "...,ngram-map-k4v"` | text copy boost: n-gram drafting in front of MTP. Where the last tokens repeat an earlier place of the context, the continuation found there is drafted, otherwise MTP drafts as before. Each match first makes a 4-token probe that is not sent: MTP drafts that pass, and the probe is scored against what comes out. Once six probes in a row would have been accepted in full, n-gram drafts of up to 48 tokens replace MTP until one is not accepted in full, so a match that is only a phrase or a path costs neither a pass nor a checkpoint. On two days of agent traffic (783 requests) this saved 4.6-6.0% of decode time, and 5-6% of the requests came out slower, against 12-40% when the probes were sent. Code edits that copy the prompt 95 -> 239 t/s (187 with drafts of up to 24 tokens), a verbatim copy at 41k 83 -> 124 t/s. Quote the value in a .cmd file: cmd splits arguments at commas. |
+| `--spec-type "...,ngram-map-k4v"` | text copy boost: n-gram drafting in front of MTP. Where the last tokens repeat an earlier place of the context, the continuation found there is drafted, otherwise MTP drafts as before. Each match first makes a 4-token probe that is not sent: MTP drafts that pass, and the probe is scored against what comes out. Once six probes in a row would have been accepted in full, n-gram drafts of up to 48 tokens replace MTP until one is not accepted in full, so a match that is only a phrase or a path costs neither a pass nor a checkpoint. On two days of agent traffic (783 requests) this saved 4.6-6.0% of decode time, and 5-6% of the requests came out slower, against 12-40% when the probes were sent. Code edits that copy the prompt run at up to 263 t/s. Quote the value in a .cmd file: cmd splits arguments at commas. |
 | `--no-spec-ngram-map-ramp` | not set here. Full-length n-gram drafts (48 tokens) from the first match: 268 t/s on code edits and 180 t/s on the copy at 41k, but slower on answers that only share phrases with the context, where a wrong long draft costs a checkpoint restore and a replay pass. |
 | `--ctx-checkpoints 8` | kept in host RAM, ~200 MiB each. When the list is full, the one whose removal leaves the smallest gap is dropped; the one at the first user message never is. |
 | `--cache-disk` | conversations and their checkpoints are kept on SSD. See [The SSD prompt cache](#the-ssd-prompt-cache). |
@@ -236,10 +227,14 @@ converted to f16, and [rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm
 (Adel Johar, MIT, in `vendor/rocm_wmma_gemm`) computes the product with f32
 accumulation.
 
-| one matrix product, 1,024 tokens | int8 path | WMMA GEMM |
+| one matrix product | int8 path | WMMA GEMM |
 |---|---:|---:|
-| FP4 weights, the four shapes of the model | 41-45 TFLOPS | 60-62 TFLOPS (1.34-1.49x) |
-| FP6 weights | 29-31 TFLOPS | 51-52 TFLOPS (1.6-1.8x) |
+| FP4 weights, the four shapes of the model, 1,024 tokens | 41-45 TFLOPS | 60-62 TFLOPS |
+| FP6 weights, 1,024 tokens | 29-31 TFLOPS | 51-52 TFLOPS |
+| stock quants (Q4_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS), 512 tokens | 39-48 TFLOPS | 45-48 TFLOPS |
+
+With Swift 1.5 IQ4_XS, a cold 17k prompt runs at 864 t/s through the WMMA GEMM
+and at 781 t/s on the int8 path.
 
 On the model, cold prompts go from 682 to 923 t/s at 17k and from 621 to 815
 t/s at 41k. Decode does not change (the same text at temperature 0: 56.1 and
