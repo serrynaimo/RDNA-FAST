@@ -2039,7 +2039,10 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
     // shadow probes are free, and on agent text 63% of them held, so four in a row came by chance (9 openings in 2 h,
     // 37% of the long drafts accepted). 6 since 2026-10-20 (Thomas); ROCMFPX_NGRAM_PROBES overrides it.
     const int               probe_count;
-    static constexpr size_t long_size   = 24;
+    // [TAG_NGRAM_LONG48] the draft size once the gate is open: 24 until 2026-10-24, 48 since (Thomas). At 8 probes the
+    // long drafts nearly always reached the cap (23.4-23.9 tokens), 96% of them held in full on answers that copy
+    // (code edits) and 69% on ordinary ones. 48 is also the map's own default value size (size_m).
+    static constexpr size_t long_size   = 48;
     const bool ramp;
     // [TAG_NGRAM_MAP_SHADOW] A probe that is sent takes MTP's place in that pass, and on real traffic (2026-10-12..20)
     // most probes lost to the MTP draft they replaced: short answers came out up to 20% slower and the n-gram drafter

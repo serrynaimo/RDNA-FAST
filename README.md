@@ -17,7 +17,7 @@ FP4/FP6 weight formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
 - **Multi-token prediction.** The model's own MTP head drafts tokens ahead:
   about 50 t/s on prose and 73 t/s on code. When an answer repeats text from
-  the prompt, as code edits do, n-gram drafting copies it at about 187 t/s.
+  the prompt, as code edits do, n-gram drafting copies it at about 240 t/s.
 
 - **Prompts on the matrix cores.** Prompt processing runs on RDNA3's WMMA units
   through [rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) by Adel
@@ -79,7 +79,8 @@ identical prompts (14 requests; an orchestrator grows from 4k to 41k tokens, a
 `-b 2048 -ub 2048` (the chart, mean of two runs), and at `-c 106496 -ub 1024`
 (mean of four runs), where `-ub 2048` does not fit. The
 edit row is the text copy boost, n-gram drafting (95 t/s without it); it was
-not measured on LM Studio.</sub>
+not measured on LM Studio. Since the n-gram drafts grew from 24 to 48 tokens,
+the production server makes 239 t/s on the same edit.</sub>
 
 Decode on the production server, 450-token answers at temperature 1:
 
@@ -169,7 +170,7 @@ Flags:
 | `--no-mmproj-offload` | the 0.9 GB vision projector was the whole paged share at two slots. Images cost 7-12 s to the first token instead of 3-5 s. |
 | `-ub 1024` | prefill +6% at 17k and +11% at 41k over 256, for 0.3 GB more VRAM; 512 gives +4% and +8% for 0.1 GB. Decode does not change with it (55.7 against 56.0 t/s on identical text). The WMMA GEMM for prompts takes batches of 512 tokens or more only, so at `-ub 256` it never runs. `-ub 2048` does not fit beside `-c 106496` on 20 GB (2.3 GB paged, prefill falls to 162 t/s); at `-c 65536` it fits but gains only 1-2% on cold prompts (949 / 836 against 932 / 821 t/s at 17k / 41k). |
 | `--spec-type draft-mtp`, `--spec-draft-n-max 4` | +45% decode on prose, +112% on code, for about 0.7 GB of VRAM and 3% of prefill speed. The draft head has its own KV cache; for prompt tokens only its K and V are computed, nothing else of the block is ever read. |
-| `--spec-type "...,ngram-map-k4v"` | text copy boost: n-gram drafting in front of MTP. Where the last tokens repeat an earlier place of the context, the continuation found there is drafted, otherwise MTP drafts as before. Each match first makes a 4-token probe that is not sent: MTP drafts that pass, and the probe is scored against what comes out. Once six probes in a row would have been accepted in full, n-gram drafts of up to 24 tokens replace MTP until one is not accepted in full, so a match that is only a phrase or a path costs neither a pass nor a checkpoint. On two days of agent traffic (783 requests) this saved 4.6-6.0% of decode time, and 5-6% of the requests came out slower, against 12-40% when the probes were sent. Code edits that copy the prompt 95 -> 187 t/s, a verbatim copy at 41k 83 -> 124 t/s. Quote the value in a .cmd file: cmd splits arguments at commas. |
+| `--spec-type "...,ngram-map-k4v"` | text copy boost: n-gram drafting in front of MTP. Where the last tokens repeat an earlier place of the context, the continuation found there is drafted, otherwise MTP drafts as before. Each match first makes a 4-token probe that is not sent: MTP drafts that pass, and the probe is scored against what comes out. Once six probes in a row would have been accepted in full, n-gram drafts of up to 48 tokens replace MTP until one is not accepted in full, so a match that is only a phrase or a path costs neither a pass nor a checkpoint. On two days of agent traffic (783 requests) this saved 4.6-6.0% of decode time, and 5-6% of the requests came out slower, against 12-40% when the probes were sent. Code edits that copy the prompt 95 -> 239 t/s (187 with drafts of up to 24 tokens), a verbatim copy at 41k 83 -> 124 t/s. Quote the value in a .cmd file: cmd splits arguments at commas. |
 | `--no-spec-ngram-map-ramp` | not set here. Full-length n-gram drafts (48 tokens) from the first match: 268 t/s on code edits and 180 t/s on the copy at 41k, but slower on answers that only share phrases with the context, where a wrong long draft costs a checkpoint restore and a replay pass. |
 | `--ctx-checkpoints 8` | kept in host RAM, ~200 MiB each. When the list is full, the one whose removal leaves the smallest gap is dropped; the one at the first user message never is. |
 | `--cache-disk` | conversations and their checkpoints are kept on SSD. See [The SSD prompt cache](#the-ssd-prompt-cache). |
