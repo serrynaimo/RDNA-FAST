@@ -860,6 +860,15 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             }
         }
     }
+    // [TAG_MMVQ_RDNA3_0_KQ_RPB2] RDNA3.0 (gfx1100) K-quants at 2-8 columns (MTP verify, parallel slots): 2 rows per
+    // block, measured on an RX 7900 XT (2026-10-25) on a 65536 x 5120 matrix streaming from VRAM: Q4_K 11-17%, Q5_K
+    // 8-15%, Q6_K 4-16% faster at 2-5 columns; stock Qwen3.8-27B Q4_K_M decodes 8 / 11 / 13% faster with 3 / 4 / 5
+    // sequences (llama-batched-bench, 1-2 unchanged). Tried and dropped: each block decoded once for all columns (no
+    // gain on top, Q6_K up to 10% slower), 8 warps at 1 column (9-28% slower), 2 warps at 2-5 columns, 4 warps at 1-5.
+    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst >= 2 && ncols_dst <= 8 &&
+            (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K)) {
+        return 2;
+    }
     // RDNA3.0 (gfx1100) keeps 1 row per block for the fork types, measured on an RX 7900 XT (2026-10-24): FP4
     // (Q4_0_ROCMFP4) at 2-8 columns with 2 rows and the codes decoded once per block is bit-exact and faster on a
     // single 200 MB matrix (5 columns 375 -> 309 us, 3 columns 295 -> 283, 1-2 unchanged), but the 27B's decode did

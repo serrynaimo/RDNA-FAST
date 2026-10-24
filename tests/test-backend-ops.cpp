@@ -12926,6 +12926,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // decode-sized products on a weight matrix too large for an 80 MB last-level cache (RX 7900: 188-270 MB for the
+    // 4-6 bit types), so the times include streaming the weights from VRAM as a real decode does
+    for (int bs : {1, 2, 3, 4, 5}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_0_ROCMFP4}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 65536, bs, 5120, {1, 1}, {1, 1}));
+        }
+    }
+
     // Q4_K multi-column mat-vec
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {
