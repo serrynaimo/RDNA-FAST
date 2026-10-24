@@ -1574,6 +1574,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    // [TAG_GRAPH_ARENAS] a graph is reused only right after one of the same size (gf_res_prev_active == res). MTP
+    // check passes vary in size, so the main graph is rebuilt on most of them (24 of 32 on the 27B, ~2 ms of a
+    // 45 ms decode step, 2026-10-24). Keeping the per-size graphs across sizes does not work as is: the scheduler
+    // rewires node srcs to its own input copies when it splits a graph, so a kept graph points at the copies of
+    // another allocation (GPU: GGML_ASSERT(src_backend_id != -1) in ggml-backend.cpp).
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 

@@ -758,7 +758,9 @@ size_t mmb_shadow_cap(){ return (size_t) 6144 << 20; }
 // [TAG_MMB_SHADOW_FITS] a shadow is made only while it fits in the free device memory with 1 GiB to spare (the pool
 // grows during compute, the desktop takes its share). On Windows cudaMalloc does not fail past the card, it lands in
 // shared memory: the Q6_K shadows of a stock Q4_K_M 27B pushed 7.5 GB out of a 20 GB RX 7900 XT (2026-10-24).
-// Once one does not fit, no more are tried.
+// Once one does not fit, no more are tried. On Windows the free memory is this process's: what another process holds
+// on the card is not subtracted (20.3 GB reported free beside a server holding 18.7 GB), so the check guards a
+// process against its own overflow only.
 static bool g_mmb_shadow_full = false;
 static bool mmb_shadow_fits(const ggml_tensor * w, size_t bytes) {
     if (g_mmb_shadow_full) return false;

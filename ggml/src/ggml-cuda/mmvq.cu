@@ -860,6 +860,11 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             }
         }
     }
+    // RDNA3.0 (gfx1100) keeps 1 row per block for the fork types, measured on an RX 7900 XT (2026-10-24): FP4
+    // (Q4_0_ROCMFP4) at 2-8 columns with 2 rows and the codes decoded once per block is bit-exact and faster on a
+    // single 200 MB matrix (5 columns 375 -> 309 us, 3 columns 295 -> 283, 1-2 unchanged), but the 27B's decode did
+    // not move; 4 rows are no better, 2 rows without the decode-once cost 10-20% decode; FP6 (Q6_0_ROCMFPX) with 2
+    // rows is 1.5-2.8x slower.
     return 1;
 }
 
