@@ -20,6 +20,9 @@ static const char * decision_question_type_name(server_decision_question_type ty
 // lev reads noul from a rating scale: 0 = certainly no, 8 = certainly yes
 static const size_t DECISION_LEV_N_RATINGS = 9;
 
+// the recursive functions of this file walk request JSON, a deeper value would overflow the stack
+static const int RECURSIVE_LIMIT = 128;
+
 static std::string decision_meta_str(const llama_model * model, const std::string & key) {
     char buf[256];
     const int32_t n = llama_model_meta_val_str(model, key.c_str(), buf, sizeof(buf));
@@ -314,7 +317,10 @@ json server_decision_context::parse_state(const json & body, std::vector<raw_buf
 //
 
 // replace text in all strings of a JSON value
-static json decision_replace_text(const json & val, const std::string & search, const std::string & replace) {
+static json decision_replace_text(const json & val, const std::string & search, const std::string & replace, int depth = 0) {
+    if (depth >= RECURSIVE_LIMIT) {
+        throw std::invalid_argument("JSON is nested more than " + std::to_string(RECURSIVE_LIMIT) + " levels deep");
+    }
     if (val.is_string()) {
         std::string str = val.get<std::string>();
         string_replace_all(str, search, replace);
@@ -323,14 +329,14 @@ static json decision_replace_text(const json & val, const std::string & search, 
     if (val.is_array()) {
         json out = json::array();
         for (const auto & item : val) {
-            out.push_back(decision_replace_text(item, search, replace));
+            out.push_back(decision_replace_text(item, search, replace, depth + 1));
         }
         return out;
     }
     if (val.is_object()) {
         json out = json::object();
         for (const auto & [key, item] : val.items()) {
-            out[key] = decision_replace_text(item, search, replace);
+            out[key] = decision_replace_text(item, search, replace, depth + 1);
         }
         return out;
     }
@@ -338,18 +344,21 @@ static json decision_replace_text(const json & val, const std::string & search, 
 }
 
 // sort the keys of all objects of a JSON value
-static json decision_sort_keys(const json & val) {
+static json decision_sort_keys(const json & val, int depth = 0) {
+    if (depth >= RECURSIVE_LIMIT) {
+        throw std::invalid_argument("JSON is nested more than " + std::to_string(RECURSIVE_LIMIT) + " levels deep");
+    }
     if (val.is_array()) {
         json out = json::array();
         for (const auto & item : val) {
-            out.push_back(decision_sort_keys(item));
+            out.push_back(decision_sort_keys(item, depth + 1));
         }
         return out;
     }
     if (val.is_object()) {
         std::map<std::string, json> sorted;
         for (const auto & [key, item] : val.items()) {
-            sorted[key] = decision_sort_keys(item);
+            sorted[key] = decision_sort_keys(item, depth + 1);
         }
         json out = json::object();
         for (const auto & [key, item] : sorted) {
@@ -398,7 +407,10 @@ static std::string decision_kev_text(const json & val) {
 }
 
 // lfm2-d1-omni: special tokens written in the input must not be parsed as such, in keys too (d1-omni prompt.py: escape)
-static json decision_d1omni_escape(const json & val) {
+static json decision_d1omni_escape(const json & val, int depth = 0) {
+    if (depth >= RECURSIVE_LIMIT) {
+        throw std::invalid_argument("JSON is nested more than " + std::to_string(RECURSIVE_LIMIT) + " levels deep");
+    }
     static const std::regex re_special("<\\|([A-Za-z0-9_]+)\\|>");
     if (val.is_string()) {
         return std::regex_replace(val.get<std::string>(), re_special, "<\xC2\xA6$1\xC2\xA6>");
@@ -406,14 +418,14 @@ static json decision_d1omni_escape(const json & val) {
     if (val.is_array()) {
         json out = json::array();
         for (const auto & item : val) {
-            out.push_back(decision_d1omni_escape(item));
+            out.push_back(decision_d1omni_escape(item, depth + 1));
         }
         return out;
     }
     if (val.is_object()) {
         json out = json::object();
         for (const auto & [key, item] : val.items()) {
-            out[std::regex_replace(key, re_special, "<\xC2\xA6$1\xC2\xA6>")] = decision_d1omni_escape(item);
+            out[std::regex_replace(key, re_special, "<\xC2\xA6$1\xC2\xA6>")] = decision_d1omni_escape(item, depth + 1);
         }
         return out;
     }
