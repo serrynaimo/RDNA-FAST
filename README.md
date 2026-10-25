@@ -11,9 +11,9 @@ FP4/FP6 weight formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
 ## Highlights
 
-- **Faster agent loops than LM Studio on the same card.** A scripted two-agent
-  session finishes in 105 s instead of 168 s, with twice the decode speed.
-  [Numbers](#speed)
+- **Faster agent loops than LM Studio on the same card.** With the same model,
+  quant and context, a scripted two-agent session finishes in 105 s instead of
+  132 s. [Numbers](#speed)
 
 - **Multi-token prediction.** The model's own MTP head drafts tokens ahead: up
   to 54 t/s on prose and 88 t/s on code. When an answer repeats text from the
@@ -61,27 +61,44 @@ been measured on an XTX.
 
 ![Speed against LM Studio (llama.cpp + MTP) on an RX 7900 XT](media/speed-vs-lmstudio.svg)
 
-Against stock llama.cpp on the same card: one scripted two-agent session with
-identical prompts (14 requests; an orchestrator grows from 4k to 41k tokens, a
-10k-token worker is called twice in between):
+Against LM Studio on the same card, with the same model, quant and context: one
+scripted two-agent session with identical prompts (14 requests; an orchestrator
+grows from 4k to 41k tokens, a 10k-token worker is called twice in between):
 
-| | stock llama.cpp | stock + MTP draft | this runtime |
-|---|---:|---:|---:|
-| **the session, wall-clock** | **1,065 s** | **168 s** | **105 s** |
-| prefill t/s, cold 4k prompt | 174 | 636 | 904 |
-| prefill t/s, 4.3k new tokens at 17k depth | 67 | 592 | 764 |
-| prefill t/s, 4.0k new tokens at 41k depth | 32 | 458 | 626 |
-| decode t/s at 4k depth | 32.3 | 31.5 | 63.2 |
-| decode t/s at 17k depth | 17.8 | 30.9 | 61.1 |
-| decode t/s at 41k depth | 10.6 | 24.3 | 56.6 |
-| decode t/s, text copy boost: code edit that copies the prompt | | | 263 |
+| | LM Studio + MTP draft | this runtime |
+|---|---:|---:|
+| **the session, wall-clock** | **132 s** | **105 s** |
+| prefill t/s, cold 4k prompt | 728 | 904 |
+| prefill t/s, 4.3k new tokens at 17k depth | 678 | 763 |
+| prefill t/s, 4.0k new tokens at 41k depth | 519 | 625 |
+| decode t/s at 4k depth | 51.6 | 63.2 |
+| decode t/s at 17k depth | 56.6 | 61.1 |
+| decode t/s at 41k depth | 42.4 | 56.6 |
+| decode t/s, text copy boost: code edit that copies the prompt | | 263 |
 
-<sub>October 2026. Stock is LM Studio's ROCm llama.cpp runtime 2.55.0 with
-`Qwen3.8-27B-Q4_K_M`, flash attention, a q4_0 KV cache, two sessions,
-`-c 65536` and batch 2048 / 1024. This runtime runs Swift 1.5 IQ4_XS with the
-quick start below (`-c 98304 -ub 1024`), the better of two runs for each value.
-The edit row is the text copy boost, n-gram drafting, the best of three edits;
-it was not measured on LM Studio.</sub>
+<sub>October 2026. Both run Swift 1.5 IQ4_XS at `-c 98304` with MTP drafting,
+flash attention, a q4_0 KV cache and two sessions, the better of two runs for
+each value. LM Studio is its ROCm llama.cpp runtime 2.64.0 with batch
+2048 / 1024; this runtime runs the quick start below (`-ub 1024`). The edit row
+is the text copy boost, n-gram drafting, the best of three edits; LM Studio
+cannot run it, as its API does not switch Swift 1.5's thinking off.</sub>
+
+The same session with each quant we tested:
+
+| quant | size | session, this runtime | session, LM Studio | prefill t/s at 4k / 17k / 41k | decode t/s at 4k / 17k / 41k | code edit t/s |
+|---|---:|---:|---:|---:|---:|---:|
+| [Q4_K_M](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf)\* | 17.4 GB | 146.8 s | 1,211 s (spill) | 408 / 548 / 431 | 50.6 / 50.8 / 48.2 | 238 |
+| [Q4_K_S](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-Q4_K_S.gguf) | 16.4 GB | 112.6 s | 1,139 s (spill) | 889 / 769 / 616 | 49.2 / 51.7 / 48.8 | 247 |
+| [IQ4_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf) | 15.5 GB | 105.3 s | 132.4 s | 904 / 763 / 625 | 63.2 / 61.1 / 56.6 | 263 |
+| [ROCmFP4-FP6](docs/rocmfpx/swift-1.5-qwen3.8-27b-rocmfp4-fp6.md) | 16.1 GB | 104.5 s | | 923 / 798 / 634 | 60.2 / 56.4 / 58.5 | 243 |
+
+<sub>\* At 64k (`-c 65536`) and `-ub 512`: the smaller context and prompt batches
+keep Q4_K_M's spill into system RAM down while staying above Hermes'
+64,000-token minimum. The other quants run at 96k with `-ub 1024`. Prefill and
+decode are this runtime's, in the session above; the better of two runs
+(Q4_K_M: one). LM Studio's Q4_K_S and Q4_K_M sit at the edge of the card's
+memory and read every prompt again in full. ROCmFP4-FP6 is a ROCmFPX format,
+which LM Studio does not load.</sub>
 
 Decode, 450-token answers at temperature 1, the best of nine:
 

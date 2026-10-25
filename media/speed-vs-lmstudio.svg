@@ -8,66 +8,66 @@
 <rect width="1200" height="6" fill="url(#red)"/>
 <path d="M1030 6 L1200 6 L1200 176 Z" fill="url(#red)" opacity="0.95"/>
 <text x="56" y="74" fill="#F4F4F5" font-size="38" font-weight="800" letter-spacing="-0.5">Qwen3.8-27B on a Radeon RX 7900 XT</text>
-<text x="56" y="110" fill="#9A9FA8" font-size="19">Agentic session with identical prompts: this runtime at 96k context against LM Studio (llama.cpp + MTP) at 64k</text>
+<text x="56" y="110" fill="#9A9FA8" font-size="19">Agentic session with identical prompts: Swift 1.5 IQ4_XS at 96k context on both runtimes</text>
 <rect x="56" y="136" width="26" height="14" rx="3" fill="url(#red)" filter="url(#glow)"/><text x="92" y="149" fill="#F4F4F5" font-size="16" font-weight="600">this runtime</text>
 <rect x="216" y="136" width="26" height="14" rx="3" fill="#5B6068"/><text x="252" y="149" fill="#9A9FA8" font-size="16">LM Studio (llama.cpp + MTP)</text>
 <rect x="40" y="186" width="1120" height="110" rx="14" fill="#141417" stroke="#26262B"/>
 <text x="64" y="217" fill="#ED1C24" font-size="17" font-weight="800" letter-spacing="2">AGENTIC SESSION</text>
 <text x="276" y="217" fill="#9A9FA8" font-size="14">wall-clock, lower is better</text>
 <text x="64" y="259" fill="#F4F4F5" font-size="17">two-agent session, 14 requests</text>
-<rect x="420" y="236" width="294.6" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
-<text x="724.6" y="250" fill="#F4F4F5" font-size="17" font-weight="800">105.3 s</text>
+<rect x="420" y="236" width="373.8" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
+<text x="803.8" y="250" fill="#F4F4F5" font-size="17" font-weight="800">105.3 s</text>
 <rect x="420" y="258" width="470.0" height="17" rx="4" fill="#5B6068"/>
-<text x="900.0" y="272" fill="#9A9FA8" font-size="15">168 s</text>
-<text x="1136" y="265" text-anchor="end" fill="#FF6A3D" font-size="30" font-weight="800">1.6x</text>
+<text x="900.0" y="272" fill="#9A9FA8" font-size="15">132.4 s</text>
+<text x="1136" y="265" text-anchor="end" fill="#FF6A3D" font-size="30" font-weight="800">1.3x</text>
 <rect x="40" y="312" width="1120" height="238" rx="14" fill="#141417" stroke="#26262B"/>
 <text x="64" y="343" fill="#ED1C24" font-size="17" font-weight="800" letter-spacing="2">DECODE</text>
 <text x="157" y="343" fill="#9A9FA8" font-size="14">generated tokens per second, higher is better</text>
 <text x="64" y="385" fill="#F4F4F5" font-size="17">at 4k depth</text>
 <rect x="420" y="362" width="470.0" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
 <text x="900.0" y="376" fill="#F4F4F5" font-size="17" font-weight="800">63.2 t/s</text>
-<rect x="420" y="384" width="234.3" height="17" rx="4" fill="#5B6068"/>
-<text x="664.3" y="398" fill="#9A9FA8" font-size="15">31.5 t/s</text>
-<text x="1136" y="391" text-anchor="end" fill="#FF6A3D" font-size="30" font-weight="800">2.0x</text>
+<rect x="420" y="384" width="383.7" height="17" rx="4" fill="#5B6068"/>
+<text x="813.7" y="398" fill="#9A9FA8" font-size="15">51.6 t/s</text>
+<text x="1136" y="391" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+22%</text>
 <text x="64" y="449" fill="#F4F4F5" font-size="17">at 17k depth</text>
 <rect x="420" y="426" width="454.4" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
 <text x="884.4" y="440" fill="#F4F4F5" font-size="17" font-weight="800">61.1 t/s</text>
-<rect x="420" y="448" width="229.8" height="17" rx="4" fill="#5B6068"/>
-<text x="659.8" y="462" fill="#9A9FA8" font-size="15">30.9 t/s</text>
-<text x="1136" y="455" text-anchor="end" fill="#FF6A3D" font-size="30" font-weight="800">2.0x</text>
+<rect x="420" y="448" width="420.9" height="17" rx="4" fill="#5B6068"/>
+<text x="850.9" y="462" fill="#9A9FA8" font-size="15">56.6 t/s</text>
+<text x="1136" y="455" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+8%</text>
 <text x="64" y="513" fill="#F4F4F5" font-size="17">at 41k depth</text>
 <rect x="420" y="490" width="420.9" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
 <text x="850.9" y="504" fill="#F4F4F5" font-size="17" font-weight="800">56.6 t/s</text>
-<rect x="420" y="512" width="180.7" height="17" rx="4" fill="#5B6068"/>
-<text x="610.7" y="526" fill="#9A9FA8" font-size="15">24.3 t/s</text>
-<text x="1136" y="519" text-anchor="end" fill="#FF6A3D" font-size="30" font-weight="800">2.3x</text>
+<rect x="420" y="512" width="315.3" height="17" rx="4" fill="#5B6068"/>
+<text x="745.3" y="526" fill="#9A9FA8" font-size="15">42.4 t/s</text>
+<text x="1136" y="519" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+33%</text>
 <rect x="40" y="566" width="1120" height="238" rx="14" fill="#141417" stroke="#26262B"/>
 <text x="64" y="597" fill="#ED1C24" font-size="17" font-weight="800" letter-spacing="2">PREFILL</text>
 <text x="170" y="597" fill="#9A9FA8" font-size="14">prompt tokens per second, higher is better</text>
 <text x="64" y="639" fill="#F4F4F5" font-size="17">cold 4k prompt</text>
 <rect x="420" y="616" width="470.0" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
 <text x="900.0" y="630" fill="#F4F4F5" font-size="17" font-weight="800">904 t/s</text>
-<rect x="420" y="638" width="330.7" height="17" rx="4" fill="#5B6068"/>
-<text x="760.7" y="652" fill="#9A9FA8" font-size="15">636 t/s</text>
-<text x="1136" y="645" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+42%</text>
+<rect x="420" y="638" width="378.5" height="17" rx="4" fill="#5B6068"/>
+<text x="808.5" y="652" fill="#9A9FA8" font-size="15">728 t/s</text>
+<text x="1136" y="645" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+24%</text>
 <text x="64" y="703" fill="#F4F4F5" font-size="17">4.3k new tokens at 17k depth</text>
-<rect x="420" y="680" width="397.2" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
-<text x="827.2" y="694" fill="#F4F4F5" font-size="17" font-weight="800">764 t/s</text>
-<rect x="420" y="702" width="307.8" height="17" rx="4" fill="#5B6068"/>
-<text x="737.8" y="716" fill="#9A9FA8" font-size="15">592 t/s</text>
-<text x="1136" y="709" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+29%</text>
+<rect x="420" y="680" width="396.7" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
+<text x="826.7" y="694" fill="#F4F4F5" font-size="17" font-weight="800">763 t/s</text>
+<rect x="420" y="702" width="352.5" height="17" rx="4" fill="#5B6068"/>
+<text x="782.5" y="716" fill="#9A9FA8" font-size="15">678 t/s</text>
+<text x="1136" y="709" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+13%</text>
 <text x="64" y="767" fill="#F4F4F5" font-size="17">4.0k new tokens at 41k depth</text>
-<rect x="420" y="744" width="325.5" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
-<text x="755.5" y="758" fill="#F4F4F5" font-size="17" font-weight="800">626 t/s</text>
-<rect x="420" y="766" width="238.1" height="17" rx="4" fill="#5B6068"/>
-<text x="668.1" y="780" fill="#9A9FA8" font-size="15">458 t/s</text>
-<text x="1136" y="773" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+37%</text>
+<rect x="420" y="744" width="324.9" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
+<text x="754.9" y="758" fill="#F4F4F5" font-size="17" font-weight="800">625 t/s</text>
+<rect x="420" y="766" width="269.8" height="17" rx="4" fill="#5B6068"/>
+<text x="699.8" y="780" fill="#9A9FA8" font-size="15">519 t/s</text>
+<text x="1136" y="773" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+20%</text>
 <rect x="40" y="820" width="1120" height="110" rx="14" fill="#141417" stroke="#26262B"/>
 <text x="64" y="851" fill="#ED1C24" font-size="17" font-weight="800" letter-spacing="2">TEXT COPY BOOST</text>
 <text x="276" y="851" fill="#9A9FA8" font-size="14">decode t/s when the answer copies the prompt (n-gram drafting)</text>
 <text x="64" y="893" fill="#F4F4F5" font-size="17">return a file with one small change</text>
 <rect x="420" y="881" width="470.0" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
 <text x="900.0" y="895" fill="#F4F4F5" font-size="17" font-weight="800">263 t/s</text>
-<text x="56" y="962" fill="#9A9FA8" font-size="13">RX 7900 XT 20 GB, October 2026. This runtime: Swift 1.5 (Qwen3.8-27B) IQ4_XS, -c 98304 -ub 1024, MTP draft, WMMA GEMM for prompts, best of two runs.</text>
-<text x="56" y="982" fill="#9A9FA8" font-size="13">LM Studio: ROCm llama.cpp 2.55.0, Qwen3.8-27B Q4_K_M, MTP draft, q4_0 KV cache, -c 65536 -ub 1024.</text>
+<text x="56" y="962" fill="#9A9FA8" font-size="13">RX 7900 XT 20 GB, October 2026. Both: Swift 1.5 (Qwen3.8-27B) IQ4_XS, -c 98304, MTP draft, q4_0 KV cache, two sessions, best of two runs.</text>
+<text x="56" y="982" fill="#9A9FA8" font-size="13">This runtime: -ub 1024, WMMA GEMM for prompts. LM Studio: ROCm llama.cpp runtime 2.64.0, batch 2048 / 1024.</text>
 </svg>
