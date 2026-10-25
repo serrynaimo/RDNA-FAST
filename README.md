@@ -74,7 +74,7 @@ grows from 4k to 41k tokens, a 10k-token worker is called twice in between):
 | decode t/s at 4k depth | 51.6 | 63.2 |
 | decode t/s at 17k depth | 56.6 | 61.1 |
 | decode t/s at 41k depth | 42.4 | 56.6 |
-| decode t/s, text copy boost: code edit that copies the prompt | | 263 |
+| decode t/s, text copy boost: code edit that copies the prompt | unavailable | 263 |
 
 <sub>October 2026. Both run Swift 1.5 IQ4_XS at `-c 98304` with MTP drafting,
 flash attention, a q4_0 KV cache and two sessions, the better of two runs for
