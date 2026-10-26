@@ -7,7 +7,8 @@ A 3-bit quantization of
 every `attn_output` and the first and last four layers' FFN are `IQ4_XS`;
 `attn_k`, `attn_v` and `output` are `Q6_0_ROCMFPX`; the embedding is `Q8_0`.
 Against bartowski's IQ3_XS of the same model it drifts 25% less from the
-original (KL divergence 0.135 against 0.179) at the same speed.
+original (KL divergence 0.135 against 0.179) at the same speed. To run it you
+need the [RDNA-FAST runtime](../../README.md).
 
 ![Nanbeige4.3-33B IQ3-FP6 on an RX 7900 XT](nanbeige4.3-33b-iq3-fp6.svg)
 
