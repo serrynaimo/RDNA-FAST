@@ -118,6 +118,12 @@ bool ggml_cuda_should_use_wmma_gemm(const ggml_tensor * src0, const ggml_tensor 
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
+        // [TAG_WMMA_GEMM_Q3] the 3-bit stock types (IQ3_S / IQ3_XXS of the IQ3 quants, Q3_K of Q3_K_S/M/L), unpacked to f16
+        // by their existing to_fp16 kernels like the 4-bit ones above. RX 7900 XT 2026-10-26, 22016 x 7168 at 512 rows
+        // against int8 MMQ: IQ3_S 55.1 vs 51.9 TFLOPS, IQ3_XXS 55.2 vs 52.7, Q3_K 51.2 vs 45.4
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_Q3_K:
             break;
         default:
             return false;

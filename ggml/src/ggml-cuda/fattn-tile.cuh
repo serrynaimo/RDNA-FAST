@@ -37,6 +37,18 @@
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 128, 6,  32, 256)     \
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 30, 320, 3,  32, 256)
 
+// [TAG_FATTN_GQA7] the same for a GQA ratio of 7 with head size 128 (Nanbeige4.3-33B: 56 query heads on 8 KV heads):
+// 7 columns per query, 1 to 5 queries. Seven is prime, so a block has 1 or 7 warps per 7 columns. Measured on gfx1100
+// (RX 7900 XT, 2026-10-26) on a q4_0 cache, us per call against the old routing (the vector kernel, which reads every
+// K/V row once per query head): 1 query at 4k / 16k / 48k cells 60 -> 28, 234 -> 96, 682 -> 269; 2 queries 109 -> 39,
+// 399 -> 118, 1167 -> 328. Not tuned further: the first layout tried, seven warps.
+#define GGML_CUDA_FATTN_TILE_CONFIG_GQA7                                 \
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  7, 224, 6,  32, 128)     \
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 14, 224, 6,  32, 128)     \
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 21, 224, 6,  32, 128)     \
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 28, 224, 6,  32, 128)     \
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 35, 224, 4,  32, 128)
+
 static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nvidia_fp16(const int DKQ, const int DV, const int ncols) {
     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40,  2, 128, 3, 128,  40)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40,  4, 128, 2, 128,  40)
@@ -238,6 +250,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  32, 128)
 
     GGML_CUDA_FATTN_TILE_CONFIG_GQA6
+    GGML_CUDA_FATTN_TILE_CONFIG_GQA7
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 32, 512, 1, 128,  64)
 
@@ -318,6 +331,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 3,  64, 128)
 
     GGML_CUDA_FATTN_TILE_CONFIG_GQA6
+    GGML_CUDA_FATTN_TILE_CONFIG_GQA7
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 32, 256, 2, 128,  64)
 
@@ -525,6 +539,17 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
 // (the f16 copy of the whole cache per call) is memory traffic, which RDNA4 has less of. RDNA4 speed is not measured.
 // Every other card keeps the stock routing: the vector kernel for small batches and an f16 copy of the cache for the
 // tile kernel. GGML_HIP_FA_Q4_TILE=1 turns it on for any HIP card, =0 off for all of them.
+// [TAG_FATTN_GQA7] head size 128 too, but only where the per-KV-head block of TAG_FATTN_GQA7 takes the batch (GQA 7,
+// 1 to 5 queries): other head-128 shapes keep their measured routing.
+// GGML_HIP_FA_GQA7: 1 = on (the default), 0 = off.
+static inline int ggml_cuda_fattn_tile_gqa7_mode() {
+    static const int mode = [] {
+        const char * env = getenv("GGML_HIP_FA_GQA7");
+        return env ? atoi(env) : 1;
+    }();
+    return mode;
+}
+
 static inline bool ggml_cuda_fattn_tile_reads_q4_0(const int cc, const ggml_tensor * dst) {
 #if defined(GGML_USE_HIP) && defined(FAST_FP16_AVAILABLE)
     static const int mode = [] {
@@ -540,8 +565,14 @@ static inline bool ggml_cuda_fattn_tile_reads_q4_0(const int cc, const ggml_tens
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    return K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0 &&
-           Q->ne[0] == 256 && K->ne[0] == 256 && V->ne[0] == 256;
+    if (K->type != GGML_TYPE_Q4_0 || V->type != GGML_TYPE_Q4_0) {
+        return false;
+    }
+    if (Q->ne[0] == 256 && K->ne[0] == 256 && V->ne[0] == 256) {
+        return true;
+    }
+    return Q->ne[0] == 128 && K->ne[0] == 128 && V->ne[0] == 128 && Q->ne[2] == 7*K->ne[2] && Q->ne[1] <= 5 &&
+           ggml_cuda_fattn_tile_gqa7_mode() > 0;
 #else
     GGML_UNUSED(cc);
     GGML_UNUSED(dst);
@@ -982,7 +1013,7 @@ static __global__ void flash_attn_tile(
 
     // Skip unused kernel variants for faster compilation:
 
-    if ((use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512)) || (kv_q4_0 && !(DKQ == 256 && DV == 256))) {
+    if ((use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512)) || (kv_q4_0 && !((DKQ == 256 && DV == 256) || (DKQ == 128 && DV == 128)))) {
         GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,
@@ -1304,11 +1335,11 @@ static __global__ void flash_attn_tile(
 #endif // FLASH_ATTN_AVAILABLE
 }
 
-// [TAG_FATTN_TILE_Q4_0] the kernel that expands q4_0 K/V itself exists for head size 256 only
+// [TAG_FATTN_TILE_Q4_0] the kernel that expands q4_0 K/V itself exists for head size 256, and 128 for TAG_FATTN_GQA7
 template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap>
 static fattn_kernel_t ggml_cuda_fattn_tile_get_kernel(const bool kv_q4_0) {
 #if defined(GGML_USE_HIP) && defined(FAST_FP16_AVAILABLE)
-    if constexpr (DKQ == 256 && DV == 256) {
+    if constexpr ((DKQ == 256 && DV == 256) || (DKQ == 128 && DV == 128)) {
         if (kv_q4_0) {
             return flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, true>;
         }
@@ -1327,7 +1358,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     const int warp_size = 32;
 
     // [TAG_FATTN_TILE_Q4_0]
-    const bool kv_q4_0 = DKQ == 256 && DV == 256 && ggml_cuda_fattn_tile_reads_q4_0(cc, dst);
+    const bool kv_q4_0 = ((DKQ == 256 && DV == 256) || (DKQ == 128 && DV == 128)) && ggml_cuda_fattn_tile_reads_q4_0(cc, dst);
 
     constexpr size_t nbytes_shared = 0;
 
@@ -1424,9 +1455,9 @@ static inline int ggml_cuda_fattn_tile_gqa6_mode() {
     return mode;
 }
 
-template <int DKQ, int DV, int ncols1, bool use_logit_softcap>
-static void launch_fattn_tile_gqa6_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const bool kv_q4_0) {
-    constexpr int    ncols2        = 6;
+// [TAG_FATTN_GQA6] [TAG_FATTN_GQA7] one block per KV head with all ncols2 of its query heads (6: head 256, 7: head 128)
+template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap>
+static void launch_fattn_tile_per_kv_head_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const bool kv_q4_0) {
     constexpr size_t nbytes_shared = 0;
 
     const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -1446,18 +1477,18 @@ static void launch_fattn_tile_gqa6_case(ggml_backend_cuda_context & ctx, ggml_te
 }
 
 // returns false if the batch is not one this path handles
-template <int DKQ, int DV, bool use_logit_softcap>
-static bool launch_fattn_tile_gqa6(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
+static bool launch_fattn_tile_per_kv_head(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
 
     const bool kv_q4_0 = ggml_cuda_fattn_tile_reads_q4_0(ggml_cuda_info().devices[ggml_cuda_get_device()].cc, dst);
 
     switch (Q->ne[1]) {
-        case 1: launch_fattn_tile_gqa6_case<DKQ, DV, 1, use_logit_softcap>(ctx, dst, kv_q4_0); return true;
-        case 2: launch_fattn_tile_gqa6_case<DKQ, DV, 2, use_logit_softcap>(ctx, dst, kv_q4_0); return true;
-        case 3: launch_fattn_tile_gqa6_case<DKQ, DV, 3, use_logit_softcap>(ctx, dst, kv_q4_0); return true;
-        case 4: launch_fattn_tile_gqa6_case<DKQ, DV, 4, use_logit_softcap>(ctx, dst, kv_q4_0); return true;
-        case 5: launch_fattn_tile_gqa6_case<DKQ, DV, 5, use_logit_softcap>(ctx, dst, kv_q4_0); return true;
+        case 1: launch_fattn_tile_per_kv_head_case<DKQ, DV, 1, ncols2, use_logit_softcap>(ctx, dst, kv_q4_0); return true;
+        case 2: launch_fattn_tile_per_kv_head_case<DKQ, DV, 2, ncols2, use_logit_softcap>(ctx, dst, kv_q4_0); return true;
+        case 3: launch_fattn_tile_per_kv_head_case<DKQ, DV, 3, ncols2, use_logit_softcap>(ctx, dst, kv_q4_0); return true;
+        case 4: launch_fattn_tile_per_kv_head_case<DKQ, DV, 4, ncols2, use_logit_softcap>(ctx, dst, kv_q4_0); return true;
+        case 5: launch_fattn_tile_per_kv_head_case<DKQ, DV, 5, ncols2, use_logit_softcap>(ctx, dst, kv_q4_0); return true;
         default: return false;
     }
 }
@@ -1531,7 +1562,16 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
         if constexpr (DKQ == 256 && DV == 256 && !use_logit_softcap) {
             if (use_gqa_opt && gqa_ratio == 6 && ggml_cuda_fattn_tile_gqa6_mode() > 0 &&
                     GGML_CUDA_CC_IS_RDNA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
-                    launch_fattn_tile_gqa6<DKQ, DV, use_logit_softcap>(ctx, dst)) {
+                    launch_fattn_tile_per_kv_head<DKQ, DV, 6, use_logit_softcap>(ctx, dst)) {
+                return;
+            }
+        }
+        // [TAG_FATTN_GQA7] seven query heads per KV head, head size 128, 1 to 5 queries (Nanbeige4.3-33B): the generic path
+        // below cannot group an odd ratio, so without this every query head reads the K/V rows again (7x the traffic)
+        if constexpr (DKQ == 128 && DV == 128 && !use_logit_softcap) {
+            if (use_gqa_opt && gqa_ratio == 7 && ggml_cuda_fattn_tile_gqa7_mode() > 0 &&
+                    GGML_CUDA_CC_IS_RDNA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
+                    launch_fattn_tile_per_kv_head<DKQ, DV, 7, use_logit_softcap>(ctx, dst)) {
                 return;
             }
         }

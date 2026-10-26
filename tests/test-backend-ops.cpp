@@ -12276,6 +12276,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // ROCmFPX [TAG_FATTN_GQA7]: a GQA ratio of 7 with head size 128 (Nanbeige4.3-33B), batches of 1 to 5 queries on q4_0
+    // and f16 caches: on RDNA the tile kernel gives each KV head one block with all seven query heads.
+    for (ggml_type type_KV : {GGML_TYPE_Q4_0, GGML_TYPE_F16}) {
+        for (int64_t kv : {512, 2048, 4352}) {
+            for (int64_t nb : {1, 2, 3, 4, 5}) {
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {7, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
+        }
+    }
+
     // ROCmFPX [TAG_FATTN_TILE_Q4_0]: decode-sized batches on a q4_0 cache with head size 256 and grouped queries;
     // on HIP the tile kernel expands the q4_0 K/V tiles itself. Other backends take their usual path.
     for (int64_t nr2 : {2, 4, 6, 8}) {
@@ -12652,6 +12662,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // ROCmFPX: a dense model's attention at depth, Nanbeige4.3-33B: head 128, 8 KV heads with GQA 7 (56 query heads), the
+    // q4_0 KV cache; 1 / 2 queries (decode, a short verify) and a 512-row prompt batch, over 4k / 16k / 48k cells
+    for (int64_t kv : {4096, 16384, 49152}) {
+        for (int64_t nb : {1, 2, 512}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {7, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+        }
+    }
+    // the same prompt batch with GQA 8 (Llama-style head 128), to see what a head-128 tuning does to other models
+    for (int64_t kv : {16384, 49152}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {8, 1}, kv, 512, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    }
+
+    // ROCmFPX: the 3-bit stock types against IQ4_XS on a dense model's FFN matrix (Nanbeige4.3-33B ffn_up: 22016 x 7168,
+    // 158 M weights), a decode token, a verify batch of 4 and a 512-row prompt batch
+    for (ggml_type t : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q3_K, GGML_TYPE_IQ4_XS}) {
+        for (int64_t n : {1, 4, 512}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 22016, n, 7168, {1, 1}, {1, 1}));
+        }
+    }
+
     // ROCmFPX: tile-width probe. One column tile of J = n: does a narrower tile (smaller LDS footprint) do more work per second?
     for (int64_t n : {32, 64, 96, 128}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_F32, 17408, n,  5120, {1, 1}, {1, 1}));
@@ -12929,7 +12959,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // decode-sized products on a weight matrix too large for an 80 MB last-level cache (RX 7900: 188-270 MB for the
     // 4-6 bit types), so the times include streaming the weights from VRAM as a real decode does
     for (int bs : {1, 2, 3, 4, 5}) {
-        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_0_ROCMFP4}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_0_ROCMFP4,
+                                 GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q3_K}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 65536, bs, 5120, {1, 1}, {1, 1}));
         }
     }

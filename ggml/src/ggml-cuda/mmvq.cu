@@ -860,6 +860,14 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             }
         }
     }
+    // [TAG_MMVQ_RDNA3_0_Q3_RPB2] the 3-bit types (IQ3_S, IQ3_XXS, Q3_K) at 2-8 columns as the K-quants below, RX 7900 XT
+    // (2026-10-26) on a 65536 x 5120 matrix streaming from VRAM: 4-6% faster at 2 columns, 7-11% at 3-5. At 1 column
+    // one warp per row stays: 2 / 4 / 8 warps cost 7-15% / 34-46% / 56-63%. A single token still streams IQ3_S at
+    // ~575 GB/s against ~750 for IQ4_XS: its dot product spends the time on codebook lookups, not on the reads.
+    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst >= 2 && ncols_dst <= 8 &&
+            (type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_Q3_K)) {
+        return 2;
+    }
     // [TAG_MMVQ_RDNA3_0_KQ_RPB2] RDNA3.0 (gfx1100) K-quants at 2-8 columns (MTP verify, parallel slots): 2 rows per
     // block, measured on an RX 7900 XT (2026-10-25) on a 65536 x 5120 matrix streaming from VRAM: Q4_K 11-17%, Q5_K
     // 8-15%, Q6_K 4-16% faster at 2-5 columns; stock Qwen3.8-27B Q4_K_M decodes 8 / 11 / 13% faster with 3 / 4 / 5

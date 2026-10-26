@@ -150,6 +150,11 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128,  8,  64, 2,  32,  64,  64,  64, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 16,  64, 2,  32,  64,  64,  64, 1, true);
+    // Head 128 at 32 / 64 columns, measured on gfx1100 (RX 7900 XT, 2026-10-26) with 512 queries on a q4_0 cache at 4k-48k
+    // cells, GQA 7 (Nanbeige4.3-33B) and GQA 8: this layout is the fastest of those tried. 8 warps +1-12%, 128 KV rows
+    // per softmax step +72-89%, both +8-21%, occupancy 3 0 to -3% (noise), Q outside registers +35-42%. GQA 8, whose
+    // queries share each K/V tile (ncols2 8), runs as fast as GQA 7, whose do not: the kernel is compute-bound here
+    // (~33 TFLOPS at 48k), not bound by the K/V loads.
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 32, 128, 2,  64,  64,  64,  64, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 64, 128, 2,  64,  64,  64,  64, 1, true);
 
