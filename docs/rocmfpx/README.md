@@ -34,6 +34,7 @@ individual block layout.
 - [Formats and compatibility](FORMATS.md)
 - [Quant mixing](QUANT-MIXING.md)
 - [Swift-1.5-Qwen3.8-27B ROCmFP4-FP6 recipe for the RX 7900 XT](swift-1.5-qwen3.8-27b-rocmfp4-fp6.md)
+- [Nanbeige4.3-33B IQ3-FP6 recipe for the RX 7900 XT](nanbeige4.3-33b-iq3-fp6.md)
 - [Plugin and sidecar ABI](PLUGINS.md)
 - [Windows AMD multi-GPU bridge](../../README.md#windows-amd-multi-gpu-bridge)
 - [Hyperloom adapter](../../tools/hyperloom/README.md)
