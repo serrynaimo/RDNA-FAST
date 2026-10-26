@@ -72,9 +72,12 @@ it must report `quant size = 16309.81 MiB (4.13 BPW)`. The policy file pins
 every quantized tensor.
 
 Serve it like the quick start in the main README, with these differences:
-`-c 65536` and no MTP draft (`--spec-type ngram-map-k4v`; the model has no MTP
-head), no `--mmproj`, and the model card's sampling (`--temp 0.6 --top-p
-0.95`). Use a build of RDNA-FAST main of 26 October 2026 or later: it carries
+`-c 65536 -ub 512` and no MTP draft (`--spec-type ngram-map-k4v`; the model has
+no MTP head), no `--mmproj`, and the model card's sampling (`--temp 0.6 --top-p
+0.95`). `-ub 512` halves the prompt buffer: with `-ub 1024` and the quick start's
+SSD prompt cache, the server outgrew the card by 0.08 GB, and the part Windows
+moved to system RAM was the prompt buffer (prompts at 110-220 instead of ~690
+t/s). Use a build of RDNA-FAST main of 26 October 2026 or later: it carries
 the attention path for this model's seven query heads per key/value head
 (`[TAG_FATTN_GQA7]`), 3-bit prompts on the WMMA GEMM and the 3-bit decode
 tuning; older builds run it at about half the decode speed at depth.
