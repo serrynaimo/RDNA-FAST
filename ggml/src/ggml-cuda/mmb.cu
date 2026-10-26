@@ -871,6 +871,8 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
     return ggml_nrows(dst) == T;
 }
 
+bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);   // mmq.cuh
+
 bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
     if (!mmb_enabled()) return false;
     if (!mmb_quant_type(src0->type) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
@@ -884,6 +886,15 @@ bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * 
     if (dst->ne[0] != M || dst->ne[1] != n_used || dst->ne[2] != T || dst->ne[3] != 1) return false;
     if (ids->nb[0] != sizeof(int32_t) || ids->ne[2] != 1 || ids->ne[3] != 1) return false;
     if (T < mmb_min_t() || n_used > 64 || (T * n_used) >> 16 >= 1024) return false;   // tile index must fit in 16 bits per expert
+#if defined(GGML_USE_HIP)
+    // [TAG_MMB_RDNA3_0_MMQ_MOE] the same for routed experts on gfx1100: the types int8 MMQ takes go there, except Q8_0.
+    // RX 7900 XT (2026-10-26), MUL_MAT_ID at 512 tokens, 128 experts top-8 of 768 x 2048, MMB against MMQ: IQ4_XS 4.4x
+    // slower, Q6_K 2.6x, Q4_K 1.7x, IQ2_XS 1.6x, Q4_0 1.3x, Q8_0 0.71x (MMB faster: stays); 288 experts of 1024 x 4096 at
+    // 2048 tokens IQ4_XS 4.6x, IQ3_S 3.5x, Q5_K 2.7x; gpt-oss's MXFP4 2.1x. Gemma 4 26B-A4B Q4_K_M prompts at -ub 1024:
+    // pp512 2788 -> 3507 t/s, pp2048 3457 -> 4120 (best of two).
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (GGML_CUDA_CC_IS_RDNA3_0(cc) && src0->type != GGML_TYPE_Q8_0 && ggml_cuda_should_use_mmq(src0->type, cc, T, E)) return false;
+#endif // defined(GGML_USE_HIP)
     return true;
 }
 

@@ -11541,10 +11541,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // ROCmFPX [TAG_WMMA_GEMM]: prompt-sized FP4/FP6 products that take the WMMA GEMM on gfx1100/gfx1151 (rows and width
-    // in whole 256s, 256+ tokens), with token counts that are not whole tiles. ROCMFPX_WMMA_GEMM_SCRATCH_MB=1 makes the
-    // 1280-row case go through the chunked path (512 rows of K 1024 per chunk).
-    for (ggml_type type : {GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_Q6_0_ROCMFPX}) {
+    // ROCmFPX [TAG_WMMA_GEMM]: prompt-sized products of every type that takes the WMMA GEMM on gfx1100/gfx1151 (rows
+    // and width in whole 256s, 256+ tokens), with token counts that are not whole tiles. ROCMFPX_WMMA_GEMM_SCRATCH_MB=1
+    // makes the 1280-row case go through the chunked path (512 rows of K 1024 per chunk).
+    for (ggml_type type : {GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_Q6_0_ROCMFPX,
+                           GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL,
+                           GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_Q3_K,
+                           GGML_TYPE_Q8_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_1, GGML_TYPE_Q2_K,
+                           GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
+                           GGML_TYPE_Q3_0_ROCMFPX, GGML_TYPE_Q5_0_ROCMFPX, GGML_TYPE_Q7_0_ROCMFPX}) {
         for (int n : {256, 300, 1031}) {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1280, n, 1024, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  512, n, 2048, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
@@ -12669,9 +12674,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {7, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
         }
     }
-    // the same prompt batch with GQA 8 (Llama-style head 128), to see what a head-128 tuning does to other models
+    // the same prompt batch with GQA 8 (Llama-style head 128), to see what a head-128 tuning does to other models; and
+    // GQA 7 on an f16 cache, which the WMMA kernel reads as it is (a q4_0 cache is first copied to f16 for every call)
     for (int64_t kv : {16384, 49152}) {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {8, 1}, kv, 512, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {7, 1}, kv, 512, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
 
     // ROCmFPX: the 3-bit stock types against IQ4_XS on a dense model's FFN matrix (Nanbeige4.3-33B ffn_up: 22016 x 7168,
@@ -12957,10 +12964,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // decode-sized products on a weight matrix too large for an 80 MB last-level cache (RX 7900: 188-270 MB for the
-    // 4-6 bit types), so the times include streaming the weights from VRAM as a real decode does
+    // 4-6 bit types, 356 MB for Q8_0; the 2-bit types at 86-110 MB are only just larger), so the times include streaming
+    // the weights from VRAM as a real decode does
     for (int bs : {1, 2, 3, 4, 5}) {
         for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_0_ROCMFP4,
-                                 GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q3_K}) {
+                                 GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q3_K,
+                                 GGML_TYPE_Q2_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_Q4_0,
+                                 GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 65536, bs, 5120, {1, 1}, {1, 1}));
         }
     }

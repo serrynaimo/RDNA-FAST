@@ -124,6 +124,21 @@ bool ggml_cuda_should_use_wmma_gemm(const ggml_tensor * src0, const ggml_tensor 
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_Q3_K:
+        // [TAG_WMMA_GEMM_REST] the other types with a to_fp16 kernel, where it wins. RX 7900 XT 2026-10-26, 4096 x 14336 at
+        // 512 rows against today's path: Q8_0 46.3 vs 44.2 TFLOPS, Q4_1 48.6 vs 41.9, Q5_1 41.6 vs 38.5, Q2_K 48.3 vs 44.3,
+        // IQ2_XXS 49.2 vs 45.6, IQ2_XS 49.2 vs 44.1, IQ2_S 49.3 vs 43.9, Q3_0_ROCMFPX 37.3 vs 30.9, Q5_0_ROCMFPX 36.9 vs
+        // 35.2, Q7_0_ROCMFPX 36.7 vs 35.0. Left out, slower here because their unpack costs more than the GEMM saves:
+        // Q5_0 41.3 vs 45.4, Q8_0_ROCMFPX 40.8 vs 43.8, Q4_0_ROCMI4 40.6 vs 45.0; Q2_0_ROCMFPX measured unchanged.
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_Q3_0_ROCMFPX:
+        case GGML_TYPE_Q5_0_ROCMFPX:
+        case GGML_TYPE_Q7_0_ROCMFPX:
             break;
         default:
             return false;

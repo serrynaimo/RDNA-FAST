@@ -860,6 +860,23 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             }
         }
     }
+    // [TAG_MMVQ_RDNA3_0_Q2_RPB2] the 2-bit types at 2-8 columns as the K-quants below, RX 7900 XT (2026-10-26) on a
+    // 65536 x 5120 matrix: Q2_K 8-11%, IQ2_XXS 8-10%, IQ2_XS 6-11%, IQ2_S 7-13% faster at 2-5 columns.
+    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst >= 2 && ncols_dst <= 8 &&
+            (type == GGML_TYPE_Q2_K || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S)) {
+        return 2;
+    }
+    // [TAG_MMVQ_RDNA3_0_Q4_RPB2] the 4- and 5-bit block types from 4 columns (an MTP verify of 4 drafts is 5), same
+    // matrix: at 4 / 5 columns Q4_0 15 / 21% faster, IQ4_NL 14 / 19%, IQ4_XS 10 / 15%, Q5_0 11 / 14%, Q4_1 8 / 16%,
+    // Q5_1 8 / 10%. Real models carry much less (llama-batched-bench decode, 4 / 5 sequences): Swift 1.5 Qwen3.8-27B
+    // IQ4_XS +0.2 / +1.7%, Nanbeige4.3-33B IQ3-FP6 (its IQ4_XS tensors) +2.5 / +3.7%; at 3 sequences both lost 1.9%
+    // (the matrix gained 0-7%) and at 2 columns the matrix is 1-2% slower, so 1 row stays below 4. Q8_0 left out: 1-3%
+    // slower at 2-4 columns.
+    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst >= 4 && ncols_dst <= 8 &&
+            (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q5_1 ||
+             type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_IQ4_XS)) {
+        return 2;
+    }
     // [TAG_MMVQ_RDNA3_0_Q3_RPB2] the 3-bit types (IQ3_S, IQ3_XXS, Q3_K) at 2-8 columns as the K-quants below, RX 7900 XT
     // (2026-10-26) on a 65536 x 5120 matrix streaming from VRAM: 4-6% faster at 2 columns, 7-11% at 3-5. At 1 column
     // one warp per row stays: 2 / 4 / 8 warps cost 7-15% / 34-46% / 56-63%. A single token still streams IQ3_S at
