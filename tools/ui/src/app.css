@@ -35,6 +35,8 @@
 
 :root {
 	--radius: 0.625rem;
+	/* expanded desktop sidebar width, overridden once the user drags its edge */
+	--sidebar-width: 18rem;
 	/* RDNA-FAST brand light theme: #F6F6F7 ground, white panels, #E4E4E7 lines, red accents */
 	--background: #f6f6f7;
 	--foreground: #18181b;
