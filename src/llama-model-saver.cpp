@@ -1,4 +1,5 @@
 #include "llama-model-saver.h"
+#include "llama-ext.h"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -14,19 +15,7 @@
 #include <unordered_set>
 
 bool llama_model_saver_supports_arch(llm_arch arch) {
-    switch (arch) {
-        case LLM_ARCH_SENSENOVA_U1:
-        case LLM_ARCH_GEMMA3N:
-        case LLM_ARCH_BITNET:
-        case LLM_ARCH_T5:
-        case LLM_ARCH_APERTUS:
-        case LLM_ARCH_STEP35:
-        case LLM_ARCH_CLEF: // the head tensors are not saved
-        case LLM_ARCH_VLLM_DECISION2:
-            return false;
-        default:
-            return true;
-    }
+    return llama_arch_supports_save(arch);
 }
 
 llama_model_saver::llama_model_saver(const struct llama_model * model) :
