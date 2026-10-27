@@ -186,6 +186,10 @@ caps caps_get(jinja::program & prog) {
                     {
                         {"role", "user"},
                         {"content", json::array({
+                            {
+                                {"type", "text"},
+                                {"text", content_marker}
+                            }
                         })}
                     }
                 });
