@@ -2,10 +2,12 @@
 #include "convert.cuh"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -100,6 +102,382 @@ static wmma_gemm_f32_f16_t wmma_gemm_load(const char * arch) {
     return fn;
 }
 
+// [TAG_WMMA_GEMM_FP8_EMU] What an FP8 version of this path would cost in quality, measured on gfx1100 before writing one
+// for RDNA4 (whose FP8 WMMA runs at twice its FP16 rate): ROCMFPX_WMMA_GEMM_FP8_EMU=1 rounds the unpacked weights to
+// OCP E4M3 (3 mantissa bits, saturating at 448), 2 the activations (once, from f32), 3 both, each row with its own power-of-two scale
+// (an output channel of the weights, a token of the activations), so the scale itself adds no error. The block scales
+// of the quant are already folded into the f16 weights, as an FP8 unpack would fold them. The GEMM stays f16.
+static __device__ __forceinline__ float fp8_e4m3_round(const float x) {
+    const float a = fabsf(x);
+    if (!(a > 0.0f)) {
+        return 0.0f;
+    }
+    int e;
+    frexpf(a, &e);                                     // a = m * 2^e, m in [0.5, 1)
+    const float q = ldexpf(1.0f, max(e - 1, -6) - 3);  // spacing of 3 mantissa bits; the subnormals share 2^-6's
+    return copysignf(fminf(rintf(a / q) * q, 448.0f), x);
+}
+
+// x rows rounded in place, or (activations) read as f32 from xf and rounded once, as an FP8 path would quantize them
+template <int nthreads>
+static __global__ void fp8_e4m3_emulate_rows(half * __restrict__ x, const float * __restrict__ xf, const int64_t ncols) {
+    half * row = x + blockIdx.x*ncols;
+    const float * rowf = xf ? xf + blockIdx.x*ncols : nullptr;
+    float amax = 0.0f;
+    for (int64_t i = threadIdx.x; i < ncols; i += nthreads) {
+        amax = fmaxf(amax, fabsf(rowf ? rowf[i] : __half2float(row[i])));
+    }
+    __shared__ float smax[nthreads/WARP_SIZE];
+    amax = warp_reduce_max(amax);
+    if (threadIdx.x % WARP_SIZE == 0) {
+        smax[threadIdx.x / WARP_SIZE] = amax;
+    }
+    __syncthreads();
+    amax = 0.0f;
+#pragma unroll
+    for (int w = 0; w < nthreads/WARP_SIZE; ++w) {
+        amax = fmaxf(amax, smax[w]);
+    }
+    if (!(amax > 0.0f)) {
+        return;
+    }
+    int e;
+    frexpf(448.0f / amax, &e);                         // the largest power of two s with amax*s <= 448
+    const float s   = ldexpf(1.0f, e - 1);
+    const float inv = ldexpf(1.0f, 1 - e);
+    for (int64_t i = threadIdx.x; i < ncols; i += nthreads) {
+        row[i] = __float2half(fp8_e4m3_round((rowf ? rowf[i] : __half2float(row[i])) * s) * inv);
+    }
+}
+
+static void fp8_e4m3_emulate_rows_cuda(half * x, const float * xf, const int64_t nrows, const int64_t ncols, cudaStream_t stream) {
+    constexpr int nthreads = 256;
+    fp8_e4m3_emulate_rows<nthreads><<<(unsigned) nrows, nthreads, 0, stream>>>(x, xf, ncols);
+}
+
+// [TAG_FP8_GEMM] The prompt path for RDNA4, whose FP8 WMMA runs at twice its FP16 rate (RX 9070 XT: 389 against 195
+// TFLOPS dense; int8 is 389 too, but MMQ applies a scale every 32 values, as an FP8 kernel would have to for the quant
+// blocks). Weights are unpacked to f16 as for the WMMA GEMM, then to OCP E4M3 with one power-of-two scale per weight row,
+// so the block scales are folded into the values; activations go to E4M3 with one per token. The GEMM is plain FP8
+// with f32 accumulation and the two scales applied on the way out. Quality as [TAG_WMMA_GEMM_FP8_EMU] measures it.
+//
+// The kernel follows the design AMD describes for its RDNA4 FP8 GEMM (ROCm blog "FP8 GEMM Optimization on AMD RDNA 4",
+// written here from the description): both operands K-contiguous (activation rows, weight rows as stored), 16-byte
+// global loads into one LDS buffer whose rows are padded by 16 bytes, tiles taken in bands of 8 rows for L2 reuse, the
+// next K step loaded into registers while the current one computes and committed after it. A lane's 16 bytes of a
+// 32-wide K step feed two WMMAs (bytes 0-7, then 8-15), the K order the fork's RDNA4 int8 MMA uses: the two halves of
+// the wave hold K 0-15 and 16-31, so the first WMMA sums K 0-7 and 16-23, the second 8-15 and 24-31.
+//
+// Written without an RDNA4 card. On RDNA3 the same kernel runs with each E4M3 value widened to f16 (exact) and the f16
+// WMMA, to check everything but the gfx12 fragment layout: ROCMFPX_FP8_GEMM=1 there gives the numbers of
+// ROCMFPX_WMMA_GEMM_FP8_EMU=3 to f32 rounding. Off by default (ROCMFPX_FP8_GEMM=1 turns it on) until it is measured on RDNA4.
+static __device__ __forceinline__ uint8_t fp8_e4m3_encode(const float x) {
+    // x pre-scaled to |x| <= 448; nearest, ties to even, as fp8_e4m3_round
+    const uint32_t sign = x < 0.0f ? 0x80u : 0u;
+    const float a = fabsf(x);
+    if (!(a > 0.0f)) {
+        return 0;
+    }
+    int e;
+    frexpf(a, &e);
+    int E = e - 1;
+    if (E < -6) {
+        // subnormal steps of 2^-9; a carry to 8 is the smallest normal, 0x08
+        return (uint8_t) (sign | (uint32_t) rintf(a * 512.0f));
+    }
+    int m = (int) rintf(ldexpf(a, 3 - E));             // 8..16
+    if (m == 16) {
+        m = 8;
+        ++E;
+    }
+    if (E > 8 || (E == 8 && m > 14)) {
+        return (uint8_t) (sign | 0x7E);                 // 448, the largest finite value
+    }
+    return (uint8_t) (sign | ((uint32_t) (E + 7) << 3) | (uint32_t) (m - 8));
+}
+
+static __device__ __forceinline__ float fp8_gemm_to_float(const float x) { return x; }
+static __device__ __forceinline__ float fp8_gemm_to_float(const half x)  { return __half2float(x); }
+
+// one block per row: the row's power-of-two scale, its E4M3 bytes and 1/scale for the epilogue
+template <typename T, int nthreads>
+static __global__ void fp8_e4m3_quantize_rows(const T * __restrict__ x, uint8_t * __restrict__ q, float * __restrict__ inv_scale,
+                                              const int64_t ncols) {
+    const T * row  = x + blockIdx.x*ncols;
+    uint8_t * qrow = q + blockIdx.x*ncols;
+    float amax = 0.0f;
+    for (int64_t i = threadIdx.x; i < ncols; i += nthreads) {
+        amax = fmaxf(amax, fabsf(fp8_gemm_to_float(row[i])));
+    }
+    __shared__ float smax[nthreads/WARP_SIZE];
+    amax = warp_reduce_max(amax);
+    if (threadIdx.x % WARP_SIZE == 0) {
+        smax[threadIdx.x / WARP_SIZE] = amax;
+    }
+    __syncthreads();
+    amax = 0.0f;
+#pragma unroll
+    for (int w = 0; w < nthreads/WARP_SIZE; ++w) {
+        amax = fmaxf(amax, smax[w]);
+    }
+    float s = 1.0f, inv = 1.0f;
+    if (amax > 0.0f) {
+        int e;
+        frexpf(448.0f / amax, &e);
+        s   = ldexpf(1.0f, e - 1);
+        inv = ldexpf(1.0f, 1 - e);
+    }
+    if (threadIdx.x == 0) {
+        inv_scale[blockIdx.x] = inv;
+    }
+    for (int64_t i = threadIdx.x; i < ncols; i += nthreads) {
+        qrow[i] = fp8_e4m3_encode(fp8_gemm_to_float(row[i]) * s);
+    }
+}
+
+template <typename T>
+static void fp8_e4m3_quantize_rows_cuda(const T * x, uint8_t * q, float * inv_scale, const int64_t nrows, const int64_t ncols,
+                                        cudaStream_t stream) {
+    constexpr int nthreads = 256;
+    fp8_e4m3_quantize_rows<T, nthreads><<<(unsigned) nrows, nthreads, 0, stream>>>(x, q, inv_scale, ncols);
+}
+
+#if defined(GGML_USE_HIP) && (defined(RDNA4) || defined(RDNA3))
+#define FP8_GEMM_AVAILABLE
+typedef int      fp8_gemm_v2i __attribute__((ext_vector_type(2)));
+typedef uint32_t fp8_gemm_u4 __attribute__((ext_vector_type(4)));   // not HIP's uint4: an array of that struct stays in scratch
+typedef float    fp8_gemm_v8f __attribute__((ext_vector_type(8)));
+typedef _Float16 fp8_gemm_v16h __attribute__((ext_vector_type(16)));
+#endif
+
+#if defined(FP8_GEMM_AVAILABLE) && defined(RDNA3)
+// RDNA3 stand-in for the check: E4M3 widened to f16, which holds every E4M3 value exactly
+static __device__ __forceinline__ _Float16 fp8_e4m3_to_f16(const uint32_t b) {
+    const uint32_t e = (b >> 3) & 0xF;
+    const uint32_t m = b & 7;
+    uint16_t h = e == 0 ? __half_as_ushort(__float2half((float) m * (1.0f/512.0f))) : (uint16_t) (((e + 8) << 10) | (m << 7));
+    h |= (uint16_t) ((b & 0x80) << 8);
+    return __builtin_bit_cast(_Float16, h);
+}
+
+// the 16 K values of one WMMA from a lane's 32 bytes: bytes 0-7 and 16-23 (lo) or 8-15 and 24-31 (hi), the same K
+// sets as the two gfx12 WMMAs
+static __device__ __forceinline__ fp8_gemm_v16h fp8_gemm_rdna3_frag(const fp8_gemm_u4 v0, const fp8_gemm_u4 v1, const bool hi) {
+    const uint32_t w[4] = { hi ? v0.z : v0.x, hi ? v0.w : v0.y, hi ? v1.z : v1.x, hi ? v1.w : v1.y };
+    fp8_gemm_v16h f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        f[i] = fp8_e4m3_to_f16((w[i/4] >> (8*(i % 4))) & 0xFF);
+    }
+    return f;
+}
+#endif
+
+// C (M x N, row stride ldc, f32) = A (M x K, E4M3, row major) * B^T (B: N x K, E4M3, the weight rows), each element
+// scaled by sa[m]*sb[n]. N a multiple of BN, K of BK; rows past M are read clamped and not written.
+template <int BM, int BN, int BK, int WM, int WN>
+static __global__ void __launch_bounds__(WM*WN*WARP_SIZE)
+fp8_gemm_tn(const uint8_t * __restrict__ A, const uint8_t * __restrict__ B, const float * __restrict__ sa,
+            const float * __restrict__ sb, float * __restrict__ C, const int64_t ldc, const int M, const int N, const int K) {
+#if defined(FP8_GEMM_AVAILABLE)
+    constexpr int NT    = WM*WN*WARP_SIZE;
+    constexpr int LDS_K = BK + 16;                 // row stride in bytes; the pad staggers the rows across the banks
+    constexpr int FM    = BM/WM/16;                // 16 x 16 tiles per wave
+    constexpr int FN    = BN/WN/16;
+    constexpr int KC    = BK/16;                   // 16-byte chunks per tile row
+    constexpr int CA    = BM*KC/NT;                // chunks per thread and K step
+    constexpr int CB    = BN*KC/NT;
+    static_assert(BM*KC % NT == 0 && BN*KC % NT == 0, "tile loads must split evenly over the threads");
+    static_assert(BK % 32 == 0 && FM > 0 && FN > 0, "bad tile");
+
+    __shared__ __attribute__((aligned(16))) uint8_t As[BM*LDS_K];
+    __shared__ __attribute__((aligned(16))) uint8_t Bs[BN*LDS_K];
+
+    // tiles in bands of GROUP tile rows: blocks that run at the same time read the same strips of A and B
+    constexpr int GROUP = 8;
+    const int nbm       = (M + BM - 1) / BM;
+    const int nbn       = N / BN;
+    const int per_group = GROUP*nbn;
+    const int first_m   = (int) (blockIdx.x / per_group)*GROUP;
+    const int gsize     = min(nbm - first_m, GROUP);
+    const int in_group  = (int) (blockIdx.x % per_group);
+    const int m0        = (first_m + in_group % gsize)*BM;
+    const int n0        = (in_group / gsize)*BN;
+
+    const int tid  = threadIdx.x;
+    const int lane = tid % WARP_SIZE;
+    const int wave = tid / WARP_SIZE;
+    const int wm0  = (wave / WN)*(BM/WM);
+    const int wn0  = (wave % WN)*(BN/WN);
+
+    // staged in a native vector type: an array of HIP's uint4 (a struct around a union) stayed in scratch on gfx1201
+    fp8_gemm_u4 ra[CA];
+    fp8_gemm_u4 rb[CB];
+#define FP8_GEMM_LOAD(k0_)                                                                              \
+    _Pragma("unroll") for (int c = 0; c < CA; ++c) {                                                    \
+        const int idx = tid + c*NT;                                                                     \
+        ra[c] = *(const fp8_gemm_u4 *) (A + (int64_t) min(m0 + idx / KC, M - 1)*K + (k0_) + (idx % KC)*16);   \
+    }                                                                                                   \
+    _Pragma("unroll") for (int c = 0; c < CB; ++c) {                                                    \
+        const int idx = tid + c*NT;                                                                     \
+        rb[c] = *(const fp8_gemm_u4 *) (B + (int64_t) (n0 + idx / KC)*K + (k0_) + (idx % KC)*16);             \
+    }
+#define FP8_GEMM_COMMIT()                                                                               \
+    _Pragma("unroll") for (int c = 0; c < CA; ++c) {                                                    \
+        const int idx = tid + c*NT;                                                                     \
+        *(fp8_gemm_u4 *) (As + (idx / KC)*LDS_K + (idx % KC)*16) = ra[c];                                     \
+    }                                                                                                   \
+    _Pragma("unroll") for (int c = 0; c < CB; ++c) {                                                    \
+        const int idx = tid + c*NT;                                                                     \
+        *(fp8_gemm_u4 *) (Bs + (idx / KC)*LDS_K + (idx % KC)*16) = rb[c];                                     \
+    }
+
+    fp8_gemm_v8f acc[FM][FN];
+#pragma unroll
+    for (int fm = 0; fm < FM; ++fm) {
+#pragma unroll
+        for (int fn = 0; fn < FN; ++fn) {
+            acc[fm][fn] = fp8_gemm_v8f{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        }
+    }
+
+    FP8_GEMM_LOAD(0)
+    FP8_GEMM_COMMIT()
+    __syncthreads();
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        const bool more = k0 + BK < K;
+        // the next K step, in flight while this one computes. Unconditional (the last step reads its own tile again and
+        // does not commit it): under a branch gfx1201 needs 183 VGPRs instead of 151 (tile 1: 256 and 40 bytes of scratch)
+        FP8_GEMM_LOAD(more ? k0 + BK : k0)
+#pragma unroll
+        for (int kk = 0; kk < BK; kk += 32) {
+#if defined(RDNA4)
+            fp8_gemm_v2i bl[FN];
+            fp8_gemm_v2i bh[FN];
+#pragma unroll
+            for (int fn = 0; fn < FN; ++fn) {
+                const fp8_gemm_u4 v = *(const fp8_gemm_u4 *) (Bs + (wn0 + fn*16 + lane % 16)*LDS_K + kk + (lane / 16)*16);
+                bl[fn] = fp8_gemm_v2i{(int) v.x, (int) v.y};
+                bh[fn] = fp8_gemm_v2i{(int) v.z, (int) v.w};
+            }
+#pragma unroll
+            for (int fm = 0; fm < FM; ++fm) {
+                const fp8_gemm_u4 v = *(const fp8_gemm_u4 *) (As + (wm0 + fm*16 + lane % 16)*LDS_K + kk + (lane / 16)*16);
+                const fp8_gemm_v2i al = {(int) v.x, (int) v.y};
+                const fp8_gemm_v2i ah = {(int) v.z, (int) v.w};
+#pragma unroll
+                for (int fn = 0; fn < FN; ++fn) {
+                    acc[fm][fn] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(al, bl[fn], acc[fm][fn]);
+                    acc[fm][fn] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(ah, bh[fn], acc[fm][fn]);
+                }
+            }
+#else
+#pragma unroll
+            for (int fm = 0; fm < FM; ++fm) {
+                const uint8_t * pa = As + (wm0 + fm*16 + lane % 16)*LDS_K + kk;
+                const fp8_gemm_v16h al = fp8_gemm_rdna3_frag(*(const fp8_gemm_u4 *) pa, *(const fp8_gemm_u4 *) (pa + 16), false);
+                const fp8_gemm_v16h ah = fp8_gemm_rdna3_frag(*(const fp8_gemm_u4 *) pa, *(const fp8_gemm_u4 *) (pa + 16), true);
+#pragma unroll
+                for (int fn = 0; fn < FN; ++fn) {
+                    const uint8_t * pb = Bs + (wn0 + fn*16 + lane % 16)*LDS_K + kk;
+                    const fp8_gemm_u4 b0 = *(const fp8_gemm_u4 *) pb;
+                    const fp8_gemm_u4 b1 = *(const fp8_gemm_u4 *) (pb + 16);
+                    acc[fm][fn] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(al, fp8_gemm_rdna3_frag(b0, b1, false), acc[fm][fn]);
+                    acc[fm][fn] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(ah, fp8_gemm_rdna3_frag(b0, b1, true), acc[fm][fn]);
+                }
+            }
+#endif // defined(RDNA4)
+        }
+        __syncthreads();
+        if (more) {
+            FP8_GEMM_COMMIT()
+            __syncthreads();
+        }
+    }
+#undef FP8_GEMM_LOAD
+#undef FP8_GEMM_COMMIT
+
+    // accumulator element g of a lane: column lane % 16 (B), row 8*(lane/16) + g on gfx12, 2*g + lane/16 on gfx11 (A)
+#pragma unroll
+    for (int fm = 0; fm < FM; ++fm) {
+#pragma unroll
+        for (int fn = 0; fn < FN; ++fn) {
+            const int n = n0 + wn0 + fn*16 + lane % 16;
+            const float sbn = sb[n];
+#pragma unroll
+            for (int g = 0; g < 8; ++g) {
+#if defined(RDNA4)
+                const int m = m0 + wm0 + fm*16 + 8*(lane / 16) + g;
+#else
+                const int m = m0 + wm0 + fm*16 + 2*g + lane / 16;
+#endif // defined(RDNA4)
+                if (m < M) {
+                    C[(int64_t) m*ldc + n] = acc[fm][fn][g]*sa[m]*sbn;
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(A, B, sa, sb, C, ldc, M, N, K);
+    NO_DEVICE_CODE;
+#endif // defined(FP8_GEMM_AVAILABLE)
+}
+
+template <int BM, int BN, int BK, int WM, int WN>
+static void fp8_gemm_tn_cuda(const uint8_t * A, const uint8_t * B, const float * sa, const float * sb, float * C,
+                             const int64_t ldc, const int M, const int N, const int K, cudaStream_t stream) {
+    GGML_ASSERT(N % BN == 0 && K % BK == 0);
+    const int nblocks = ((M + BM - 1) / BM)*(N / BN);
+    fp8_gemm_tn<BM, BN, BK, WM, WN><<<nblocks, WM*WN*WARP_SIZE, 0, stream>>>(A, B, sa, sb, C, ldc, M, N, K);
+}
+
+// ROCMFPX_FP8_GEMM: 0 = off (the default until measured on RDNA4), 1 = on: FP8 WMMA on RDNA4, the f16 stand-in on RDNA3
+static bool fp8_gemm_on(const int cc) {
+    static const bool on = wmma_gemm_env("ROCMFPX_FP8_GEMM", 0) != 0;
+    return on && (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3(cc));
+}
+
+static void ggml_cuda_mul_mat_fp8_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                                       ggml_tensor * dst) {
+    const int64_t K = src0->ne[0];
+    const int64_t N = src0->ne[1];
+    const int64_t M = src1->ne[1];
+    cudaStream_t stream = ctx.stream();
+
+    // activations: E4M3 with one scale per token
+    ggml_cuda_pool_alloc<uint8_t> a8(ctx.pool(), M*K);
+    ggml_cuda_pool_alloc<float>   sa(ctx.pool(), M);
+    fp8_e4m3_quantize_rows_cuda((const float *) src1->data, a8.get(), sa.get(), M, K, stream);
+
+    // weights: chunks of whole rows, unpacked to f16 (the existing kernels), then to E4M3 with one scale per row
+    static const int64_t budget = (int64_t) std::max(1, wmma_gemm_env("ROCMFPX_WMMA_GEMM_SCRATCH_MB", 64)) << 20;
+    const int64_t rows = std::min<int64_t>(N, std::max<int64_t>(256, budget / (K*(int64_t) sizeof(half)) / 256 * 256));
+    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(src0->type);
+    GGML_ASSERT(to_fp16);
+    ggml_cuda_pool_alloc<half>    w16(ctx.pool(), rows*K);
+    ggml_cuda_pool_alloc<uint8_t> w8(ctx.pool(), rows*K);
+    ggml_cuda_pool_alloc<float>   sb(ctx.pool(), rows);
+
+    float * dst_d = (float *) dst->data;
+    for (int64_t n0 = 0; n0 < N; n0 += rows) {
+        const int64_t nc = std::min(rows, N - n0);
+        to_fp16((const char *) src0->data + n0*src0->nb[1], w16.get(), nc*K, stream);
+        fp8_e4m3_quantize_rows_cuda(w16.get(), w8.get(), sb.get(), nc, K, stream);
+        // the chunk's columns straight into dst (row stride N). ROCMFPX_FP8_GEMM_TILE: 0 = 128 x 128 tiles in 8 waves of
+        // 64 x 32 (the default), 1 = in 4 waves of 64 x 64. gfx1201 VGPRs per lane (compiler report): 0 fits, 1 takes
+        // 253 and spills 272 bytes (16 accumulators of 8 floats plus 16 staged 16-byte loads).
+        static const int tile = wmma_gemm_env("ROCMFPX_FP8_GEMM_TILE", 0);
+        if (tile == 1) {
+            fp8_gemm_tn_cuda<128, 128, 128, 2, 2>(a8.get(), w8.get(), sa.get(), sb.get(), dst_d + n0, N, (int) M, (int) nc,
+                                                   (int) K, stream);
+        } else {
+            fp8_gemm_tn_cuda<128, 128, 128, 2, 4>(a8.get(), w8.get(), sa.get(), sb.get(), dst_d + n0, N, (int) M, (int) nc,
+                                                   (int) K, stream);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
 bool ggml_cuda_should_use_wmma_gemm(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int cc) {
     static const bool    enabled   = wmma_gemm_env("ROCMFPX_WMMA_GEMM", 1) != 0;
     // at 256 tokens the unpack costs about what the GEMM saves (0.68x-1.25x by shape on gfx1100); at 512 it is 1.1x-1.4x
@@ -107,8 +485,9 @@ bool ggml_cuda_should_use_wmma_gemm(const ggml_tensor * src0, const ggml_tensor 
     if (!enabled) {
         return false;
     }
+    const bool   fp8  = fp8_gemm_on(cc);
     const char * arch = wmma_gemm_arch(cc);
-    if (!arch) {
+    if (!fp8 && !arch) {
         return false;
     }
     switch (src0->type) {
@@ -162,10 +541,12 @@ bool ggml_cuda_should_use_wmma_gemm(const ggml_tensor * src0, const ggml_tensor 
     if (src0->ne[0] % 256 != 0 || src0->ne[1] % 256 != 0) {
         return false;
     }
-    return wmma_gemm_load(arch) != nullptr;
+    return fp8 || wmma_gemm_load(arch) != nullptr;
 }
 
-void ggml_cuda_mul_mat_wmma_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+// the f16 path into dst_d (M x N, row major); fp8_emu as ROCMFPX_WMMA_GEMM_FP8_EMU
+static void wmma_gemm_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, float * dst_d,
+                          const int fp8_emu) {
     const int64_t K = src0->ne[0];   // input width
     const int64_t N = src0->ne[1];   // weight rows = output width
     const int64_t M = src1->ne[1];   // tokens
@@ -178,7 +559,11 @@ void ggml_cuda_mul_mat_wmma_gemm(ggml_backend_cuda_context & ctx, const ggml_ten
 
     // activations: f32 -> f16, row major M x K
     ggml_cuda_pool_alloc<half> a16(ctx.pool(), M*K);
-    ggml_get_to_fp16_cuda(GGML_TYPE_F32)(src1->data, a16.get(), M*K, stream);
+    if (fp8_emu & 2) {
+        fp8_e4m3_emulate_rows_cuda(a16.get(), (const float *) src1->data, M, K, stream);
+    } else {
+        ggml_get_to_fp16_cuda(GGML_TYPE_F32)(src1->data, a16.get(), M*K, stream);
+    }
 
     // weights: a chunk of whole rows at a time, unpacked to f16 into one scratch of at most ROCMFPX_WMMA_GEMM_SCRATCH_MB
     // (64): a full f16 copy of a 17408 x 5120 matrix is 178 MB, which a 20 GB card running a 15 GB model has not got.
@@ -196,10 +581,12 @@ void ggml_cuda_mul_mat_wmma_gemm(ggml_backend_cuda_context & ctx, const ggml_ten
         c32.alloc(M*rows);
     }
 
-    float * dst_d = (float *) dst->data;
     for (int64_t n0 = 0; n0 < N; n0 += rows) {
         const int64_t nc = std::min(rows, N - n0);
         to_fp16((const char *) src0->data + n0*src0->nb[1], w16.get(), nc*K, stream);
+        if (fp8_emu & 1) {
+            fp8_e4m3_emulate_rows_cuda(w16.get(), nullptr, nc, K, stream);
+        }
         float * c = rows < N ? c32.get() : dst_d;
         // C (M x nc, row major) = A (M x K, row major) * B (K x nc, column major: the weight rows as stored)
         hipStream_t s = stream;
@@ -210,4 +597,48 @@ void ggml_cuda_mul_mat_wmma_gemm(ggml_backend_cuda_context & ctx, const ggml_ten
                                          cudaMemcpyDeviceToDevice, stream));
         }
     }
+}
+
+// ROCMFPX_FP8_GEMM_CHECK=N (with ROCMFPX_FP8_GEMM=1, RDNA3 only: needs the f16 library): the first N products also run
+// through the emulation (ROCMFPX_WMMA_GEMM_FP8_EMU=3) on the same inputs, and the log gets the difference. End-to-end
+// numbers cannot show it: an f32 rounding difference moves some activations across an E4M3 boundary in the next layer.
+static void fp8_gemm_check(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    static const int max_checks = wmma_gemm_env("ROCMFPX_FP8_GEMM_CHECK", 0);
+    static int n_checked = 0;
+    if (n_checked >= max_checks) {
+        return;
+    }
+    ++n_checked;
+    const int64_t N = src0->ne[1];
+    const int64_t M = src1->ne[1];
+    ggml_cuda_pool_alloc<float> ref(ctx.pool(), M*N);
+    wmma_gemm_f16(ctx, src0, src1, ref.get(), 3);
+    std::vector<float> h_out(M*N), h_ref(M*N);
+    CUDA_CHECK(cudaMemcpyAsync(h_out.data(), dst->data, M*N*sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(h_ref.data(), ref.get(), M*N*sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    double d2 = 0.0, r2 = 0.0, dmax = 0.0, rmax = 0.0;
+    for (int64_t i = 0; i < M*N; ++i) {
+        const double d = (double) h_out[i] - h_ref[i];
+        d2 += d*d;
+        r2 += (double) h_ref[i]*h_ref[i];
+        dmax = std::max(dmax, std::fabs(d));
+        rmax = std::max(rmax, (double) std::fabs(h_ref[i]));
+    }
+    GGML_LOG_INFO("%s: %s %s M=%lld N=%lld K=%lld: kernel vs emulation rel L2 %.3e, max |diff| %.3e of max |ref| %.3e\n",
+        __func__, dst->name, ggml_type_name(src0->type), (long long) M, (long long) N, (long long) src0->ne[0],
+        r2 > 0.0 ? std::sqrt(d2/r2) : 0.0, dmax, rmax);
+}
+
+void ggml_cuda_mul_mat_wmma_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (fp8_gemm_on(cc)) {
+        ggml_cuda_mul_mat_fp8_gemm(ctx, src0, src1, dst);
+        if (GGML_CUDA_CC_IS_RDNA3(cc)) {
+            fp8_gemm_check(ctx, src0, src1, dst);
+        }
+        return;
+    }
+    static const int fp8_emu = wmma_gemm_env("ROCMFPX_WMMA_GEMM_FP8_EMU", 0);
+    wmma_gemm_f16(ctx, src0, src1, (float *) dst->data, fp8_emu);
 }

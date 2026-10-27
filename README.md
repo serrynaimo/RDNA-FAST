@@ -200,6 +200,8 @@ Environment variables:
 | `ROCMFPX_NGRAM_SHADOW`, `ROCMFPX_NGRAM_PROBES` | not set here: `ROCMFPX_NGRAM_SHADOW=0` sends the n-gram probes in place of MTP's draft instead of scoring them in the background, `ROCMFPX_NGRAM_PROBES` sets how many probes in a row must hold before long n-gram drafts start (6). |
 | `ROCMFPX_WMMA_GEMM` | not set here, on by default on RDNA3 and RDNA3.5 (gfx11): prompt-sized FP4/FP6 products through the WMMA GEMM. `=0` turns it off. See [Prompts through a WMMA GEMM](#prompts-through-a-wmma-gemm). |
 | `ROCMFPX_WMMA_GEMM_MIN_BATCH`, `ROCMFPX_WMMA_GEMM_SCRATCH_MB` | not set here: the smallest batch that takes the WMMA GEMM (512) and the size of its f16 weight scratch (64 MB). |
+| `ROCMFPX_FP8_GEMM` | not set here, off by default: `=1` sends prompt-sized products through the FP8 GEMM, on RDNA4 with FP8 WMMA, on RDNA3 with the f16 stand-in that is only there to check it. `ROCMFPX_FP8_GEMM_TILE=1` picks the 4-wave tile layout instead of the 8-wave one, `ROCMFPX_FP8_GEMM_CHECK=N` (RDNA3) compares the first N products with the emulation in the log. See [Other cards](#other-cards). |
+| `ROCMFPX_WMMA_GEMM_FP8_EMU` | not set here: `1` rounds the weights, `2` the activations, `3` both to E4M3 inside the f16 WMMA GEMM, to measure what an FP8 path costs in quality on any gfx11 card. |
 
 ## Other cards
 
@@ -237,8 +239,29 @@ would likely not help elsewhere stay limited to the RX 7900 series.
 - **On for RDNA3 and RDNA3.5** (RX 7000 and the gfx11 iGPUs): the WMMA GEMM for
   prompts. Its configurations are tuned for gfx1100 and gfx1151; gfx1101 and
   gfx1102 build with the gfx1100 ones, gfx1103, gfx1150 and gfx1152 with the
-  gfx1151 ones. RDNA4 needs a port (its WMMA instructions take other operands)
-  and keeps the int8 path.
+  gfx1151 ones. RDNA4 has other WMMA instructions and keeps the int8 path, or
+  takes the FP8 path below.
+- **RDNA4: FP8 prompt path (opt-in, `ROCMFPX_FP8_GEMM=1`).** RDNA4's FP8
+  matrix cores run at twice its FP16 rate. Prompt-sized products go through an
+  FP8 GEMM written for gfx12 (after the design AMD describes for its RDNA4 FP8
+  GEMM): the weights unpacked and rounded to E4M3 with one power-of-two scale
+  per row, the activations with one per token, the two scales applied to the
+  f32 result. Not run on an RDNA4 card yet: on the RX 7900 XT the same kernel
+  (E4M3 widened to f16) matches an emulation of the FP8 rounding to f32
+  precision on every product of the model, and that emulation measures the
+  quality: mean KL divergence against the Q8_0 rises by about 0.005 (IQ4_XS
+  0.0205 to 0.0261), with every token of the test through FP8, where in use
+  only prompt batches of 512 tokens or more are.
+- **Cards with 24 GB or more: DFlash2.** Upstream's DFlash2 speculative
+  decoding is in this build: a block-diffusion drafter (`-md`, e.g. the
+  Qwen3.8-27B DFlash2 GGUF, Q8_0 2.06 GB) drafts 15 tokens per pass,
+  `--spec-type draft-dflash --spec-draft-n-max 15`. It keeps features of the
+  main model for the whole context, so it needs room: with Swift 1.5 IQ4_XS,
+  two slots at 32k took 22.6 GB. On the RX 7900 XT at 8k, one slot (1.1 GB of
+  it still paged out): code 76 t/s median, 95 peak (MTP + n-gram at 32k: 76,
+  86), prose 43 (MTP 51); 52% of drafted tokens accepted on code, 21% on
+  prose. MTP stays the default; DFlash2 is for code-heavy work on a bigger
+  card.
 - **Only on the RX 7000 series (RDNA3.0):** the int8 matmul in place of the
   dequantising WMMA kernel for quantized weights and MoE experts (RDNA3.5 keeps
   that kernel, which is tuned there; RDNA4 never uses it), and two rows per
