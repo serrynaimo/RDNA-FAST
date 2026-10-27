@@ -11556,6 +11556,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // ROCmFPX [TAG_MM_F32_SKINNY]: F32 weights of 9-256 rows at 9+ tokens (the delta-net gate projections, 48 x 5120;
+    // MoE routers), with token, row and K counts that are not whole tiles (32 tokens, 64 rows, K steps of 32)
+    for (int m : {9, 48, 64, 128, 200, 256}) {
+        for (int n : {9, 30, 512, 1031}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, n, 5120, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, 100, 1000, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+    }
+
     // test large experts*tokens
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, b, 32, 1024, 16));
@@ -12657,6 +12666,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  6144, 2048,  5120, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  5120, 2048,  6144, {1, 1}, {1, 1}));
     }
+    // ROCmFPX [TAG_MM_F32_SKINNY]: the F32 delta-net gate projections (ssm_alpha / ssm_beta, 48 x 5120) of a prompt
+    // batch and its tail, and an F32 MoE router (128 experts)
+    for (int64_t n : {30, 512, 1024, 2048}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32,  48, n, 5120, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1024, 2816, {1, 1}, {1, 1}));
 
     // ROCmFPX: decode-sized attention at depth: 1 and 4 queries (a draft step, a verify batch) over 16k and 41k cells,
     // head 256, 4 KV heads with GQA 6, the production q4_0 KV cache against f16

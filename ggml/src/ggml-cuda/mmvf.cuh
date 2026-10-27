@@ -15,4 +15,9 @@ void ggml_cuda_op_mul_mat_vec_f(
 bool ggml_cuda_should_use_mm_few_rows(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 
 void ggml_cuda_mul_mat_f_few_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
+// [TAG_MM_F32_SKINNY] F32 weights of 9-256 rows at prompt-sized batches (AMD)
+bool ggml_cuda_should_use_mm_skinny(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+
+void ggml_cuda_mul_mat_f_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);

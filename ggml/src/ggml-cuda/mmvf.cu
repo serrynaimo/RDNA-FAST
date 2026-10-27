@@ -938,6 +938,174 @@ static __global__ void mul_mat_f_few_rows(
     }
 }
 
+// [TAG_MM_F32_SKINNY] dst[t][m] = sum_k x[m][k] * y[t][k] for F32 weights of 9-256 rows and prompt-sized batches on
+// AMD: the delta-net gate projections of Qwen3.5/3.8 (ssm_alpha / ssm_beta, 48 rows, kept F32 by IQ4_XS and K-quant
+// GGUFs) and F32 MoE routers. No other kernel takes them on RDNA (MMF has no F32 WMMA, the few-rows kernel stops at 8),
+// so they went to rocBLAS sgemm: RX 7900 XT 407 us at 1024 tokens (1.2 TFLOPS) and 208 us at 30, almost the same, because
+// a handful of workgroups each walk all of K; 5.3% of a 1024-token Swift 1.5 IQ4_XS prompt in the op profile. A tiled
+// kernel with the same shape of grid (32 blocks at 1024 tokens) was no faster, 476 / 357 us: every K step waits for its
+// loads. So K is split too, into enough slices for ~8 blocks per WGP, each slice summed in registers (the next K step
+// loaded while this one computes) and written to a scratch; a second kernel adds the slices in a fixed order, so every
+// output is the same on every run. Tiles of 32 tokens x 64 rows, K steps of 32 through LDS, 2 tokens x 4 rows per
+// thread, f32 throughout. GGML_HIP_MM_SKINNY=0 turns it off.
+#define MM_SKINNY_BT 32
+#define MM_SKINNY_BR 64
+#define MM_SKINNY_BK 32
+#define MM_SKINNY_NY (MM_SKINNY_BT*MM_SKINNY_BK/256)   // staged y values per thread and K step
+#define MM_SKINNY_NX (MM_SKINNY_BR*MM_SKINNY_BK/256)   // staged x values
+template <typename T>
+static __global__ void __launch_bounds__(256) mul_mat_f_skinny(
+        const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ out,
+        const int K, const int M, const int n_tokens, const int64_t stride_x, const int64_t stride_y,
+        const int64_t stride_out, const int k_slice) {
+    __shared__ float ys[MM_SKINNY_BK][MM_SKINNY_BT + 1];
+    __shared__ float xs[MM_SKINNY_BK][MM_SKINNY_BR + 1];
+
+    const int tid = threadIdx.x;
+    const int t0  = blockIdx.x*MM_SKINNY_BT;
+    const int r0  = blockIdx.y*MM_SKINNY_BR;
+    const int kb  = blockIdx.z*k_slice;
+    const int ke  = min(K, kb + k_slice);
+    const int tt  = (tid % 16)*2;               // this thread's 2 tokens
+    const int rr  = (tid / 16)*4;               // and 4 rows
+
+    // the K step at k0 into registers, transposed on the way into LDS; rows, tokens and K past the end read as 0
+    float ry[MM_SKINNY_NY];
+    float rx[MM_SKINNY_NX];
+    auto load = [&](const int k0) __attribute__((always_inline)) {
+#pragma unroll
+        for (int j = 0; j < MM_SKINNY_NY; ++j) {
+            const int i = tid + j*256;
+            const int t = i / MM_SKINNY_BK;
+            const int k = k0 + i % MM_SKINNY_BK;
+            ry[j] = t0 + t < n_tokens && k < ke ? y[(int64_t) (t0 + t)*stride_y + k] : 0.0f;
+        }
+#pragma unroll
+        for (int j = 0; j < MM_SKINNY_NX; ++j) {
+            const int i = tid + j*256;
+            const int r = i / MM_SKINNY_BK;
+            const int k = k0 + i % MM_SKINNY_BK;
+            rx[j] = r0 + r < M && k < ke ? ggml_cuda_cast<float>(x[(int64_t) (r0 + r)*stride_x + k]) : 0.0f;
+        }
+    };
+
+    float acc[2][4] = {};
+    load(kb);
+    for (int k0 = kb; k0 < ke; k0 += MM_SKINNY_BK) {
+#pragma unroll
+        for (int j = 0; j < MM_SKINNY_NY; ++j) {
+            const int i = tid + j*256;
+            ys[i % MM_SKINNY_BK][i / MM_SKINNY_BK] = ry[j];
+        }
+#pragma unroll
+        for (int j = 0; j < MM_SKINNY_NX; ++j) {
+            const int i = tid + j*256;
+            xs[i % MM_SKINNY_BK][i / MM_SKINNY_BK] = rx[j];
+        }
+        __syncthreads();
+        load(k0 + MM_SKINNY_BK);                // in flight while this step computes; past the slice it reads 0
+#pragma unroll
+        for (int k = 0; k < MM_SKINNY_BK; ++k) {
+            const float y0 = ys[k][tt];
+            const float y1 = ys[k][tt + 1];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float xv = xs[k][rr + j];
+                acc[0][j] = fmaf(xv, y0, acc[0][j]);
+                acc[1][j] = fmaf(xv, y1, acc[1][j]);
+            }
+        }
+        __syncthreads();
+    }
+
+    // this K slice of every output: straight into dst with one slice, else into the scratch for the reduction
+    float * o = out + (int64_t) blockIdx.z*n_tokens*stride_out;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int t = t0 + tt + i;
+        if (t >= n_tokens) {
+            continue;
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int r = r0 + rr + j;
+            if (r < M) {
+                o[(int64_t) t*stride_out + r] = acc[i][j];
+            }
+        }
+    }
+}
+
+// dst[t][m] = the K slices of the scratch added in slice order
+static __global__ void mul_mat_f_skinny_reduce(const float * __restrict__ part, float * __restrict__ dst, const int M,
+        const int n_tokens, const int n_slices, const int64_t stride_dst) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= (int64_t) n_tokens*M) {
+        return;
+    }
+    const int64_t t = i / M;
+    const int     r = (int) (i % M);
+    float v = 0.0f;
+    for (int s = 0; s < n_slices; ++s) {
+        v += part[((int64_t) s*n_tokens + t)*M + r];
+    }
+    dst[t*stride_dst + r] = v;
+}
+
+bool ggml_cuda_should_use_mm_skinny(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_HIP_MM_SKINNY");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled || !GGML_CUDA_CC_IS_AMD(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (src0->ne[1] <= 8 || src0->ne[1] > 256 || src0->ne[2] != 1 || src0->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    const int64_t n_tokens = ggml_nrows(src1);
+    return n_tokens > 8 && n_tokens <= INT32_MAX && src0->ne[0] <= INT32_MAX;
+}
+
+void ggml_cuda_mul_mat_f_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int K = (int) src0->ne[0];
+    const int M = (int) src0->ne[1];
+    const int n_tokens = (int) ggml_nrows(src1);
+    const int64_t stride_dst = dst->nb[1] / sizeof(float);
+    cudaStream_t stream = ctx.stream();
+
+    // K slices for ~8 blocks per WGP (nsm), at least 4 K steps each: 48 x 1024 x 5120 on the RX 7900 XT (nsm 42) = 32
+    // tiles x 11 slices of 15 steps, the same at 30 tokens = 1 tile x 40 slices of 4 steps
+    const int nbt     = (n_tokens + MM_SKINNY_BT - 1) / MM_SKINNY_BT;
+    const int nbr     = (M + MM_SKINNY_BR - 1) / MM_SKINNY_BR;
+    const int steps   = (K + MM_SKINNY_BK - 1) / MM_SKINNY_BK;
+    const int nsm     = ggml_cuda_info().devices[ctx.device].nsm;
+    const int want    = std::max(1, std::min(steps / 4, (8*nsm + nbt*nbr - 1) / (nbt*nbr)));
+    const int per     = (steps + want - 1) / want;          // K steps per slice
+    const int nslices = (steps + per - 1) / per;
+
+    const dim3 grid(nbt, nbr, nslices);
+    if (nslices == 1) {
+        mul_mat_f_skinny<float><<<grid, 256, 0, stream>>>((const float *) src0->data, (const float *) src1->data,
+            (float *) dst->data, K, M, n_tokens, src0->nb[1] / sizeof(float), src1->nb[1] / sizeof(float), stride_dst,
+            per*MM_SKINNY_BK);
+    } else {
+        ggml_cuda_pool_alloc<float> part(ctx.pool(), (size_t) nslices*n_tokens*M);
+        mul_mat_f_skinny<float><<<grid, 256, 0, stream>>>((const float *) src0->data, (const float *) src1->data,
+            part.get(), K, M, n_tokens, src0->nb[1] / sizeof(float), src1->nb[1] / sizeof(float), M, per*MM_SKINNY_BK);
+        const int64_t n_out = (int64_t) n_tokens*M;
+        mul_mat_f_skinny_reduce<<<(unsigned) ((n_out + 255) / 256), 256, 0, stream>>>(part.get(), (float *) dst->data, M,
+            n_tokens, nslices, stride_dst);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 bool ggml_cuda_should_use_mm_few_rows(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (!GGML_CUDA_CC_IS_AMD(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         return false;
