@@ -823,6 +823,15 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
+// The RDNA tables for the 2-rows-per-block rules below ([TAG_MMVQ_RDNA3_0_KQ_RPB2] and the 2- and 3-bit ones): measured
+// on gfx1100, on for RDNA2, RDNA3.5 and RDNA4 too without a measurement there. Two rows per block at 2-8 columns is what
+// the generic, GCN and Turing tables do for every type; the RDNA tables keep 1, which gfx1100 confirms for Q4_0 and Q8_0
+// but not for these types, whose dot products cost more per block than their loads.
+static constexpr __host__ __device__ bool mmvq_rdna_rpb2(int table_id) {
+    return table_id == MMVQ_PARAMETERS_RDNA2 || table_id == MMVQ_PARAMETERS_RDNA3_0 ||
+           table_id == MMVQ_PARAMETERS_RDNA3_5 || table_id == MMVQ_PARAMETERS_RDNA4;
+}
+
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
@@ -862,7 +871,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     }
     // [TAG_MMVQ_RDNA3_0_Q2_RPB2] the 2-bit types at 2-8 columns as the K-quants below, RX 7900 XT (2026-10-26) on a
     // 65536 x 5120 matrix: Q2_K 8-11%, IQ2_XXS 8-10%, IQ2_XS 6-11%, IQ2_S 7-13% faster at 2-5 columns.
-    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst >= 2 && ncols_dst <= 8 &&
+    if (mmvq_rdna_rpb2(table_id) && ncols_dst >= 2 && ncols_dst <= 8 &&
             (type == GGML_TYPE_Q2_K || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S)) {
         return 2;
     }
@@ -871,7 +880,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     // Q5_1 8 / 10%. Real models carry much less (llama-batched-bench decode, 4 / 5 sequences): Swift 1.5 Qwen3.8-27B
     // IQ4_XS +0.2 / +1.7%, Nanbeige4.3-33B IQ3-FP6 (its IQ4_XS tensors) +2.5 / +3.7%; at 3 sequences both lost 1.9%
     // (the matrix gained 0-7%) and at 2 columns the matrix is 1-2% slower, so 1 row stays below 4. Q8_0 left out: 1-3%
-    // slower at 2-4 columns.
+    // slower at 2-4 columns. gfx1100 only: a real-model gain this small is not worth carrying to cards it was not measured on.
     if (table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst >= 4 && ncols_dst <= 8 &&
             (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q5_1 ||
              type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_IQ4_XS)) {
@@ -881,7 +890,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     // (2026-10-26) on a 65536 x 5120 matrix streaming from VRAM: 4-6% faster at 2 columns, 7-11% at 3-5. At 1 column
     // one warp per row stays: 2 / 4 / 8 warps cost 7-15% / 34-46% / 56-63%. A single token still streams IQ3_S at
     // ~575 GB/s against ~750 for IQ4_XS: its dot product spends the time on codebook lookups, not on the reads.
-    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst >= 2 && ncols_dst <= 8 &&
+    if (mmvq_rdna_rpb2(table_id) && ncols_dst >= 2 && ncols_dst <= 8 &&
             (type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_Q3_K)) {
         return 2;
     }
@@ -890,7 +899,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     // 8-15%, Q6_K 4-16% faster at 2-5 columns; stock Qwen3.8-27B Q4_K_M decodes 8 / 11 / 13% faster with 3 / 4 / 5
     // sequences (llama-batched-bench, 1-2 unchanged). Tried and dropped: each block decoded once for all columns (no
     // gain on top, Q6_K up to 10% slower), 8 warps at 1 column (9-28% slower), 2 warps at 2-5 columns, 4 warps at 1-5.
-    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst >= 2 && ncols_dst <= 8 &&
+    if (mmvq_rdna_rpb2(table_id) && ncols_dst >= 2 && ncols_dst <= 8 &&
             (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K)) {
         return 2;
     }

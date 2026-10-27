@@ -179,8 +179,8 @@ endif()
 
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
 
-# ROCmFPX [TAG_WMMA_GEMM]: prompt-sized FP4/FP6 products through the vendored rocm_wmma_gemm on gfx1100 / gfx1151
-option(GGML_HIP_WMMA_GEMM "ggml: build rocm_wmma_gemm (vendor/) for prompt-sized FP4/FP6 products on gfx1100/gfx1151" ON)
+# ROCmFPX [TAG_WMMA_GEMM]: prompt-sized FP4/FP6 products through the vendored rocm_wmma_gemm on the gfx11 targets
+option(GGML_HIP_WMMA_GEMM "ggml: build rocm_wmma_gemm (vendor/) for prompt-sized FP4/FP6 products on the gfx11 targets" ON)
 if (GGML_HIP_WMMA_GEMM)
     include(${CMAKE_CURRENT_SOURCE_DIR}/wmma-gemm.cmake)
 endif()

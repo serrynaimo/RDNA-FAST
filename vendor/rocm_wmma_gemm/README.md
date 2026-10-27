@@ -6,8 +6,9 @@ A WMMA GEMM for AMD RDNA3 / RDNA3.5 GPUs by Adel Johar, MIT licensed (see [LICEN
 - Source: https://github.com/adelj88/rocm_wmma_gemm
 - Commit: `ea3aa74` ("Overhaul tuning script, minor optimization, added float accumulator configs")
 
-ROCmFPX uses it for prompt-sized products of its FP4/FP6 weight types on gfx1100 and gfx1151: the weight rows are
-unpacked to f16 and multiplied with this GEMM (f16 inputs, f32 accumulation and output). See
+ROCmFPX uses it for prompt-sized products of its FP4/FP6 weight types on the gfx11 GPUs (tuned for gfx1100 and
+gfx1151; gfx1101 and gfx1102 build with the gfx1100 configurations, gfx1103, gfx1150 and gfx1152 with the gfx1151
+ones): the weight rows are unpacked to f16 and multiplied with this GEMM (f16 inputs, f32 accumulation and output). See
 `ggml/src/ggml-cuda/wmma-gemm.cu` ([TAG_WMMA_GEMM]) and `ggml/src/ggml-hip/wmma-gemm.cmake`, which builds one library
 per GPU architecture from these files: `rocm_wmma_gemm_<arch>_accf32` next to the other binaries.
 

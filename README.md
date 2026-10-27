@@ -152,7 +152,6 @@ set "PATH=%HIP_PATH%bin;%PATH%"
 set GGML_CUDA_NO_PINNED=1
 set LLAMA_MAX_QUEUED=3
 set ROCMFPX_DRAFT_VOCAB=24576
-set GGML_HIP_FA_GQA6=1
 
 llama-server -m Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf --mmproj mmproj-Qwen3.8-27B-f16.gguf ^
   -dev ROCm0 -ngl 999 -fa on --jinja --load-mode dio --gpu-keepalive-ms 2000 ^
@@ -196,17 +195,17 @@ Environment variables:
 | `GGML_CUDA_NO_PINNED=1` | pinned host memory makes more of the model page out, for no speed gain. |
 | `LLAMA_MAX_QUEUED=3` | a request is rejected once three are already waiting, so a client can fall back to another server instead of queueing. |
 | `ROCMFPX_DRAFT_VOCAB=24576` | a drafted token is scored against 24,576 candidate tokens instead of all 248,320: half fixed, half the main model's own top tokens at the previous position, per slot. The main model still verifies each drafted token against the full vocabulary. Measured at 16,384: 0.12 ms instead of 1.9 ms per drafted token, decode +9% on a short context and +3 to 5% at 41k, a verbatim copy drafts slightly less (acceptance 0.99 to 0.96), ordinary text the same. 24,576 accepts 3.50 drafted tokens per verify pass against 3.43 at 16,384, at the same speed. |
-| `GGML_HIP_FA_GQA6=1` | attention for decode batches of 1 to 5 tokens: one GPU block per KV head with all six of its query heads, instead of three groups of two and a batch padded to 8. Decode +10 to 12% at 41k, +2 to 6% at 17k, nothing at a short context. Qwen3.5/3.8-27B on RDNA only (head size 256, 24 query heads on 4 KV heads). |
+| `GGML_HIP_FA_GQA6` | not set here, on by default: attention for decode batches of 1 to 5 tokens, one GPU block per KV head with all six of its query heads, instead of three groups of two and a batch padded to 8. Decode +10 to 12% at 41k, +2 to 6% at 17k, nothing at a short context. Qwen3.5/3.8-27B on RDNA only (head size 256, 24 query heads on 4 KV heads). `=0` turns it off. |
 | `ROCMFPX_MTP_LEAN_RESERVE` | not set here, on by default: the MTP draft context reserves memory for the two shapes it runs (the K/V-only pass over prompt tokens and a one-token draft step), 80 MiB instead of 784 MiB, which is what lets `-c 98304` fit. `=0` restores the full reserve. |
 | `ROCMFPX_NGRAM_SHADOW`, `ROCMFPX_NGRAM_PROBES` | not set here: `ROCMFPX_NGRAM_SHADOW=0` sends the n-gram probes in place of MTP's draft instead of scoring them in the background, `ROCMFPX_NGRAM_PROBES` sets how many probes in a row must hold before long n-gram drafts start (6). |
-| `ROCMFPX_WMMA_GEMM` | not set here, on by default on gfx1100 and gfx1151: prompt-sized FP4/FP6 products through the WMMA GEMM. `=0` turns it off. See [Prompts through a WMMA GEMM](#prompts-through-a-wmma-gemm). |
+| `ROCMFPX_WMMA_GEMM` | not set here, on by default on RDNA3 and RDNA3.5 (gfx11): prompt-sized FP4/FP6 products through the WMMA GEMM. `=0` turns it off. See [Prompts through a WMMA GEMM](#prompts-through-a-wmma-gemm). |
 | `ROCMFPX_WMMA_GEMM_MIN_BATCH`, `ROCMFPX_WMMA_GEMM_SCRATCH_MB` | not set here: the smallest batch that takes the WMMA GEMM (512) and the size of its f16 weight scratch (64 MB). |
 
 ## Other cards
 
-Everything above is tuned and measured on an RX 7900 XT. The project still runs
-elsewhere; the card-specific fast paths are gated so that other hardware keeps
-the stock behaviour.
+Everything above is tuned and measured on an RX 7900 XT. The fast paths are on
+for every AMD card that can run their code, tuned or not; only the ones that
+would likely not help elsewhere stay limited to the RX 7900 series.
 
 - **Any backend (CPU, Vulkan, other GPUs).** The slot ranges on the shared
   pool, the shared pass of busy slots, the MTP changes, the draft vocabulary,
@@ -217,18 +216,34 @@ the stock behaviour.
   (RX 7000 series) and RDNA3.5 (gfx1151, checked on 10 October 2026). Since
   the merge of ROCmFPX main on 19 October 2026 it also builds for RDNA4
   (gfx1201, checked by the ROCmFPX project), where the ROCmFPX weight types
-  use the RDNA3 matmul tiles. RDNA2 targets have not been checked again.
-- **Fast paths for the RX 7900 series.**
-  - Attention that reads a q4_0 KV cache directly is on by default for RDNA3
-    desktop cards (RX 7900, 7800, 7700, 7600) and RDNA4 (RX 9000, AI PRO
-    R9700); it was measured on the RX 7900 XT only. `GGML_HIP_FA_Q4_TILE=1`
-    turns it on for any HIP card, `=0` turns it off everywhere.
-  - `GGML_HIP_FA_GQA6=1` (six query heads per attention block) is opt-in and
-    runs on RDNA cards only. Its thread layouts and block counts were tuned on
-    gfx1100.
-  - The WMMA GEMM for prompts is built and used only for gfx1100 (RX 7900 XT,
-    XTX, GRE) and gfx1151, the targets its configurations are tuned for; every
-    other card keeps the int8 path.
+  use the RDNA3 matmul tiles. RDNA2 targets have not been checked again. Build
+  for your card by putting its target in `-DGPU_TARGETS` and
+  `-DCMAKE_HIP_ARCHITECTURES` (several, separated by `;`): `gfx1100` for the RX
+  7900 XT / XTX / GRE, `gfx1101` RX 7800 XT / 7700 XT, `gfx1102` RX 7600,
+  `gfx1103` Radeon 780M / 760M, `gfx1150` Radeon 890M / 880M, `gfx1152`
+  Radeon 860M, `gfx1151` Ryzen AI Max, `gfx1200` RX 9060 XT, `gfx1201` RX 9070
+  (XT) and AI PRO R9700.
+- **On for every RDNA card** (RX 6000, 7000, 9000 and the Radeon iGPUs), each
+  measured on the RX 7900 XT only:
+  - Attention that reads a q4_0 KV cache directly, once per group of query
+    heads, for decode batches of 1 to 8 tokens. `GGML_HIP_FA_Q4_TILE=1` turns it
+    on for any HIP card, `=0` off everywhere.
+  - Six query heads per attention block for Qwen3.5/3.8-27B, `GGML_HIP_FA_GQA6`
+    (seven for head size 128, `GGML_HIP_FA_GQA7`). Thread layouts and block
+    counts were tuned on gfx1100.
+  - Two weight rows per GPU block in decode for the K-quants (Q4_K, Q5_K, Q6_K)
+    and the 2- and 3-bit types at 2 to 8 tokens (an MTP verify, parallel
+    slots), as the stock code does on NVIDIA and older AMD cards.
+- **On for RDNA3 and RDNA3.5** (RX 7000 and the gfx11 iGPUs): the WMMA GEMM for
+  prompts. Its configurations are tuned for gfx1100 and gfx1151; gfx1101 and
+  gfx1102 build with the gfx1100 ones, gfx1103, gfx1150 and gfx1152 with the
+  gfx1151 ones. RDNA4 needs a port (its WMMA instructions take other operands)
+  and keeps the int8 path.
+- **Only on the RX 7000 series (RDNA3.0):** the int8 matmul in place of the
+  dequantising WMMA kernel for quantized weights and MoE experts (RDNA3.5 keeps
+  that kernel, which is tuned there; RDNA4 never uses it), and two rows per
+  block for the 4- and 5-bit block types, whose gain on real models was 0.2 to
+  3.7% and is not worth carrying untested.
 - **Settings.** `-c`, `-ub 1024` and the VRAM split in this README are sized
   for 20 GB of VRAM. The speed tables are for the RX 7900 XT and will differ on
   other cards.
@@ -732,4 +747,4 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
 - [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
 - [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
-- [adelj88/rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) - WMMA GEMM for RDNA3/RDNA3.5, used for prompt-sized FP4/FP6 matrix products on gfx1100 and gfx1151 - MIT license
+- [adelj88/rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) - WMMA GEMM for RDNA3/RDNA3.5, used for prompt-sized FP4/FP6 matrix products on RDNA3 and RDNA3.5 - MIT license

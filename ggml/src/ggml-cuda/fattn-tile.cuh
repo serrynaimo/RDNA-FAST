@@ -534,11 +534,12 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
 // a handful of decode tokens (measured on gfx1100 at 41k cells, 4 queries: 0.49 ms of 0.99 ms), and the vector kernel,
 // which also reads q4_0 directly, loads every K/V row once per query head instead of once per GQA group.
 //
-// Measured on gfx1100 (RX 7900 XT). On by default for RDNA3 desktop (RX 7900, 7800, 7700, 7600) and RDNA4 (RX 9000,
-// AI PRO R9700): both are wave32 with the same tile layout, the code uses no gfx11-only instructions, and what it saves
-// (the f16 copy of the whole cache per call) is memory traffic, which RDNA4 has less of. RDNA4 speed is not measured.
-// Every other card keeps the stock routing: the vector kernel for small batches and an f16 copy of the cache for the
-// tile kernel. GGML_HIP_FA_Q4_TILE=1 turns it on for any HIP card, =0 off for all of them.
+// Measured on gfx1100 (RX 7900 XT). On by default for every RDNA card (RDNA2, RDNA3, the RDNA3.5 iGPUs, RDNA4): all are
+// wave32 with the same tile layout, the code uses no gfx11-only instructions, and what it saves (the f16 copy of the
+// whole cache per call, and K/V loads per query head) is memory traffic, which the other cards have less of than the RX
+// 7900 and the iGPUs far less. Speed off gfx1100 is not measured. GCN and CDNA (wave64) keep the stock routing: the
+// vector kernel for small batches and an f16 copy of the cache for the tile kernel. GGML_HIP_FA_Q4_TILE=1 turns it on
+// for any HIP card, =0 off for all of them.
 // [TAG_FATTN_GQA7] head size 128 too, but only where the per-KV-head block of TAG_FATTN_GQA7 takes the batch (GQA 7,
 // 1 to 5 queries): other head-128 shapes keep their measured routing.
 // GGML_HIP_FA_GQA7: 1 = on (the default), 0 = off.
@@ -557,7 +558,7 @@ static inline bool ggml_cuda_fattn_tile_reads_q4_0(const int cc, const ggml_tens
         return env ? atoi(env) : -1;
     }();
 
-    if (mode >= 0 ? mode == 0 : !(GGML_CUDA_CC_IS_RDNA3_0(cc) || GGML_CUDA_CC_IS_RDNA4(cc))) {
+    if (mode >= 0 ? mode == 0 : !GGML_CUDA_CC_IS_RDNA(cc)) {
         return false;
     }
 
@@ -1446,11 +1447,12 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
 // and a batch of 5 queries is padded to 8 columns. This path gives each KV head one block with all 6 of its query
 // heads and exactly as many queries as the batch has: 6, 12, 18, 24 or 30 columns for 1 to 5 queries (a draft step,
 // an MTP verify batch). Larger batches keep the generic path, where the K/V loads are a small share of the work.
-// GGML_HIP_FA_GQA6: 0 = off (the default until it is verified on the device), 1 = on.
+// GGML_HIP_FA_GQA6: 1 = on (the default since 2026-10-27, after two weeks in production on gfx1100), 0 = off. Runs on
+// every RDNA card; the thread layouts and block counts were tuned on gfx1100 only.
 static inline int ggml_cuda_fattn_tile_gqa6_mode() {
     static const int mode = [] {
         const char * env = getenv("GGML_HIP_FA_GQA6");
-        return env ? atoi(env) : 0;
+        return env ? atoi(env) : 1;
     }();
     return mode;
 }

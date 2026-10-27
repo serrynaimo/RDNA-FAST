@@ -30,15 +30,21 @@ static int wmma_gemm_env(const char * name, int def) {
     return v ? atoi(v) : def;
 }
 
-// The archs with tuned configurations upstream; RDNA3 cards with other chips (gfx1101, gfx1102) are not tuned for.
+// Every gfx11 chip (RDNA3, RDNA3.5): the library uses the gfx11 WMMA builtins, which all of them have and RDNA4 (gfx12,
+// other operand vectors) does not. Configurations are tuned upstream for gfx1100 and gfx1151 only; wmma-gemm.cmake builds
+// the desktop chips (gfx1101, gfx1102) with the gfx1100 ones and the other iGPUs (gfx1103, gfx1150, gfx1152) with the
+// gfx1151 ones. Speed off gfx1100 is not measured; a chip whose library was not built stays on MMQ.
 static const char * wmma_gemm_arch(const int cc) {
-    if (cc == GGML_CUDA_CC_OFFSET_AMD + 0x1100) {
-        return "gfx1100";
+    switch (cc - GGML_CUDA_CC_OFFSET_AMD) {
+        case 0x1100: return "gfx1100";
+        case 0x1101: return "gfx1101";
+        case 0x1102: return "gfx1102";
+        case 0x1103: return "gfx1103";
+        case 0x1150: return "gfx1150";
+        case 0x1151: return "gfx1151";
+        case 0x1152: return "gfx1152";
+        default:     return nullptr;
     }
-    if (cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151) {
-        return "gfx1151";
-    }
-    return nullptr;
 }
 
 // The directory of the module this code is in (ggml-hip): the build puts the library next to it.

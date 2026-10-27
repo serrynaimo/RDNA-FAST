@@ -1,21 +1,23 @@
-# ROCmFPX [TAG_WMMA_GEMM]: build the vendored rocm_wmma_gemm (vendor/rocm_wmma_gemm, MIT) for the GPU targets it is
-# tuned for (gfx1100, gfx1151): one shared library per architecture, rocm_wmma_gemm_<arch>_accf32 (f16 inputs, f32
-# accumulation and output), next to the other binaries. ggml-hip loads it at run time (ggml-cuda/wmma-gemm.cu) and uses
-# it for prompt-sized products of the fork's FP4/FP6 weight types; without it those stay on MMQ.
+# ROCmFPX [TAG_WMMA_GEMM]: build the vendored rocm_wmma_gemm (vendor/rocm_wmma_gemm, MIT) for the gfx11 GPU targets:
+# one shared library per architecture, rocm_wmma_gemm_<arch>_accf32 (f16 inputs, f32 accumulation and output), next to
+# the other binaries. ggml-hip loads it at run time (ggml-cuda/wmma-gemm.cu) and uses it for prompt-sized products of
+# the fork's FP4/FP6 weight types and most stock quants; without it those stay on MMQ. The configurations are tuned for
+# gfx1100 and gfx1151 only: the desktop chips gfx1101 / gfx1102 build with the gfx1100 ones, the iGPUs gfx1103 /
+# gfx1150 / gfx1152 with the gfx1151 ones (not tuned for, not measured). RDNA4 (gfx12) has other WMMA instructions.
 # Included from ggml-hip/CMakeLists.txt when GGML_HIP_WMMA_GEMM is ON. Needs Python 3 at configure time: the kernel
 # instances are generated from the tuned configurations by the library's own generate_config.py.
 
 set(WMMA_GEMM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../vendor/rocm_wmma_gemm")
 
 set(WMMA_GEMM_ARCHS "")
-foreach (arch gfx1100 gfx1151)
+foreach (arch gfx1100 gfx1101 gfx1102 gfx1103 gfx1150 gfx1151 gfx1152)
     if ("${arch}" IN_LIST GPU_TARGETS OR "${arch}" IN_LIST AMDGPU_TARGETS OR "${arch}" IN_LIST CMAKE_HIP_ARCHITECTURES)
         list(APPEND WMMA_GEMM_ARCHS ${arch})
     endif()
 endforeach()
 
 if (NOT WMMA_GEMM_ARCHS)
-    message(STATUS "rocm_wmma_gemm: no gfx1100 or gfx1151 among the GPU targets, not built")
+    message(STATUS "rocm_wmma_gemm: no gfx11 target among the GPU targets, not built")
     return()
 endif()
 
@@ -27,11 +29,16 @@ if (NOT Python3_Interpreter_FOUND)
 endif()
 
 foreach (arch ${WMMA_GEMM_ARCHS})
+    if (arch MATCHES "^gfx110[012]$")
+        set(tuned gfx1100)
+    else()
+        set(tuned gfx1151)
+    endif()
     set(gen "${CMAKE_CURRENT_BINARY_DIR}/rocm_wmma_gemm_${arch}")
     file(MAKE_DIRECTORY "${gen}/include/rocm_wmma_gemm/kernel" "${gen}/src")
     execute_process(
         COMMAND ${Python3_EXECUTABLE} "${WMMA_GEMM_DIR}/config/generate_config.py"
-                --config "${WMMA_GEMM_DIR}/config/gemm_config_${arch}_f32.json" --group accf32
+                --config "${WMMA_GEMM_DIR}/config/gemm_config_${tuned}_f32.json" --group accf32
                 "${gen}/include/rocm_wmma_gemm/kernel/config_generated.hpp" --kernel-dir "${gen}/src"
         RESULT_VARIABLE wmma_gen_result
         OUTPUT_QUIET
@@ -39,7 +46,7 @@ foreach (arch ${WMMA_GEMM_ARCHS})
     if (NOT wmma_gen_result EQUAL 0)
         message(FATAL_ERROR "rocm_wmma_gemm: kernel generation for ${arch} failed: ${wmma_gen_error}")
     endif()
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${WMMA_GEMM_DIR}/config/gemm_config_${arch}_f32.json")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${WMMA_GEMM_DIR}/config/gemm_config_${tuned}_f32.json")
 
     set(KERNEL_INST_SOURCES "")
     include("${gen}/src/kernel_sources.cmake")   # sets KERNEL_INST_SOURCES
@@ -63,5 +70,5 @@ foreach (arch ${WMMA_GEMM_ARCHS})
     endif()
     target_link_libraries(${lib} PRIVATE hip::host)
     add_dependencies(ggml-hip ${lib})
-    message(STATUS "rocm_wmma_gemm: ${lib} (${wmma_kernel_count} kernels)")
+    message(STATUS "rocm_wmma_gemm: ${lib} (${wmma_kernel_count} kernels, ${tuned} configurations)")
 endforeach()
