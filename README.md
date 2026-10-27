@@ -12,12 +12,12 @@ FP4/FP6 weight formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
 ## Highlights
 
 - **Faster agent loops than LM Studio on the same card.** With the same model,
-  quant and context, a scripted two-agent session finishes in 104 s instead of
+  quant and context, a scripted two-agent session finishes in 102 s instead of
   132 s. [Numbers](#speed)
 
 - **Multi-token prediction.** The model's own MTP head drafts tokens ahead: up
   to 54 t/s on prose and 88 t/s on code. When an answer repeats text from the
-  prompt, as code edits do, n-gram drafting copies it at up to 264 t/s.
+  prompt, as code edits do, n-gram drafting copies it at up to 293 t/s.
 
 - **Prompts on the matrix cores.** Prompt processing runs on RDNA3's WMMA units
   through [rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) by Adel
@@ -67,21 +67,21 @@ grows from 4k to 41k tokens, a 10k-token worker is called twice in between):
 
 | | LM Studio + MTP draft | this runtime |
 |---|---:|---:|
-| **the session, wall-clock** | **132 s** | **104 s** |
-| prefill t/s, cold 4k prompt | 728 | 904 |
-| prefill t/s, 4.3k new tokens at 17k depth | 678 | 776 |
-| prefill t/s, 4.0k new tokens at 41k depth | 519 | 633 |
+| **the session, wall-clock** | **132 s** | **102 s** |
+| prefill t/s, cold 4k prompt | 728 | 919 |
+| prefill t/s, 4.3k new tokens at 17k depth | 678 | 799 |
+| prefill t/s, 4.0k new tokens at 41k depth | 519 | 646 |
 | decode t/s at 4k depth | 51.6 | 67.4 |
 | decode t/s at 17k depth | 56.6 | 65.1 |
 | decode t/s at 41k depth | 42.4 | 56.6 |
-| decode t/s, text copy boost: code edit that copies the prompt | unavailable | 264 |
+| decode t/s, text copy boost: code edit that copies the prompt | unavailable | 293 |
 
 <sub>October 2026. Both run Swift 1.5 IQ4_XS at `-c 98304` with MTP drafting,
 flash attention, a q4_0 KV cache and two sessions, the best run for each value
-(LM Studio: two runs, this runtime: four). LM Studio is its ROCm llama.cpp
+(LM Studio: two runs, this runtime: six). LM Studio is its ROCm llama.cpp
 runtime 2.64.0 with batch 2048 / 1024; this runtime runs the quick start below
 (`-ub 1024`). The edit row is the text copy boost, n-gram drafting, the best of
-six edits; LM Studio cannot run it, as its API does not switch Swift 1.5's
+nine edits; LM Studio cannot run it, as its API does not switch Swift 1.5's
 thinking off.</sub>
 
 The same session with each quant we tested:
@@ -90,14 +90,14 @@ The same session with each quant we tested:
 |---|---:|---:|---:|---:|---:|---:|
 | [Q4_K_M](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf)\* | 17.4 GB | 146.8 s | 1,211 s (spill) | 408 / 548 / 431 | 50.6 / 50.8 / 48.2 | 238 |
 | [Q4_K_S](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-Q4_K_S.gguf) | 16.4 GB | 112.6 s | 1,139 s (spill) | 889 / 769 / 616 | 49.2 / 51.7 / 48.8 | 247 |
-| [IQ4_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf) | 15.5 GB | 103.8 s | 132.4 s | 904 / 776 / 633 | 67.4 / 65.1 / 56.6 | 264 |
+| [IQ4_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf) | 15.5 GB | 102.2 s | 132.4 s | 919 / 799 / 646 | 67.4 / 65.1 / 56.6 | 293 |
 | [ROCmFP4-FP6](docs/rocmfpx/swift-1.5-qwen3.8-27b-rocmfp4-fp6.md) | 16.1 GB | 104.5 s | | 923 / 798 / 634 | 60.2 / 56.4 / 58.5 | 243 |
 
 <sub>\* At 64k (`-c 65536`) and `-ub 512`: the smaller context and prompt
 batches keep Q4_K_M's spill into system RAM down while staying above Hermes'
 64,000-token minimum. The other quants run at 96k with `-ub 1024`. Prefill and
 decode are this runtime's, in the session above; the better of two runs (IQ4_XS:
-the best of four, Q4_K_M: one). LM Studio's Q4_K_S and Q4_K_M sit at the edge of
+the best of six, Q4_K_M: one). LM Studio's Q4_K_S and Q4_K_M sit at the edge of
 the card's memory and read every prompt again in full. ROCmFP4-FP6 is a ROCmFPX
 format, which LM Studio does not load.</sub>
 
@@ -178,7 +178,7 @@ Flags:
 | `--no-mmproj-offload` | the 0.9 GB vision projector was the whole paged share at two slots. Images cost 7-12 s to the first token instead of 3-5 s. |
 | `-ub 1024` | prefill +6% at 17k and +11% at 41k over 256, for 0.3 GB more VRAM; 512 gives +4% and +8% for 0.1 GB. Decode does not change with it (55.7 against 56.0 t/s on identical text). The WMMA GEMM for prompts takes batches of 512 tokens or more only, so at `-ub 256` it never runs. `-ub 2048` does not fit beside `-c 106496` on 20 GB (2.3 GB paged, prefill falls to 162 t/s); at `-c 65536` it fits but gains only 1-2% on cold prompts (949 / 836 against 932 / 821 t/s at 17k / 41k). |
 | `--spec-type draft-mtp`, `--spec-draft-n-max 4` | +45% decode on prose, +112% on code, for about 0.7 GB of VRAM and 3% of prefill speed. The draft head has its own KV cache; for prompt tokens only its K and V are computed, nothing else of the block is ever read. |
-| `--spec-type "...,ngram-map-k4v"` | text copy boost: n-gram drafting in front of MTP. Where the last tokens repeat an earlier place of the context, the continuation found there is drafted, otherwise MTP drafts as before. Each match first makes a 4-token probe that is not sent: MTP drafts that pass, and the probe is scored against what comes out. Once six probes in a row would have been accepted in full, n-gram drafts of up to 48 tokens replace MTP until one is not accepted in full, so a match that is only a phrase or a path costs neither a pass nor a checkpoint. On two days of agent traffic (783 requests) this saved 4.6-6.0% of decode time, and 5-6% of the requests came out slower, against 12-40% when the probes were sent. Code edits that copy the prompt run at up to 263 t/s. Quote the value in a .cmd file: cmd splits arguments at commas. |
+| `--spec-type "...,ngram-map-k4v"` | text copy boost: n-gram drafting in front of MTP. Where the last tokens repeat an earlier place of the context, the continuation found there is drafted, otherwise MTP drafts as before. Each match first makes a 4-token probe that is not sent: MTP drafts that pass, and the probe is scored against what comes out. Once six probes in a row would have been accepted in full, n-gram drafts of up to 48 tokens replace MTP until one is not accepted in full, so a match that is only a phrase or a path costs neither a pass nor a checkpoint. On two days of agent traffic (783 requests) this saved 4.6-6.0% of decode time, and 5-6% of the requests came out slower, against 12-40% when the probes were sent. Code edits that copy the prompt run at up to 293 t/s. Quote the value in a .cmd file: cmd splits arguments at commas. |
 | `--no-spec-ngram-map-ramp` | not set here. Full-length n-gram drafts (48 tokens) from the first match: 268 t/s on code edits and 180 t/s on the copy at 41k, but slower on answers that only share phrases with the context, where a wrong long draft costs a checkpoint restore and a replay pass. |
 | `--ctx-checkpoints 8` | kept in host RAM, ~200 MiB each. When the list is full, the one whose removal leaves the smallest gap is dropped; the one at the first user message never is. |
 | `--cache-disk` | conversations and their checkpoints are kept on SSD. See [The SSD prompt cache](#the-ssd-prompt-cache). |
