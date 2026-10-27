@@ -939,7 +939,7 @@ static __global__ void mul_mat_f_few_rows(
 }
 
 // [TAG_MM_F32_SKINNY] dst[t][m] = sum_k x[m][k] * y[t][k] for F32 weights of 9-256 rows and prompt-sized batches on
-// AMD: the delta-net gate projections of Qwen3.5/3.8 (ssm_alpha / ssm_beta, 48 rows, kept F32 by IQ4_XS and K-quant
+// RDNA: the delta-net gate projections of Qwen3.5/3.8 (ssm_alpha / ssm_beta, 48 rows, kept F32 by IQ4_XS and K-quant
 // GGUFs) and F32 MoE routers. No other kernel takes them on RDNA (MMF has no F32 WMMA, the few-rows kernel stops at 8),
 // so they went to rocBLAS sgemm: RX 7900 XT 407 us at 1024 tokens (1.2 TFLOPS) and 208 us at 30, almost the same, because
 // a handful of workgroups each walk all of K; 5.3% of a 1024-token Swift 1.5 IQ4_XS prompt in the op profile. A tiled
@@ -947,7 +947,8 @@ static __global__ void mul_mat_f_few_rows(
 // loads. So K is split too, into enough slices for ~8 blocks per WGP, each slice summed in registers (the next K step
 // loaded while this one computes) and written to a scratch; a second kernel adds the slices in a fixed order, so every
 // output is the same on every run. Tiles of 32 tokens x 64 rows, K steps of 32 through LDS, 2 tokens x 4 rows per
-// thread, f32 throughout. GGML_HIP_MM_SKINNY=0 turns it off.
+// thread, f32 throughout. RDNA only: CDNA takes F32 weights on its matrix cores (MMF) at up to 16 tokens.
+// GGML_HIP_MM_SKINNY=0 turns it off.
 #define MM_SKINNY_BT 32
 #define MM_SKINNY_BR 64
 #define MM_SKINNY_BK 32
@@ -1057,7 +1058,7 @@ bool ggml_cuda_should_use_mm_skinny(const ggml_tensor * src0, const ggml_tensor 
         const char * env = getenv("GGML_HIP_MM_SKINNY");
         return env == nullptr || atoi(env) != 0;
     }();
-    if (!enabled || !GGML_CUDA_CC_IS_AMD(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+    if (!enabled || !GGML_CUDA_CC_IS_RDNA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         return false;
     }
     if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
