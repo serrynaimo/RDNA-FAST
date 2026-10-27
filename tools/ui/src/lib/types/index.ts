@@ -69,6 +69,7 @@ export type {
 	ChatMessagePromptProgress,
 	ChatMessageTimings,
 	ChatMessageAgenticTimings,
+	ChatMessageCompactionTimings,
 	ChatMessageAgenticTurnStats,
 	ChatMessageToolCallTiming,
 	ChatStreamCallbacks,
