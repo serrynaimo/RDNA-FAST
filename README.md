@@ -12,12 +12,12 @@ FP4/FP6 weight formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
 ## Highlights
 
 - **Faster agent loops than LM Studio on the same card.** With the same model,
-  quant and context, a scripted two-agent session finishes in 102 s instead of
+  quant and context, a scripted two-agent session finishes in 101 s instead of
   132 s. [Numbers](#speed)
 
 - **Multi-token prediction.** The model's own MTP head drafts tokens ahead: up
   to 54 t/s on prose and 88 t/s on code. When an answer repeats text from the
-  prompt, as code edits do, n-gram drafting copies it at up to 293 t/s.
+  prompt, as code edits do, n-gram drafting copies it at up to 301 t/s.
 
 - **Prompts on the matrix cores.** Prompt processing runs on RDNA3's WMMA units
   through [rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) by Adel
@@ -67,21 +67,21 @@ grows from 4k to 41k tokens, a 10k-token worker is called twice in between):
 
 | | LM Studio + MTP draft | this runtime |
 |---|---:|---:|
-| **the session, wall-clock** | **132 s** | **102 s** |
-| prefill t/s, cold 4k prompt | 728 | 919 |
-| prefill t/s, 4.3k new tokens at 17k depth | 678 | 799 |
-| prefill t/s, 4.0k new tokens at 41k depth | 519 | 646 |
+| **the session, wall-clock** | **132 s** | **101 s** |
+| prefill t/s, cold 4k prompt | 728 | 934 |
+| prefill t/s, 4.3k new tokens at 17k depth | 678 | 835 |
+| prefill t/s, 4.0k new tokens at 41k depth | 519 | 655 |
 | decode t/s at 4k depth | 51.6 | 67.4 |
 | decode t/s at 17k depth | 56.6 | 65.1 |
-| decode t/s at 41k depth | 42.4 | 56.6 |
-| decode t/s, text copy boost: code edit that copies the prompt | unavailable | 293 |
+| decode t/s at 41k depth | 42.4 | 57.8 |
+| decode t/s, text copy boost: code edit that copies the prompt | unavailable | 301 |
 
 <sub>October 2026. Both run Swift 1.5 IQ4_XS at `-c 98304` with MTP drafting,
 flash attention, a q4_0 KV cache and two sessions, the best run for each value
-(LM Studio: two runs, this runtime: six). LM Studio is its ROCm llama.cpp
+(LM Studio: two runs, this runtime: eight). LM Studio is its ROCm llama.cpp
 runtime 2.64.0 with batch 2048 / 1024; this runtime runs the quick start below
 (`-ub 1024`). The edit row is the text copy boost, n-gram drafting, the best of
-nine edits; LM Studio cannot run it, as its API does not switch Swift 1.5's
+twelve edits; LM Studio cannot run it, as its API does not switch Swift 1.5's
 thinking off.</sub>
 
 The same session with each quant we tested:
@@ -90,14 +90,14 @@ The same session with each quant we tested:
 |---|---:|---:|---:|---:|---:|---:|
 | [Q4_K_M](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf)\* | 17.4 GB | 146.8 s | 1,211 s (spill) | 408 / 548 / 431 | 50.6 / 50.8 / 48.2 | 238 |
 | [Q4_K_S](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-Q4_K_S.gguf) | 16.4 GB | 112.6 s | 1,139 s (spill) | 889 / 769 / 616 | 49.2 / 51.7 / 48.8 | 247 |
-| [IQ4_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf) | 15.5 GB | 102.2 s | 132.4 s | 919 / 799 / 646 | 67.4 / 65.1 / 56.6 | 293 |
+| [IQ4_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf) | 15.5 GB | 100.6 s | 132.4 s | 934 / 835 / 655 | 67.4 / 65.1 / 57.8 | 301 |
 | [ROCmFP4-FP6](docs/rocmfpx/swift-1.5-qwen3.8-27b-rocmfp4-fp6.md) | 16.1 GB | 104.5 s | | 923 / 798 / 634 | 60.2 / 56.4 / 58.5 | 243 |
 
 <sub>\* At 64k (`-c 65536`) and `-ub 512`: the smaller context and prompt
 batches keep Q4_K_M's spill into system RAM down while staying above Hermes'
 64,000-token minimum. The other quants run at 96k with `-ub 1024`. Prefill and
 decode are this runtime's, in the session above; the better of two runs (IQ4_XS:
-the best of six, Q4_K_M: one). LM Studio's Q4_K_S and Q4_K_M sit at the edge of
+the best of eight, Q4_K_M: one). LM Studio's Q4_K_S and Q4_K_M sit at the edge of
 the card's memory and read every prompt again in full. ROCmFP4-FP6 is a ROCmFPX
 format, which LM Studio does not load.</sub>
 
