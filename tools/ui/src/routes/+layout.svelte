@@ -14,7 +14,6 @@
 		HEADERS,
 		MODELS_ROUTE_ID,
 		NEW_CHAT_TAB_ID,
-		ROUTES,
 		SETTINGS_KEYS,
 		TOOLTIP_DELAY_DURATION
 	} from '$lib/constants';
@@ -48,12 +47,7 @@
 	let innerHeight = $state<number | undefined>();
 	let innerWidth = $state(browser ? window.innerWidth : 0);
 
-	let chatSidebar:
-		| {
-				activateSearchMode?: () => void;
-				editActiveConversation?: () => void;
-		  }
-		| undefined = $state();
+	let chatSidebar: { editActiveConversation?: () => void } | undefined = $state();
 
 	let showBuildVersion = $derived(
 		settingsStore.config[SETTINGS_KEYS.SHOW_BUILD_VERSION] as boolean
@@ -311,15 +305,7 @@
 	<RdnaTopBar />
 
 	<div class="flex flex-col md:flex-row">
-		<SidebarNavigation
-			onSearchClick={() => {
-				if (deviceStore.isMobile) {
-					goto(ROUTES.SEARCH);
-				} else if (chatSidebar?.activateSearchMode) {
-					chatSidebar.activateSearchMode();
-				}
-			}}
-		/>
+		<SidebarNavigation />
 
 		<!-- min-w-0 lets the chat column shrink below its content width, so wide
 		     code blocks and tables scroll inside their own containers instead of

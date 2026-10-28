@@ -1,6 +1,7 @@
 <script lang="ts" module>
 	import { defineMeta } from '@storybook/addon-svelte-csf';
 	import SidebarNavigation from '$lib/components/app/navigation/SidebarNavigation/SidebarNavigation.svelte';
+	import { expect } from 'storybook/test';
 	import { waitFor } from 'storybook/test';
 	import { screen } from 'storybook/test';
 
@@ -87,7 +88,9 @@
 
 		const searchTrigger = screen.getByText('Search');
 
-		userEvent.click(searchTrigger);
+		await userEvent.click(searchTrigger);
+
+		await expect(await screen.findByRole('combobox')).toHaveFocus();
 	}}
 >
 	<div class="flex-column h-screen w-72 bg-background">
