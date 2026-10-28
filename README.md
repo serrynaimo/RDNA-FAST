@@ -2,11 +2,13 @@
 
 # RDNA-FAST agent server
 
-**Qwen3.8-27B for agents on a Radeon RX 7900 XT / XTX.** A light-speed
-`llama-server` runtime for **Qwen3.8-27B on a 20 GB RX 7900 XT**, built for
-**agentic work**: long tool-calling sessions, several agents sharing one GPU,
-ideal for Hermes. Built on [ROCmFPX](https://github.com/ROCmFPX/ROCmFPX) (its
-FP4/FP6 weight formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
+**Local agents on AMD consumer GPUs, RDNA3 and newer.** A light-speed
+`llama-server` runtime optimized for **agentic work**: long tool-calling
+sessions, several agents sharing one GPU, ideal for Hermes. It works incredibly
+well with **Qwen3.8-27B**, with 96k tokens of context on a 20 GB RX 7900 XT.
+Built on [ROCmFPX](https://github.com/ROCmFPX/ROCmFPX) (its FP4/FP6 weight
+formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
+[Other cards](#other-cards)
 
 
 ## Highlights
