@@ -15,7 +15,6 @@ import {
 	CONTROL_ACTION,
 	HEADERS,
 	LEGACY_AGENTIC_REGEX,
-	REASONING_EFFORT_TOKENS,
 	SETTINGS_KEYS,
 	SSE_DATA_PREFIX,
 	SSE_DONE_MARKER,
@@ -1095,6 +1094,7 @@ export class ChatService {
 			stream,
 			// Generation parameters
 			temperature,
+			thinkingBudgetTokens,
 			timings_per_token,
 			// Tools for function calling
 			tools,
@@ -1169,9 +1169,6 @@ export class ChatService {
 			? ReasoningFormat.NONE
 			: ReasoningFormat.AUTO;
 
-		const reasoningBudgetTokens =
-			enableThinking && reasoningEffort ? (REASONING_EFFORT_TOKENS[reasoningEffort] ?? -1) : -1;
-
 		// an explicit user choice injects the kwarg, otherwise it is omitted so
 		// the server default applies (--reasoning flag or chat template)
 		if (enableThinking !== undefined) {
@@ -1181,8 +1178,12 @@ export class ChatService {
 			};
 		}
 
-		if (reasoningBudgetTokens >= 0) {
-			requestBody.thinking_budget_tokens = reasoningBudgetTokens;
+		if (reasoningEffort) {
+			requestBody.reasoning_effort = reasoningEffort;
+		}
+
+		if (thinkingBudgetTokens !== undefined) {
+			requestBody.thinking_budget_tokens = thinkingBudgetTokens;
 		}
 
 		// arms the budget sampler so reasoning can be ended at runtime via the control endpoint
