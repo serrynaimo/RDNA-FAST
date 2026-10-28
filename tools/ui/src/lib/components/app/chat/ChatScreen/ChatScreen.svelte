@@ -35,12 +35,11 @@
 		settingsStore
 	} from '$lib/stores';
 	import { parseFilesToMessageExtras } from '$lib/utils/browser-only';
-	import { onDestroy, onMount, tick, untrack } from 'svelte';
+	import { onDestroy, tick, untrack } from 'svelte';
 
 	let { showCenteredEmpty = false } = $props();
 
 	let emptyFileNames = $state<string[]>([]);
-	let initialMessage = $state('');
 	let showDeleteDialog = $state(false);
 	let showEmptyFileDialog = $state(false);
 	let isEmpty = $derived(
@@ -198,11 +197,7 @@
 	}
 
 	async function handleSystemPromptAdd(draft: { message: string; files: ChatUploadedFile[] }) {
-		if (draft.message || draft.files.length > 0) {
-			chatStore.savePendingDraft(draft.message, draft.files);
-		}
-
-		await chatStore.addSystemPrompt();
+		await chatStore.addSystemPrompt(draft);
 	}
 
 	$effect(() => {
@@ -213,15 +208,6 @@
 		stick.attach(document.documentElement, document.body);
 
 		return () => stick.detach();
-	});
-
-	onMount(() => {
-		const pendingDraft = chatStore.consumePendingDraft();
-
-		if (pendingDraft) {
-			initialMessage = pendingDraft.message;
-			fileUpload.uploadedFiles = pendingDraft.files;
-		}
 	});
 
 	// [RDNA-FAST] the new chat page's input box powers on like the status page's tiles, once each
@@ -302,7 +288,6 @@
 				bind:uploadedFiles={fileUpload.uploadedFiles}
 				class="pointer-events-auto conversation-chat-form"
 				disabled={hasPropsError || chatStore.isEditing()}
-				{initialMessage}
 				isLoading={isCurrentConversationLoading}
 				onFileRemove={fileUpload.handleFileRemove}
 				onFileUpload={fileUpload.handleFileUpload}
