@@ -4279,7 +4279,7 @@ private:
                 }
                 slot.n_trickle++;
                 t_priority_trickle_ms = t_hold_now;
-}
+            }
 
             if (slot.audio_stream && !slot_audio_step(slot)) {
                 return; // waiting for audio, or the stream ended
