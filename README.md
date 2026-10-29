@@ -204,6 +204,7 @@ Environment variables:
 | `ROCMFPX_WMMA_GEMM_MIN_BATCH`, `ROCMFPX_WMMA_GEMM_SCRATCH_MB` | not set here: the smallest batch that takes the WMMA GEMM (512) and the size of its f16 weight scratch (64 MB). |
 | `ROCMFPX_FP8_GEMM` | not set here, off by default: `=1` sends prompt-sized products through the FP8 GEMM, on RDNA4 with FP8 WMMA, on RDNA3 with the f16 stand-in that is only there to check it. `ROCMFPX_FP8_GEMM_TILE=1` picks the 4-wave tile layout instead of the 8-wave one, `ROCMFPX_FP8_GEMM_CHECK=N` (RDNA3) compares the first N products with the emulation in the log. See [Other cards](#other-cards). |
 | `ROCMFPX_WMMA_GEMM_FP8_EMU` | not set here: `1` rounds the weights, `2` the activations, `3` both to E4M3 inside the f16 WMMA GEMM, to measure what an FP8 path costs in quality on any gfx11 card. |
+| `ROCMFPX_MMQ_FUSION` | not set here: the fused gate/up/GLU prompt kernel for MoE experts runs on NVIDIA only by default. `=1` also runs it on RDNA3 (gfx1100-1102), where it is correct but slower: 3-16% on prompts with Qwen3-30B-A3B IQ4_XS on the RX 7900 XT. `=0` turns it off everywhere. |
 
 ## Other cards
 
@@ -389,7 +390,7 @@ text, from an open decision model such as StartLux-Decision. Start a server
 with that model and `--classifier-config`, or run it as a child of a router
 (`--models-preset`) next to the big model: one port, one API key, both models.
 On the CPU (`-dev none -ngl 0`) StartLux-Decision-2B BF16 answers a yes/no
-question in 0.4 s. Details: [docs/classifier.md](docs/classifier.md).
+question in 0.3 s. Details: [docs/classifier.md](docs/classifier.md).
 
 ## Several slots on one GPU
 
