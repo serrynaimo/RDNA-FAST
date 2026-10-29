@@ -2054,10 +2054,17 @@ static bool ggml_cuda_mul_mat_q_fusion_matches(const ggml_tensor * up, const ggm
     // accumulators l and l + 4 are rows r and r + 8 and the write-back runs unchanged. MoE experts only: dense FFN
     // prompts of these types take the WMMA GEMM path on this card (TAG_WMMA_GEMM_STOCK), which the fused MMQ kernel
     // would bypass. RDNA4 (row 8*(lane/16) + l) and CDNA lay the C tile out differently; RDNA3.5 is untested.
-    // ROCMFPX_MMQ_FUSION=0 turns the fused MMQ kernel off (A/B in one binary, or a quick way back).
-    static const bool enabled = getenv("ROCMFPX_MMQ_FUSION") == nullptr || std::atoi(getenv("ROCMFPX_MMQ_FUSION")) != 0;
+    // Opt-in on RDNA3.0: it is correct but slower here. RX 7900 XT 2026-10-29, Qwen3-30B-A3B IQ4_XS, prompt t/s fused vs
+    // unfused: pp512 2881 vs 3365 and pp4096 2604 vs 2996 at -ub 512, pp4096 4170 vs 4255 at -ub 2048; decode unchanged.
+    // The unfused kernels already read each activation tile once per 64 output rows, so fusing only saves the round
+    // trip of the gate/up outputs (~2% of a prompt here), less than its tiling costs.
+    // ROCMFPX_MMQ_FUSION: unset = NVIDIA Turing+ only (vanilla), 1 = also RDNA3.0 MoE experts, 0 = off everywhere.
+    static const int mode = getenv("ROCMFPX_MMQ_FUSION") ? std::atoi(getenv("ROCMFPX_MMQ_FUSION")) : -1;
+    if (mode == 0) {
+        return false;
+    }
     const int cc = ggml_cuda_info().devices[device].cc;
-    return enabled && (turing_mma_available(cc) || (GGML_CUDA_CC_IS_RDNA3_0(cc) && up->op == GGML_OP_MUL_MAT_ID));
+    return turing_mma_available(cc) || (mode == 1 && GGML_CUDA_CC_IS_RDNA3_0(cc) && up->op == GGML_OP_MUL_MAT_ID);
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu) {
