@@ -292,6 +292,12 @@ public:
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
 
+    // [TAG_RS_REPLAY] with rollback by replay the s states have their own gather and the replay records
+    ggml_tensor * s_copy_s      = nullptr; // I32 [n_rs]
+    ggml_tensor * s_copy_s_main = nullptr; // I32 [n_seqs]
+    ggml_tensor * s_copy_s_tail = nullptr; // I32 [n_rs - 1]
+    ggml_tensor * rs_rep        = nullptr; // I32 [3, n_seqs]
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse

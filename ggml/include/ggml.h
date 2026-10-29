@@ -639,6 +639,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_GATED_DELTA_NET_REPLAY,
+
         GGML_OP_COUNT,
     };
 
@@ -2695,6 +2697,25 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
+            int64_t               K);
+
+    // [TAG_RS_REPLAY] ggml_gated_delta_net for rollback by replay instead of K snapshots:
+    //   hist : [(K - 1) * E, n_rows] -- per row K - 1 token records of E >= 2*S_v*H_v + (g->ne[0] + 1)*H_v floats,
+    //          laid out [k: S_v per v head | v: S_v per v head | g: g->ne[0] per v head | beta: 1 per v head]
+    //   rep  : I32 [3, n_seqs] -- per seq: the tokens to replay, the hist row to read them from, the hist row to write
+    // each seq first advances its state by the replayed records (no output), then runs the batch. The output packs
+    // the attention scores followed by 2 states: slot 0 = final state, slot 1 = the state W - 1 tokens back, with
+    // W = min(n_tokens, K) (written when W > 1). The records of the W - 1 tokens after slot 1 go to the write row.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_replay(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * hist,
+            struct ggml_tensor  * rep,
             int64_t               K);
 
     // DSA lightning indexer

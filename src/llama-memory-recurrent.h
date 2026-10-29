@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-memory.h"
 
+#include <array>
 #include <map>
 #include <set>
 #include <vector>
@@ -78,6 +79,21 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // [TAG_RS_REPLAY] rollback by replay (delta-net models): the s tensors keep 2 groups (the current state and the
+    // replay base) instead of 1 + n_rs_seq, h_l keeps the k/v/g/beta records of the tokens after the base in 2
+    // parities, and a rollback replays the accepted ones in the next batch's gated delta net
+    bool rs_replay = false;
+    int64_t rs_S_v = 0;   // state head size
+    int64_t rs_H   = 0;   // state heads
+    int64_t rs_rec = 0;   // floats per token record
+    std::vector<ggml_tensor *> h_l;
+
+    // per data row: tokens of the last batch kept for rollback (W), the hist parity holding their records, and for a
+    // restored state the records it still has to replay from its base row (the next batch replays them)
+    std::vector<uint32_t> row_w;
+    std::vector<uint8_t>  row_par;
+    std::vector<int32_t>  row_rep;
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -133,7 +149,10 @@ private:
     size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    // s_rows (replay only): per written cell its s row, tokens to replay and hist row
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+                          const std::vector<std::array<int32_t, 3>> * s_rows = nullptr) const;
+
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
@@ -181,6 +200,15 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // [TAG_RS_REPLAY]
+    bool          get_rs_replay() const;
+    bool          is_replay_s(const ggml_tensor * s) const; // s is a replayed state tensor (gathered by s_copy_s)
+    ggml_tensor * get_h_l(int32_t il) const;
+
+    // fill the gathers of a ubatch (s_copy for the r states, and with replay s_copy_s for the s states plus the
+    // replay records rep) and consume the pending rollbacks
+    void set_input_rs(ggml_tensor * s_copy, ggml_tensor * s_copy_s, ggml_tensor * rep, const llama_ubatch * ubatch) const;
 
 private:
     const llama_memory_status status;

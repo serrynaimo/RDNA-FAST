@@ -5137,6 +5137,100 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// GGML_OP_GATED_DELTA_NET_REPLAY [TAG_RS_REPLAY]: seq s replays n_rep + s (mod K) records from hist row s, then runs
+// the batch; the output holds the attention scores, the final state and the replay base
+struct test_gated_delta_net_replay : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int     v_repeat;
+    const bool    kda;
+    const int64_t K;
+    const int     n_rep;
+
+    std::string vars() override {
+        return VARS_TO_STR8(head_count, head_size, n_seq_tokens, n_seqs, v_repeat, kda, K, n_rep);
+    }
+
+    test_gated_delta_net_replay(int64_t head_count = 4, int64_t head_size = 64, int64_t n_seq_tokens = 4,
+            int64_t n_seqs = 1, int v_repeat = 1, bool kda = false, int64_t K = 5, int n_rep = 2)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
+          v_repeat(v_repeat), kda(kda), K(K), n_rep(n_rep) {}
+
+    int64_t rec() const {
+        const int64_t H = head_count * v_repeat;
+        return 2 * head_size * H + ((kda ? head_size : 1) + 1) * H;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t H = head_count * v_repeat;
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, H, n_seq_tokens, n_seqs);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kda ? head_size : 1, H, n_seq_tokens, n_seqs);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_seq_tokens, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, H, n_seqs);
+        ggml_tensor * hist  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rec() * (K - 1), 2 * n_seqs);
+        ggml_tensor * rep   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 3, n_seqs);
+        ggml_set_name(g,     "g");
+        ggml_set_name(beta,  "beta");
+        ggml_set_name(state, "state");
+        ggml_set_name(hist,  "hist");
+        ggml_set_name(rep,   "rep");
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+        return ggml_gated_delta_net_replay(ctx, q, k, v, g, beta, state, hist, rep, K);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t H   = head_count * v_repeat;
+        const int64_t S   = head_size;
+        const int64_t gd  = kda ? S : 1;
+        std::default_random_engine rng(1234);
+        std::uniform_real_distribution<float> unit(-1.0f, 1.0f), gate(-20.0f, -1e-4f), b01(0.0f, 1.0f), vv(-0.3f, 5.0f);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else if (strcmp(t->name, "hist") == 0) {
+                // records [k (unit length per head) | v | g | beta]
+                std::vector<float> h(ggml_nelements(t));
+                const int64_t n_rec = h.size() / rec();
+                for (int64_t r = 0; r < n_rec; ++r) {
+                    float * p = h.data() + r * rec();
+                    for (int64_t hh = 0; hh < H; ++hh) {
+                        float n2 = 0.0f;
+                        for (int64_t i = 0; i < S; ++i) { p[hh*S + i] = unit(rng); n2 += p[hh*S + i] * p[hh*S + i]; }
+                        for (int64_t i = 0; i < S; ++i) { p[hh*S + i] /= sqrtf(n2); }
+                    }
+                    for (int64_t i = 0; i < S*H; ++i)  { p[S*H + i] = vv(rng); }
+                    for (int64_t i = 0; i < gd*H; ++i) { p[2*S*H + i] = gate(rng); }
+                    for (int64_t i = 0; i < H; ++i)    { p[2*S*H + gd*H + i] = b01(rng); }
+                }
+                ggml_backend_tensor_set(t, h.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "rep") == 0) {
+                std::vector<int32_t> r(3 * n_seqs);
+                for (int64_t s = 0; s < n_seqs; ++s) {
+                    r[3*s + 0] = (int32_t) ((n_rep + s) % K);
+                    r[3*s + 1] = (int32_t) s;
+                    r[3*s + 2] = (int32_t) (n_seqs + s);
+                }
+                ggml_backend_tensor_set(t, r.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -12680,6 +12774,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 516, 1, 3, false, false, /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 4100, 1, 1, false, false, /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 2049, 1));
+
+    // [TAG_RS_REPLAY] replay op: decode, verify batches, two seqs, GQA, KDA, the Qwen3.8 shape, chunked prefill
+    for (int n_rep : {0, 1, 3, 4}) {
+        test_cases.emplace_back(new test_gated_delta_net_replay(4, 64, 1, 1, 1, false, 5, n_rep));
+        test_cases.emplace_back(new test_gated_delta_net_replay(4, 64, 5, 2, 1, false, 5, n_rep));
+    }
+    test_cases.emplace_back(new test_gated_delta_net_replay(4, 128, 3, 2, 2, false, 5, 3));
+    test_cases.emplace_back(new test_gated_delta_net_replay(4, 128, 8, 1, 3, false, 5, 2));
+    test_cases.emplace_back(new test_gated_delta_net_replay(4, 32, 4, 2, 1, true, 5, 2));
+    test_cases.emplace_back(new test_gated_delta_net_replay(16, 128, 4, 1, 3, false, 5, 1));
+    test_cases.emplace_back(new test_gated_delta_net_replay(16, 128, 5, 2, 3, false, 5, 3));
+    test_cases.emplace_back(new test_gated_delta_net_replay(4, 128, 100, 1, 1, false, 5, 2));
+    test_cases.emplace_back(new test_gated_delta_net_replay(16, 128, 517, 1, 3, false, 5, 3));
 
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).

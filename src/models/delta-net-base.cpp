@@ -563,8 +563,13 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
-    // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    // [TAG_RS_REPLAY] rollback by replay: the op replays the tokens accepted after the last base and keeps 2 states
+    const bool replay = mctx_cur->get_rs_replay();
+
+    // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots (or 2 with replay) are written into the output.
+    ggml_tensor * gdn_out = replay
+        ? ggml_gated_delta_net_replay(ctx0, q, k, v, g, b, s, mctx_cur->get_h_l(il), inp->rs_rep, K)
+        : ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {
@@ -585,7 +590,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
     // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
-    const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+    // (replay: the final state and, from 2 tokens on, the replay base)
+    const int64_t n_written = std::min<int64_t>(n_seq_tokens, replay ? 2 : K);
 
     // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)
     ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
