@@ -18,6 +18,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
+#include <memory>
 #include <random>
 #include <regex>
 #include <stdexcept>
