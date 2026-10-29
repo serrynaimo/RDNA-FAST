@@ -1203,11 +1203,12 @@ static __global__ void mul_mat_q(
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const uint3 ntx) {
 
-#ifdef TURING_MMA_AVAILABLE
+// [TAG_MMQ_FUSION_RDNA3] RDNA3.0 pairs C tile rows r and r + 8 in one lane like Turing+ (see ggml_cuda_mul_mat_q_fusion_matches)
+#if defined(TURING_MMA_AVAILABLE) || defined(RDNA3_0)
     constexpr bool fusion_available = true;
 #else
     constexpr bool fusion_available = false;
-#endif // TURING_MMA_AVAILABLE
+#endif // defined(TURING_MMA_AVAILABLE) || defined(RDNA3_0)
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).type == GGML_TYPE_COUNT || (has_fusion && !fusion_available)) {
