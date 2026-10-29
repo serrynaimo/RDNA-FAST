@@ -32,6 +32,11 @@ formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
   prompts, our ROCmFPX-optimised quant of the same model:
   [ROCmFP4-FP6 recipe](docs/rocmfpx/swift-1.5-qwen3.8-27b-rocmfp4-fp6.md)
 
+- **Drafting without state copies.** After a rejected draft the recurrent
+  layers replay the accepted tokens instead of keeping a 150 MiB copy of their
+  state for every drafted token: 0.8 GB less VRAM with two slots, the same
+  output bit for bit. [More](#rollback-by-replay)
+
 - **Switching conversations costs seconds, not minutes.** Conversations are
   saved to SSD and restored when they come back, in about 3 s instead of a
   minute or more of re-reading. [More](#the-ssd-prompt-cache)
@@ -204,6 +209,7 @@ Environment variables:
 | `ROCMFPX_WMMA_GEMM_MIN_BATCH`, `ROCMFPX_WMMA_GEMM_SCRATCH_MB` | not set here: the smallest batch that takes the WMMA GEMM (512) and the size of its f16 weight scratch (64 MB). |
 | `ROCMFPX_FP8_GEMM` | not set here, off by default: `=1` sends prompt-sized products through the FP8 GEMM, on RDNA4 with FP8 WMMA, on RDNA3 with the f16 stand-in that is only there to check it. `ROCMFPX_FP8_GEMM_TILE=1` picks the 4-wave tile layout instead of the 8-wave one, `ROCMFPX_FP8_GEMM_CHECK=N` (RDNA3) compares the first N products with the emulation in the log. See [Other cards](#other-cards). |
 | `ROCMFPX_WMMA_GEMM_FP8_EMU` | not set here: `1` rounds the weights, `2` the activations, `3` both to E4M3 inside the f16 WMMA GEMM, to measure what an FP8 path costs in quality on any gfx11 card. |
+| `ROCMFPX_RS_REPLAY` | not set here, on by default for the Qwen3.5/3.6/3.8 family: [rollback by replay](#rollback-by-replay). `=0` keeps a copy of the recurrent state per drafted token, for comparisons. |
 | `ROCMFPX_MMQ_FUSION` | not set here: the fused gate/up/GLU prompt kernel for MoE experts runs on NVIDIA only by default. `=1` also runs it on RDNA3 (gfx1100-1102), where it is correct but slower: 3-16% on prompts with Qwen3-30B-A3B IQ4_XS on the RX 7900 XT. `=0` turns it off everywhere. |
 
 ## Other cards
@@ -217,6 +223,10 @@ would likely not help elsewhere stay limited to the RX 7900 series.
   the graph arenas and the SSD prompt cache live in the model core and the
   server and do not depend on the GPU. The tree builds with gcc and the Vulkan
   backend (checked on 10 October 2026).
+- **Rollback by replay** runs where its op exists: the CPU and HIP/CUDA
+  backends. Vulkan and the other backends, a recurrent cache split across GPUs,
+  RPC devices and RDNA3.5 (whose tiled kernel for batches of 16 tokens and more
+  has no replay variant) keep a state copy per drafted token, as before.
 - **AMD cards with HIP.** The GPU backend builds for the gfx11 targets: RDNA3
   (RX 7000 series) and RDNA3.5 (gfx1151, checked on 10 October 2026). Since
   the merge of ROCmFPX main on 19 October 2026 it also builds for RDNA4
@@ -316,7 +326,7 @@ move prefill by 3% or less.
 
 ## The SSD prompt cache
 
-Qwen3.8 is a hybrid (16 attention + 49 recurrent layers), and recurrent state
+Qwen3.8 is a hybrid (16 attention + 48 recurrent layers), and recurrent state
 cannot be rolled back to an arbitrary prefix, so stock llama.cpp re-prefills a
 conversation from scratch once another request has taken its slot. Here the
 conversation is written to SSD together with its checkpoints and restored when
@@ -447,6 +457,36 @@ attention sums its cells in another order, and the last bits differ. With a
 4-bit KV cache that grows to 0.1 to 0.3 in the log-probabilities of the ten
 most likely tokens, about what the tile and the vector attention kernel
 differ by on one and the same slot (0.08 to 0.16).
+
+## Rollback by replay
+
+Qwen3.8's 48 delta-net layers carry a recurrent state of 150 MiB per slot. When
+a draft is partly rejected, the state has to go back to the last accepted token.
+Stock llama.cpp keeps a copy of the state after each drafted token for that, so
+with 4 drafted tokens every slot holds 5 copies (1.5 GB for two slots) and every
+verify pass writes up to 5 of them.
+
+Here each slot keeps two rows: the current state and a replay base a few tokens
+back, plus the inputs of the tokens after the base (k, v, gate and beta, 48 KB
+per token and layer). After a rejection, the next pass first replays the
+accepted tokens from the base, inside the same kernel and with the same
+arithmetic as the token loop, so the state is the one a copy would have held,
+bit for bit. A conversation saved with a rollback still pending carries its
+base and token inputs and replays them after the restore.
+
+Swift 1.5 IQ4_XS, `-c 98304`, two slots, MTP and n-gram drafting:
+
+| | a state copy per drafted token | replay |
+|---|---:|---:|
+| VRAM after the test (dedicated + shared) | 18.77 + 0.75 GB | 18.68 + 0.03 GB |
+| decode at 17k, t/s | 66.8 | 67.2 |
+| copy decode at 17k, t/s | 171.6, 171.8 | 176.3, 174.9 |
+| copy decode at 41k, t/s | 113.6, 110.6 | 115.5, 112.0 |
+
+Temperature-0 output is identical to the copy path (four turns of a 17k-token
+conversation, generated text and drafted and accepted counts). An SSD cache entry
+saved with a pending rollback has a new tag that older builds refuse; they
+process that prompt again. All other entries keep the old format.
 
 ---
 
