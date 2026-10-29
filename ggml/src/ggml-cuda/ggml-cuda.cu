@@ -2049,8 +2049,13 @@ static bool ggml_cuda_mul_mat_q_fusion_matches(const ggml_tensor * up, const ggm
         return false;
     }
 
-    // NVIDIA only: the fused write-back relies on the MMA accumulator layout.
-    return turing_mma_available(ggml_cuda_info().devices[device].cc);
+    // NVIDIA: the fused write-back relies on the MMA accumulator layout (rows r and r + 8 of a C tile in one thread).
+    // [TAG_MMQ_FUSION_RDNA3] RDNA3.0 pairs the same rows: its int C tile holds row 2*l + lane/16 in accumulator l, so
+    // accumulators l and l + 4 are rows r and r + 8 and the write-back runs unchanged. MoE experts only: dense FFN
+    // prompts of these types take the WMMA GEMM path on this card (TAG_WMMA_GEMM_STOCK), which the fused MMQ kernel
+    // would bypass. RDNA4 (row 8*(lane/16) + l) and CDNA lay the C tile out differently; RDNA3.5 is untested.
+    const int cc = ggml_cuda_info().devices[device].cc;
+    return turing_mma_available(cc) || (GGML_CUDA_CC_IS_RDNA3_0(cc) && up->op == GGML_OP_MUL_MAT_ID);
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu) {
