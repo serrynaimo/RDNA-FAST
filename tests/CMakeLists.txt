@@ -363,6 +363,8 @@ else()
     llama_build_and_test(test-llama-mmap.cpp LABEL behavior)
 endif()
 
+llama_build_and_test(test-backend-tensor.cpp)
+
 llama_build_and_test(test-tiled-mulmat.cpp)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
