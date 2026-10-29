@@ -99,6 +99,10 @@ file rather than Q8_0. Ryzen 9 7900, 12 threads, OpenDecision 500 and 115 reques
 | Wald-4B v1.2 | letter | 488 | 111 | 1.1 - 1.25 s |
 | TinyJev-4B v2 | letter, `ollama` | 490 | 110 | 1.9 s |
 
+On the 2026-10-29 runtime (vanilla llama.cpp's x86 CPU work), StartLux-Decision-2B BF16 answers a yes/no question in
+0.20 - 0.30 s and a 21-option choice in 0.85 s, 0.47 s usage-weighted, with the same answers (every probability
+unchanged on all 615 cases). The other rows and the BF16 / Q8_0 comparison below were measured on the 2026-10-06 runtime.
+
 BF16 against Q8_0 for StartLux-Decision-2B: a yes/no question 0.39 s against 0.75 s, a 21-option choice 1.05 s
 against 2.0 s, at 3.8 GB against 2.0 GB. Its probabilities are cautious (the shipped temperatures flatten them), and
 the weights are CC BY-NC 4.0; Wald-4B is the Apache-2.0 alternative.
