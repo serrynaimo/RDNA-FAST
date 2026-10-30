@@ -1,7 +1,6 @@
 name: Python check requirements.txt
 
 on:
-  workflow_dispatch:
   push:
     paths:
       - '.github/workflows/python-check-requirements.yml'
