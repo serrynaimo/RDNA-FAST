@@ -232,6 +232,7 @@ void llama_memory_recurrent::clear(bool data) {
         cells[i].seq_id.clear();
         cells[i].src = -1;
         cells[i].tail = -1;
+        cells[i].rs_max = 0;
     }
 
     head = 0;
@@ -281,7 +282,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         if (tail_id >= 0) {
             auto & cell = cells[tail_id];
 
-            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+            // partial rollback via per-token snapshot index (bounded by the snapshots of the last ubatch)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 // a cell shared by several sequences cannot move back for only one of them
                 if (cell.seq_id.size() > 1) {
@@ -295,9 +296,11 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
-                // [TAG_RS_REPLAY] a replay reaches back only over the tokens the last batch recorded
+                // [TAG_RS_REPLAY] a replay reaches back only over the tokens the last batch recorded; the snapshot
+                // path only over the snapshots the last ubatch wrote (cell.rs_max, vanilla #31368)
                 const int32_t row = cell.src >= 0 ? cell.src : tail_id;
-                const bool in_reach = !rs_replay || (rollback < (llama_pos) row_w[row] && row_rep[row] <= 0);
+                const bool in_reach = rs_replay ? (rollback < (llama_pos) row_w[row] && row_rep[row] <= 0)
+                                                : rollback <= (llama_pos) cell.rs_max;
                 if (!pending && in_reach && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
@@ -783,6 +786,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             }
         }
         cell.pos = last_pos;
+        cell.rs_max = n_seq_tokens <= n_rs_seq + 1 ? n_seq_tokens - 1 : 0;
         cell.seq_id.clear();
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];
