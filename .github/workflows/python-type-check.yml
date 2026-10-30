@@ -1,6 +1,7 @@
 name: Python Type-Check
 
 on:
+  workflow_dispatch:
   push:
     paths:
       - '.github/workflows/python-type-check.yml'
