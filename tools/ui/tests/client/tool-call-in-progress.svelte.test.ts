@@ -86,6 +86,7 @@ describe('Show tool call in progress', () => {
 		setSettings({ alwaysShow: false, inProgress: true });
 
 		const { container } = render(ChatMessageAgenticContent, {
+			isLastAssistantMessage: true,
 			isStreaming: true,
 			message: assistantMessage(),
 			toolMessages: []
@@ -98,6 +99,7 @@ describe('Show tool call in progress', () => {
 
 	it('keeps the call collapsed while executing when the setting is off', async () => {
 		const { container } = render(ChatMessageAgenticContent, {
+			isLastAssistantMessage: true,
 			isStreaming: true,
 			message: assistantMessage(),
 			toolMessages: []
@@ -114,6 +116,7 @@ describe('Show tool call in progress', () => {
 		setSettings({ alwaysShow: false, inProgress: true });
 
 		const screen = render(ChatMessageAgenticContent, {
+			isLastAssistantMessage: true,
 			isStreaming: true,
 			message: assistantMessage(),
 			toolMessages: []
@@ -126,6 +129,7 @@ describe('Show tool call in progress', () => {
 
 		// Same block, now finished: it must close on its own, no toggle given.
 		screen.rerender({
+			isLastAssistantMessage: true,
 			isStreaming: true,
 			message: assistantMessage(),
 			toolMessages: [toolResultMessage()]
@@ -141,6 +145,7 @@ describe('Show tool call in progress', () => {
 		setSettings({ alwaysShow: false, inProgress: true });
 
 		const screen = render(ChatMessageAgenticContent, {
+			isLastAssistantMessage: true,
 			isStreaming: true,
 			message: assistantMessage(),
 			toolMessages: []
@@ -152,6 +157,7 @@ describe('Show tool call in progress', () => {
 		await collapseBlock(screen);
 
 		screen.rerender({
+			isLastAssistantMessage: true,
 			isStreaming: true,
 			message: assistantMessage(),
 			toolMessages: [toolResultMessage()]
@@ -166,6 +172,7 @@ describe('Show tool call in progress', () => {
 		setSettings({ alwaysShow: true, inProgress: false });
 
 		const { container } = render(ChatMessageAgenticContent, {
+			isLastAssistantMessage: true,
 			isStreaming: true,
 			message: assistantMessage(),
 			toolMessages: [toolResultMessage()]
@@ -180,6 +187,7 @@ describe('Show tool call in progress', () => {
 		setSettings({ alwaysShow: false, inProgress: true });
 
 		const screen = render(ChatMessageAgenticContent, {
+			isLastAssistantMessage: true,
 			isStreaming: true,
 			message: assistantMessage(),
 			toolMessages: []
@@ -196,6 +204,7 @@ describe('Show tool call in progress', () => {
 
 	it('lets a manual expand win over the collapsed default', async () => {
 		const screen = render(ChatMessageAgenticContent, {
+			isLastAssistantMessage: true,
 			isStreaming: true,
 			message: assistantMessage(),
 			toolMessages: []
