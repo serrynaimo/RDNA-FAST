@@ -2077,8 +2077,14 @@ shared float rocmfp4_ue4m3_fp32_lut[128];
 #endif
 
 #if (defined(DATA_A_NVFP4) && !defined(USE_OCP_FP4)) || defined(DATA_A_ROCMFPX_FAMILY) || defined(FA_ROCMFPX_FAMILY)
-// UE4M3 scale in NVFP4 blocks use only 7 bits; sign (bit 7) is always zero.
+#if defined(DATA_A_NVFP4)
+// NVFP4 reads the table with the raw scale byte: cover all scale bytes accepted by ggml_validate_row_data.
+// ue4m3_to_fp32_build() masks the exponent and mantissa, but checks the full byte for 0 and 0x7F.
+shared float ue4m3_fp32_lut[256];
+#else
+// the ROCmFPX lookups clamp the scale byte to 127 (their quantizers never set bit 7)
 shared float ue4m3_fp32_lut[128];
+#endif
 
 float ue4m3_to_fp32_build(uint u) {
     if (u == 0u || u == 127u) {
@@ -2135,7 +2141,7 @@ void init_iq_shmem(uvec3 wgsize)
     }
 #endif
 #if defined(DATA_A_NVFP4) || defined(DATA_A_ROCMFPX_FAMILY) || defined(FA_ROCMFPX_FAMILY)
-    for (uint i = gl_LocalInvocationIndex.x; i < 128u; i += wgsize.x) {
+    for (uint i = gl_LocalInvocationIndex.x; i < ue4m3_fp32_lut.length(); i += wgsize.x) {
         ue4m3_fp32_lut[i] = ue4m3_to_fp32_build(i);
     }
 #endif
