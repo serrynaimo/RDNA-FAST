@@ -235,7 +235,7 @@ export type {
 } from './agentic';
 
 // Navigation types
-export type { DesktopIconStripItem } from './navigation';
+export type { DesktopIconStripItem, MenuAction } from './navigation';
 
 // Tools types
 export type {
