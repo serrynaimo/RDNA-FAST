@@ -956,9 +956,6 @@ size_t common_process_resident_bytes();
 // the OS this process runs on, e.g. "Windows 11 (build 26300)", "Ubuntu 24.04.1 LTS", "macOS 15.1"
 std::string common_host_os();
 
-// reads a path from the environment, an unset variable gives an empty path
-std::filesystem::path common_get_path_from_env(const std::string & name);
-
 //
 // Filesystem utils
 //
