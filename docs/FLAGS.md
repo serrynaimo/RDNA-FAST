@@ -58,6 +58,9 @@ cache. [More](expert-handoff.md)
 | `--adapt-decay F` | 0.7 | how fast old use is forgotten: usage is multiplied by `F` after each round |
 | `--expert-profile FILE` | none | starts the cache with the experts this file ranks most used ([profiles](expert-handoff.md#profiles)) |
 | `--expert-profile-save FILE` | none | writes this run's routing counts (plus those of `--expert-profile`) to `FILE` every 30 s of use and at exit |
+| `--resident-experts` | off | copies the experts the VRAM cache misses into locked RAM, the most used first, as many as fit in the available RAM less `--ram-keep-gib`; the CPU reads them there instead of from the mapped file |
+| `--resident-budget-gib N` | off | the same, with at most `N` GiB in RAM |
+| `--ram-keep-gib N` | 4 | RAM the copy leaves available for everything else |
 
 ## Environment variables
 

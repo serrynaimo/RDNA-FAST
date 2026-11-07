@@ -51,6 +51,22 @@ else on this 32 GB machine, so some page in from the SSD. That makes the first a
 pages are back, and prompts over a few hundred tokens read every expert once per batch. It needs RAM for the experts
 outside VRAM: about 20 GB on a 20 GB card.
 
+**Flash-Next with a RAM copy of the hottest experts** (`--resident-experts`, n-gram drafting off), the same machine
+with nothing else loaded on the card, same build, sampling at temperature 1:
+
+| Decode | Without the copy | With it |
+| --- | ---: | ---: |
+| First answer after a load | 12.6 t/s | **23.1 t/s** |
+| Short answer | 17.9 t/s | **24.0-27.0 t/s** |
+| Copying a 700-token text | 36.1 t/s | **39.8-42.6 t/s** |
+| After a 4k-token prompt | 24.2 t/s | 22.4-24.7 t/s |
+
+The copy holds 15 of the 20 GB of experts outside VRAM (17 GB with `--ram-keep-gib 2`) and serves 67-88% of the
+experts the CPU computes. The CPU's time per layer falls from 371 to 223-269 us. Prompts stay about where they were
+(700 tokens in 18-21 s, 4k tokens at 84-87 t/s, 15k at 113-127 t/s): each batch still uploads every expert outside
+VRAM. With `-ub 4096`, long prompts are faster (4k tokens at 95 t/s, 15k at 146 t/s) and decode is 5-15% slower: the
+larger compute buffers leave 31% of the experts in VRAM instead of 36%.
+
 **Quality.** The CPU computes its experts in a different order and precision than the GPU would, so greedy answers
 match the all-GPU answers for a while and then diverge into different but coherent text. Against the model fully in
 VRAM, Gemma 4 with half its experts on the CPU has a KL divergence of about 0.08, the same as `--n-cpu-moe`.
@@ -72,6 +88,9 @@ llama-server -m Qwen3.6-35B-A3B-UD-Q4_K_S.gguf --expert-cache auto -ub 4096
 | `--adapt-decay F` | How fast old use is forgotten: usage is multiplied by `F` after each round (default 0.7). |
 | `--expert-profile FILE` | Starts the cache with the experts this file ranks most used. |
 | `--expert-profile-save FILE` | Writes the routing counts of this run (plus those of `--expert-profile`) to `FILE` every 30 s of use and at exit. |
+| `--resident-experts` | Copies the experts the VRAM cache misses into locked RAM, the most used first (by the profile, then by use), as many as fit in the available RAM less `--ram-keep-gib`. The CPU reads them there instead of from the mapped model file. |
+| `--resident-budget-gib N` | The same, with at most `N` GiB in RAM. |
+| `--ram-keep-gib N` | RAM the copy leaves available for everything else (default 4). |
 
 - **A profile helps the first answers after a start.** Without one, the cache starts with an even share of every
   layer's experts and learns from the first tokens. A saved profile starts it closer to your usual work (see
@@ -83,7 +102,17 @@ llama-server -m Qwen3.6-35B-A3B-UD-Q4_K_S.gguf --expert-cache auto -ub 4096
 - **MTP drafting** works: the draft layer stays in VRAM whole.
 - **Qwen3.8-Flash-Next:** add `-ot per_layer_token_embd=CPU` and `-ub 4096`. Its 28.8 GB per-layer token
   embeddings stay on the SSD and only one row is read per token. Give it RAM for the experts outside VRAM, about
-  20 GB on a 20 GB card, or they page in from the SSD.
+  20 GB on a 20 GB card, or they page in from the SSD. When RAM is short of that, add `--resident-experts`.
+- **The RAM copy** (`--resident-experts`) is worth it when the experts outside VRAM don't all fit in the RAM the
+  system leaves free. A mapped expert the memory manager has pushed out of the process costs a fault for every 4 KB
+  page, about 250 us per Flash-Next expert, against about 37 us from the copy. While the server runs, the copy follows
+  use like the VRAM cache, with a longer memory.
+- **Leave n-gram drafting off with expert handoff** (`--spec-type ngram-*`). Each check of a draft is a batch of
+  several tokens whose missed experts the CPU computes together, which costs more than the draft saves: Flash-Next
+  copied text at 20 t/s with it and at 41 t/s without. MTP drafting loads (the draft layer stays in VRAM) but gave no
+  gain for the same reason.
+- **The CPU backend's own threads** don't poll for work while expert handoff is on (as `--poll 0`), unless `--poll`
+  says otherwise: polling, they spun after every token on the cores the handoff computes on.
 - **Several GPUs.** With the layer split (the default), each GPU caches the experts of its own layers in its free
   VRAM, and one CPU pool serves them all.
 
@@ -172,11 +201,16 @@ Scale a file first if its share of the mix should be smaller than its raw counts
    slot map at once, so the CPU computes it from then on. A helper thread copies the new expert into its slot beside
    the running steps, and the slot map takes it in once the copy has landed.
 5. **The CPU reads each missed expert once per batch**, row by row for all the tokens that miss it, so a batch of
-   several tokens costs little more than one.
-6. **Prompts** of up to a few hundred tokens go the same way when the CPU is estimated to finish sooner than the GPU
+   several tokens costs little more than one. For 2-bit experts each block of weights is unpacked once for all those
+   tokens.
+6. **The RAM copy** (`--resident-experts`). After the VRAM cache is filled, the experts it misses are copied into one
+   locked block of RAM, the most used first, until the RAM budget is reached. The CPU threads read those experts there,
+   and long prompts upload them from there. Every few steps, the experts the CPU reads most often from the model file
+   take the copy's places of those it reads least, or of those the VRAM cache holds by now.
+7. **Prompts** of up to a few hundred tokens go the same way when the CPU is estimated to finish sooner than the GPU
    could upload the experts it lacks, judged from the CPU's measured speed and the share of experts it computes.
    Longer prompts take the usual path: the experts a batch uses are copied to the GPU, those in the cache from VRAM.
-7. **Several GPUs.** Each GPU's cache holds experts of its own layers. One block of host memory, mapped into every
+8. **Several GPUs.** Each GPU's cache holds experts of its own layers. One block of host memory, mapped into every
    GPU, serves them all: with the layer split, a layer finishes before the next one starts, whichever GPU runs it.
 
 ## Limits
@@ -190,3 +224,6 @@ Scale a file first if its share of the mix should be smaller than its raw counts
 - With the cache following the conversation, answers aren't bit-identical from run to run. `--adapt-every 0` keeps
   the cache fixed.
 - Keep the experts memory-mapped (the default load mode). Pinning 18 GB of them fails on Windows.
+- With `--resident-experts` on Windows, the first GPU operation after the copy is locked waits about a minute
+  (43-93 s for 15-17 GB): the server's warmup takes it, so loading takes that much longer. `ROCMFPX_EH_RES_LOCK=0`
+  keeps the copy unlocked, but then Windows pushes parts of it out and decode gets slower than without it.
