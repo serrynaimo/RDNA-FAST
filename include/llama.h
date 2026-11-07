@@ -436,6 +436,8 @@ extern "C" {
         int32_t      adapt_every;         // swap hot experts into the cache every N decode graphs, 0 = the profile's cache stays (default 4)
         int32_t      adapt_swaps;         // most swaps per round (default 96)
         float        adapt_decay;         // the routing counts behind the swaps are multiplied by this after each round (default 0.7)
+        float        resident_budget_gib; // [TAG_EH_RESIDENT] a locked RAM copy of the hottest experts the VRAM cache misses: GiB, 0 = none, < 0 = what fits
+        float        ram_keep_gib;        // RAM that copy leaves available (default 4)
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

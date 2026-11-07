@@ -192,6 +192,13 @@ extern "C" {
         bool    weight_before; // the routing weight scales the input (llama4) instead of the output
         int32_t n_used;        // only the first n_used selected experts of a token count, 0 = all
         int32_t miss_slot;     // the slot the device gives the experts the host computes
+        // [TAG_EH_RESIDENT] per expert, where its weights of gate, up, gate_up and down start when they are read
+        // from a copy (the resident RAM copy) instead of the tensor: arrays of n_expert, NULL entries or a NULL
+        // array read the tensor. A copy keeps the tensor's layout of one expert (its rows, nb[1] apart).
+        const void * const * gate_src;
+        const void * const * up_src;
+        const void * const * gate_up_src;
+        const void * const * down_src;
     };
 
     struct ggml_expert_handoff_stats {
@@ -209,6 +216,17 @@ extern "C" {
         int32_t  max_miss;
         int32_t  max_uniq;
         uint64_t max_step_ns[4]; // its steps: inputs, gate/up, activation, down
+        // [TAG_EH_LOCAL_SUM] all the answers' time by step: reading the send, inputs, gate/up, activation, down
+        // (with the copy of the sum into the mailbox)
+        uint64_t step_ns[5];
+        // [TAG_EH_RESIDENT] the distinct experts each answer read, from a copy (the resident RAM copy) or the tensor
+        uint64_t n_read_copy;
+        uint64_t n_read_tensor;
+        // [TAG_EH_LOCAL_SUM] from the first worker seeing a send to the job's start (all workers at the barrier), and
+        // the device's time between the host's answer and its next send within a graph (gaps under 5 ms)
+        uint64_t gather_ns;
+        uint64_t gap_ns;
+        uint64_t n_gap;
     };
 
     typedef struct ggml_expert_handoff_host * ggml_expert_handoff_host_t;

@@ -952,6 +952,16 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
         }
         params.no_extra_bufts = true;
+        // [TAG_EH_POLL] the CPU backend's threads poll for work after each of its graph splits (1024*128*poll rounds:
+        // ~130 ms at the default 50), so with a split per token (a model's CPU tensors, here Flash-Next's
+        // per_layer_token_embd rows) they spin through the whole step on the cores the host pool computes on: its
+        // missed experts took 3x the time of --bench (Flash-Next Q2_0, 2026-11-08). They sleep instead unless --poll says
+        if (!params.poll_explicit) {
+            params.cpuparams.poll       = 0;
+            params.cpuparams_batch.poll = 0;
+            params.speculative.draft.cpuparams.poll       = 0;
+            params.speculative.draft.cpuparams_batch.poll = 0;
+        }
     }
 
     // pad tensor_buft_overrides for llama_params_fit:
@@ -1593,6 +1603,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("use polling level to wait for work (0 - no polling, default: %u)\n", (unsigned) params.cpuparams.poll),
         [](common_params & params, const std::string & value) {
             params.cpuparams.poll = std::stoul(value);
+            params.poll_explicit = true; // [TAG_EH_POLL]
         }
     ));
     add_opt(common_arg(
@@ -1637,6 +1648,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "use polling to wait for work (default: same as --poll)",
         [](common_params & params, int value) {
             params.cpuparams_batch.poll = value;
+            params.poll_explicit = true; // [TAG_EH_POLL]
         }
     ));
     add_opt(common_arg(
@@ -2975,6 +2987,38 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.adapt_decay = f;
         }
     ).set_env("LLAMA_ARG_ADAPT_DECAY"));
+    // [TAG_EH_RESIDENT]
+    add_opt(common_arg(
+        {"--resident-experts"},
+        "expert handoff: copy the experts the VRAM cache misses into locked RAM, hottest first by the expert profile, "
+        "as many as fit in the available RAM less --ram-keep-gib; the CPU threads and the prompt uploads read them there "
+        "instead of the mapped model file (default: off)",
+        [](common_params & params) {
+            params.resident_budget_gib = -1.0f;
+        }
+    ).set_env("LLAMA_ARG_RESIDENT_EXPERTS"));
+    add_opt(common_arg(
+        {"--resident-budget-gib"}, "N",
+        "expert handoff: like --resident-experts, with at most N GiB of experts in RAM",
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (!(f > 0.0f)) {
+                throw std::invalid_argument("invalid value: N > 0");
+            }
+            params.resident_budget_gib = f;
+        }
+    ).set_env("LLAMA_ARG_RESIDENT_BUDGET_GIB"));
+    add_opt(common_arg(
+        {"--ram-keep-gib"}, "N",
+        "expert handoff: RAM the resident copy leaves available for everything else (default: 4)",
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (!(f >= 0.0f)) {
+                throw std::invalid_argument("invalid value: N >= 0");
+            }
+            params.ram_keep_gib = f;
+        }
+    ).set_env("LLAMA_ARG_RAM_KEEP_GIB"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

@@ -1802,6 +1802,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.adapt_every         = params.adapt_every;
     cparams.adapt_swaps         = params.adapt_swaps;
     cparams.adapt_decay         = params.adapt_decay;
+    cparams.resident_budget_gib = params.resident_budget_gib;
+    cparams.ram_keep_gib        = params.ram_keep_gib;
 
     return cparams;
 }

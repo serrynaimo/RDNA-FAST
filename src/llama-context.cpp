@@ -399,6 +399,8 @@ llama_context::llama_context(
     cparams.expert_profile_save = params.expert_profile_save ? params.expert_profile_save : "";
     cparams.adapt_every         = params.adapt_every;
     cparams.adapt_swaps         = params.adapt_swaps;
+    cparams.resident_budget_gib = params.resident_budget_gib;
+    cparams.ram_keep_gib        = params.ram_keep_gib;
     cparams.adapt_decay         = params.adapt_decay;
 
     // initialized later
@@ -652,6 +654,8 @@ llama_context::llama_context(
             ehp.adapt_every      = cparams.adapt_every;
             ehp.adapt_swaps      = cparams.adapt_swaps;
             ehp.adapt_decay      = cparams.adapt_decay;
+            ehp.resident_budget_gib = cparams.resident_budget_gib;
+            ehp.ram_keep_gib        = cparams.ram_keep_gib;
             expert_handoff = std::make_unique<llama_expert_handoff>(model, backend_ptrs, backend_buft, ehp);
         } else if (params.ctx_other != nullptr && llama_get_model(params.ctx_other) == &model) {
             // an MTP draft context of the same model reads the target's VRAM cache, which holds its layer whole
@@ -3115,6 +3119,25 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
         // the experts in the expert handoff's VRAM cache are copied from device memory, the others are uploaded
         const llama_expert_handoff * eh = lctx->get_expert_handoff();
+
+        // [TAG_EH_RESIDENT] upload experts [a, b) and pad bytes after them: from the handoff's resident RAM copy where
+        // it holds them (the bytes after an expert there are another expert or zeros), else from the tensor
+        auto upload = [&](int64_t a, int64_t b, size_t pad) {
+            if (a == b) {
+                if (pad > 0) {
+                    ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + a*expert_size, a*expert_size, pad);
+                }
+                return;
+            }
+            for (int64_t e = a; e < b; ) {
+                int64_t n = b - e;
+                const void * res = eh ? eh->host_source(src, e, b - 1, n) : nullptr;
+                const uint8_t * from = res ? (const uint8_t *) res : (const uint8_t *) src->data + e*expert_size;
+                ggml_backend_tensor_set_async(backend, dst, from, e*expert_size, n*expert_size + (e + n == b ? pad : 0));
+                e += n;
+            }
+        };
+
         int64_t next = first;
         for (int64_t e = first; e <= last && eh; ) {
             const int64_t n = eh->copy_experts(backend, src, dst, e, last);
@@ -3123,19 +3146,15 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                 continue;
             }
             if (next < e) {
-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                upload(next, e, 0);
             }
             e   += n;
             next = e;
         }
 
         // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
-        const size_t offset  = next*expert_size;
         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
-        const size_t size    = (last + 1 - next)*expert_size + padding;
-        if (size > 0) {
-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
-        }
+        upload(next, last + 1, padding);
 
         first = last + 1;
     }
@@ -4317,6 +4336,8 @@ llama_context_params llama_context_default_params() {
         /*.adapt_every                 =*/ 4,
         /*.adapt_swaps                 =*/ 96,
         /*.adapt_decay                 =*/ 0.7f,
+        /*.resident_budget_gib         =*/ 0.0f,
+        /*.ram_keep_gib                =*/ 4.0f,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

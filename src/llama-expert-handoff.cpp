@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <condition_variable>
@@ -23,7 +25,118 @@
 #include <tuple>
 #include <unordered_map>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 namespace {
+
+// [TAG_EH_RESIDENT] host memory for the resident copy: committed, zeroed, page aligned
+void * eh_ram_alloc(size_t size) {
+#if defined(_WIN32)
+    return VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void * p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? nullptr : p;
+#endif
+}
+
+void eh_ram_free(void * p, size_t size, size_t locked) {
+    if (p == nullptr) {
+        return;
+    }
+#if defined(_WIN32)
+    if (locked > 0) {
+        VirtualUnlock(p, locked);
+    }
+    GGML_UNUSED(size);
+    VirtualFree(p, 0, MEM_RELEASE);
+#else
+    if (locked > 0) {
+        munlock(p, locked);
+    }
+    munmap(p, size);
+#endif
+}
+
+// the RAM the copy may take: physical memory available (on Windows: free and standby pages, bounded by the commit
+// charge left)
+bool eh_available_ram(uint64_t & avail) {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms = {};
+    ms.dwLength = sizeof(ms);
+    if (!GlobalMemoryStatusEx(&ms)) {
+        return false;
+    }
+    avail = std::min<uint64_t>(ms.ullAvailPhys, ms.ullAvailPageFile);
+    return true;
+#else
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (f == nullptr) {
+        return false;
+    }
+    char line[256];
+    bool ok = false;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long long kb = 0;
+        if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+            avail = (uint64_t) kb*1024;
+            ok = true;
+            break;
+        }
+    }
+    fclose(f);
+    return ok;
+#endif
+}
+
+// lock [p, p + size) in RAM so the memory manager never trims it (a trimmed page faults back in on the host's next
+// read: what makes the mapped model file slow under memory pressure); returns the bytes locked from p on
+size_t eh_ram_lock(void * p, size_t size, std::string & note) {
+#if defined(_WIN32)
+    HANDLE self = GetCurrentProcess();
+    SIZE_T min_ws = 0, max_ws = 0;
+    DWORD flags = 0;
+    if (!GetProcessWorkingSetSizeEx(self, &min_ws, &max_ws, &flags)) {
+        note = "GetProcessWorkingSetSizeEx failed (" + std::to_string(GetLastError()) + ")";
+        return 0;
+    }
+    // locked pages count against the minimum working set: raise it by the copy and a margin (soft limits)
+    const SIZE_T margin  = (SIZE_T) 512 << 20;
+    const SIZE_T new_min = min_ws + (SIZE_T) size + margin;
+    const SIZE_T new_max = std::max<SIZE_T>(max_ws, new_min + margin);
+    if (!SetProcessWorkingSetSizeEx(self, new_min, new_max, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
+        note = "SetProcessWorkingSetSizeEx failed (" + std::to_string(GetLastError()) + ")";
+        return 0;
+    }
+    const size_t chunk = (size_t) 1 << 30;
+    size_t done = 0;
+    while (done < size) {
+        const size_t n = std::min(chunk, size - done);
+        if (!VirtualLock((uint8_t *) p + done, n)) {
+            note = "VirtualLock stopped at " + std::to_string(done >> 20) + " MiB (" + std::to_string(GetLastError()) + ")";
+            return done;
+        }
+        done += n;
+    }
+    return done;
+#else
+    if (mlock(p, size) != 0) {
+        note = std::string("mlock failed: ") + strerror(errno);
+        return 0;
+    }
+    return size;
+#endif
+}
 
 // the host pool, through the CPU backend's proc addresses (the CPU backend may be a dynamically loaded library)
 struct eh_host_api {
@@ -159,6 +272,10 @@ struct llama_expert_handoff::impl {
         mutable int32_t state = 0;                  // 0 = not yet, 1 = ok, -1 = the host cannot compute it
         mutable llama_expert_handoff_form form;
         mutable std::vector<float> gate_s, up_s, down_s;
+        // [TAG_EH_RESIDENT] [ip][e]: where the resident copy holds expert e of experts[ip], NULL if it does not (the
+        // weights only; empty for the biases and without a copy)
+        // adapt() moves slots between experts (the vectors keep their size: the host pool holds their data())
+        mutable std::vector<std::vector<const void *>> res;
     };
 
     struct binding {
@@ -199,6 +316,11 @@ struct llama_expert_handoff::impl {
     // routing counts loaded from the profile [il][e]
     std::vector<std::vector<uint64_t>> profile_counts;
 
+    // [TAG_EH_RESIDENT] the resident RAM copy
+    void * res_mem    = nullptr;
+    size_t res_size   = 0;
+    size_t res_locked = 0;
+
     mutable std::mutex mtx;
 
     // batches of up to n_small tokens are always split; larger ones (prompts) where the host's estimated time beats
@@ -218,6 +340,20 @@ struct llama_expert_handoff::impl {
     mutable std::vector<float>   usage;           // [il*counts_stride + e]
     mutable std::vector<int32_t> counts_seen;     // the device counts at the last round
     mutable std::vector<swap>    in_flight;       // evicted, copying (the helper reads the list while busy)
+    // [TAG_EH_RESIDENT] the adaptive resident copy: a swap gives the RAM slots of an expert (one per weight tensor)
+    // to another of the same group, which the helper copies in from the tensor
+    struct ram_swap {
+        int32_t il;                     // the expert copied in
+        int32_t in;
+        std::vector<const void *> ptr;  // its slots, per weight tensor (NULL for the biases)
+    };
+    mutable std::vector<ram_swap> ram_in_flight;
+    // the copy's own usage counts: the same routing counts with a slower decay (ram_decay per round). The cache's
+    // decay (0.7 every 4 graphs) remembers a dozen tokens, about 10 routings per layer each, so nearly every expert of
+    // the copy looked unused and the rounds traded it for whatever the last tokens had used twice
+    mutable std::vector<float> ram_usage;
+    static constexpr float ram_decay = 0.97f;
+    mutable uint64_t n_ram_swaps = 0, n_ram_swaps_reported = 0;
     mutable std::thread          helper;
     mutable std::mutex           helper_mtx;
     mutable std::condition_variable helper_cv;
@@ -450,6 +586,11 @@ struct llama_expert_handoff::impl {
             }
             mailbox_mapped = true;
             host = api.host_new(mailbox, dims.max_tokens, dims.max_embd, dims.max_used, (int32_t) model.layers.size(), n_workers);
+            // [TAG_EH_RESIDENT] after the mailbox: on Windows the first pinned allocation after locking the copy took
+            // as long as pinning all of it (Flash-Next, 15 GiB locked: 116 s for the mailbox's hipHostMalloc)
+            if (params.resident_budget_gib != 0.0f) {
+                make_resident();
+            }
         }
 
         // WARN so the server log shows the split (its default verbosity drops libllama INFO) [TAG_EH_TIMEOUT_DIAG]
@@ -519,6 +660,8 @@ struct llama_expert_handoff::impl {
         if (mailbox && mailbox_mapped) {
             mapped_free(mailbox);
         }
+        // after the pool, which reads it
+        eh_ram_free(res_mem, res_size, res_locked);
     }
 
     // the cache content: the most routed experts of each group by the profile, else the first experts of each layer
@@ -592,6 +735,228 @@ struct llama_expert_handoff::impl {
                 ggml_backend_tensor_set(layers[il].slot_map, layers[il].slots.data(), 0, layers[il].slots.size()*sizeof(int32_t));
             }
         }
+    }
+
+    // [TAG_EH_RESIDENT] the resident RAM copy: the experts the VRAM cache misses, hottest first by the profile (the
+    // fill's ranking: counts, then the rank within the layer), as many as the budget and the available RAM allow,
+    // copied into one locked allocation. The host pool reads them there and the prompt uploads send them from there;
+    // the others stay on the mapped file. On a box whose RAM cannot hold every expert the cache misses, the mapping
+    // pages them in and out (the prompt uploads read all of them each ubatch), and even pages still cached cost a
+    // soft fault per 4 KiB once the memory manager trims them from the working set: the host then takes ~5x its
+    // in-RAM time per expert (Flash-Next Q2_0 on 32 GB, 2026-11-07: 175 vs 35 us).
+    void make_resident() {
+        const double gib = 1024.0*1024.0*1024.0;
+#if defined(_WIN32)
+        // the fill read the cached experts through the mapping, and Windows counts those file pages in this
+        // process's working set, not as available: trimmed, they move to the standby list (still cached)
+        SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T) -1, (SIZE_T) -1);
+#endif
+        uint64_t avail = 0;
+        if (!eh_available_ram(avail)) {
+            LLAMA_LOG_WARN("%s: cannot read the available RAM, no resident copy\n", __func__);
+            return;
+        }
+        const uint64_t keep   = (uint64_t) (std::max(0.0f, params.ram_keep_gib)*gib) + ((uint64_t) 256 << 20);
+        const uint64_t room   = avail > keep ? avail - keep : 0;
+        const uint64_t budget = params.resident_budget_gib > 0.0f ? std::min<uint64_t>(room, (uint64_t) (params.resident_budget_gib*gib)) : room;
+
+        // the weights of one expert of layer il (the biases are small and stay where they are)
+        auto weights = [&](int32_t il) {
+            size_t b = 0;
+            for (const ggml_tensor * t : layers[il].experts) {
+                b += ggml_n_dims(t) >= 3 ? eh_expert_stride(t) : 0;
+            }
+            return b;
+        };
+
+        // the candidates: what the cache misses, outside the MTP draft layers (cached whole)
+        std::vector<std::tuple<uint64_t, int32_t, int32_t, int32_t>> rank; // count, rank in layer, il, e
+        uint64_t missed_bytes = 0;
+        int64_t  n_missed     = 0;
+        for (int32_t il = 0; il < il_nextn && il < (int32_t) layers.size(); ++il) {
+            const layer & l = layers[il];
+            if (l.ig < 0) {
+                continue;
+            }
+            const group & g = groups[l.ig];
+            static const std::vector<uint64_t> none;
+            const auto & c = (size_t) il < profile_counts.size() ? profile_counts[il] : none;
+            auto cnt = [&](int32_t e) { return e < (int32_t) c.size() ? c[e] : (uint64_t) 0; };
+            std::vector<int32_t> order(g.n_expert);
+            for (int32_t e = 0; e < g.n_expert; ++e) {
+                order[e] = e;
+            }
+            std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return cnt(a) > cnt(b); });
+            for (int32_t r = 0; r < g.n_expert; ++r) {
+                const int32_t e = order[r];
+                if (l.slots[e] >= g.n_slots) {
+                    rank.emplace_back(cnt(e), r, il, e);
+                    missed_bytes += weights(il);
+                    n_missed++;
+                }
+            }
+        }
+        std::stable_sort(rank.begin(), rank.end(), [](const auto & a, const auto & b) {
+            return std::get<0>(a) != std::get<0>(b) ? std::get<0>(a) > std::get<0>(b) : std::get<1>(a) < std::get<1>(b);
+        });
+        std::vector<std::pair<int32_t, int32_t>> chosen; // (il, e)
+        uint64_t at = 0;
+        for (const auto & r : rank) {
+            const size_t b = weights(std::get<2>(r));
+            if (at + b > budget) {
+                continue;
+            }
+            at += b;
+            chosen.emplace_back(std::get<2>(r), std::get<3>(r));
+        }
+        if (chosen.empty()) {
+            LLAMA_LOG_WARN("%s: no room for a resident copy (%.2f GiB available, %.2f GiB kept)\n", __func__, avail/gib, keep/gib);
+            return;
+        }
+        std::sort(chosen.begin(), chosen.end());
+
+        // the layout: per layer and weight tensor, its chosen experts in order (consecutive experts upload as one
+        // run), each block page aligned and followed by zeros the prompt uploads may read as an expert's padding
+        struct piece { size_t off; const uint8_t * src; size_t bytes; };
+        std::vector<piece> pieces;
+        std::vector<std::tuple<int32_t, size_t, int32_t, size_t>> where; // il, ip, e, offset
+        size_t off = 0;
+        const size_t align = 4096, slack = 4096;
+        const size_t piece_max = (size_t) 16 << 20;
+        for (size_t i = 0; i < chosen.size(); ) {
+            const int32_t il = chosen[i].first;
+            size_t j = i;
+            while (j < chosen.size() && chosen[j].first == il) {
+                j++;
+            }
+            const layer & l = layers[il];
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                const ggml_tensor * t = l.experts[ip];
+                if (ggml_n_dims(t) < 3) {
+                    continue;
+                }
+                const size_t es = eh_expert_stride(t);
+                off = (off + align - 1) & ~(align - 1);
+                for (size_t k = i; k < j; ) {
+                    // a run of consecutive experts: one copy (cut in pieces for the threads)
+                    size_t n = 1;
+                    while (k + n < j && chosen[k + n].second == chosen[k].second + (int32_t) n) {
+                        n++;
+                    }
+                    const uint8_t * src = (const uint8_t *) t->data + (size_t) chosen[k].second*es;
+                    for (size_t done = 0; done < n*es; done += piece_max) {
+                        pieces.push_back({ off + (k - i)*es + done, src + done, std::min(piece_max, n*es - done) });
+                    }
+                    for (size_t q = 0; q < n; ++q) {
+                        where.emplace_back(il, ip, chosen[k + q].second, off + (k - i + q)*es);
+                    }
+                    k += n;
+                }
+                off += (j - i)*es + slack;
+            }
+            i = j;
+        }
+        const size_t total = (off + align - 1) & ~(align - 1);
+
+        void * mem = eh_ram_alloc(total);
+        if (mem == nullptr) {
+            LLAMA_LOG_WARN("%s: cannot allocate %.2f GiB for the resident copy\n", __func__, total/gib);
+            return;
+        }
+        // locked before the copy, so the pages are committed once and the memory manager never trims them (a pageable
+        // copy was trimmed and faulted back in: Flash-Next decode 12-36 instead of 22-42 t/s). The price on Windows: the
+        // GPU driver's next pinned allocation stalls for ~1 s per 150-400 MiB locked (15-17 GiB: 43-93 s, once, in the
+        // warmup). ROCMFPX_EH_RES_LOCK=0 keeps the copy pageable.
+        std::string note = "pageable";
+        const char * lock_env = getenv("ROCMFPX_EH_RES_LOCK");
+        const size_t locked = lock_env == nullptr || atoi(lock_env) != 0 ? eh_ram_lock(mem, total, note) : 0;
+
+        const int64_t t0 = ggml_time_us();
+        {
+            // several readers, so the mapped file pages in from disk in parallel
+            const int n_threads = std::max(1, std::min(8, (int) std::thread::hardware_concurrency()/2));
+            std::atomic<size_t> next{0};
+            std::vector<std::thread> th;
+            for (int i = 0; i < n_threads; ++i) {
+                th.emplace_back([&] {
+                    for (size_t k; (k = next.fetch_add(1)) < pieces.size(); ) {
+                        memcpy((uint8_t *) mem + pieces[k].off, pieces[k].src, pieces[k].bytes);
+                    }
+                });
+            }
+            for (auto & t : th) {
+                t.join();
+            }
+        }
+        const double secs = (ggml_time_us() - t0)*1e-6;
+
+        // a slot array per weight tensor in every layer (adapt() may give any of them slots), then the copy's slots
+        for (int32_t il = 0; il < il_nextn && il < (int32_t) layers.size(); ++il) {
+            layer & l = layers[il];
+            if (l.ig < 0) {
+                continue;
+            }
+            l.res.assign(l.experts.size(), {});
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                if (ggml_n_dims(l.experts[ip]) >= 3) {
+                    l.res[ip].assign(groups[l.ig].n_expert, nullptr);
+                }
+            }
+        }
+        for (const auto & [il, ip, e, o] : where) {
+            layers[il].res[ip][e] = (const uint8_t *) mem + o;
+        }
+        res_mem    = mem;
+        res_size   = total;
+        res_locked = locked;
+
+        const std::string how = locked == total ? std::string("locked") : locked == 0 && note == "pageable" ? note : "not locked: " + note;
+        LLAMA_LOG_WARN("%s: resident RAM copy: %zu of the %" PRId64 " experts the VRAM cache misses (%.2f of %.2f GiB), %s; "
+            "%.2f GiB of RAM were available, %.2f GiB kept; copied in %.1f s (%.2f GB/s)\n", __func__,
+            chosen.size(), n_missed, at/gib, missed_bytes/gib, how.c_str(), avail/gib, keep/gib, secs,
+            secs > 0.0 ? at/secs/1e9 : 0.0);
+    }
+
+    // the resident copy of expert e of experts[ip] of layer il, or NULL
+    const void * resident(int32_t il, size_t ip, int64_t e) const {
+        const layer & l = layers[il];
+        return ip < l.res.size() && !l.res[ip].empty() ? l.res[ip][e] : nullptr;
+    }
+
+    const void * const * resident_of(int32_t il, const ggml_tensor * t) const {
+        const layer & l = layers[il];
+        for (size_t ip = 0; ip < l.experts.size() && t != nullptr; ++ip) {
+            if (l.experts[ip] == t) {
+                return ip < l.res.size() && !l.res[ip].empty() ? l.res[ip].data() : nullptr;
+            }
+        }
+        return nullptr;
+    }
+
+    const void * host_source(const ggml_tensor * w, int64_t e, int64_t last, int64_t & n) const {
+        n = last - e + 1;
+        const auto it = bindings.find(w);
+        if (it == bindings.end()) {
+            return nullptr;
+        }
+        const layer & l = layers[it->second.il];
+        const size_t ip = (size_t) it->second.ip;
+        if (ip >= l.res.size() || l.res[ip].empty()) {
+            return nullptr;
+        }
+        const auto & r  = l.res[ip];
+        const size_t es = eh_expert_stride(w);
+        n = 1;
+        if (r[e] == nullptr) {
+            while (e + n <= last && r[e + n] == nullptr) {
+                n++;
+            }
+            return nullptr;
+        }
+        while (e + n <= last && r[e + n] == (const uint8_t *) r[e] + n*es) {
+            n++;
+        }
+        return r[e];
     }
 
     // profile: one line per layer, "layer <il> <n_expert> <count> ...", after a header line
@@ -718,6 +1083,11 @@ struct llama_expert_handoff::impl {
                 hl.weight_before = form.weight_before;
                 hl.n_used        = form.n_used;
                 hl.miss_slot     = groups[l.ig].n_slots;
+                // [TAG_EH_RESIDENT]
+                hl.gate_src      = resident_of(il, ml.ffn_gate_exps);
+                hl.up_src        = resident_of(il, ml.ffn_up_exps);
+                hl.gate_up_src   = resident_of(il, ml.ffn_gate_up_exps);
+                hl.down_src      = resident_of(il, ml.ffn_down_exps);
                 ok = api.set_layer(host, il, &hl);
             }
             l.state = ok ? 1 : -1;
@@ -807,7 +1177,19 @@ struct llama_expert_handoff::impl {
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     const ggml_tensor * w = l.experts[ip];
                     const size_t es = eh_expert_stride(w);
-                    ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) w->data + (size_t) s.in*es, (size_t) s.slot*es, es);
+                    const void * r = resident(s.il, ip, s.in); // [TAG_EH_RESIDENT]
+                    ggml_backend_tensor_set(g.banks[ip], r ? r : (const uint8_t *) w->data + (size_t) s.in*es, (size_t) s.slot*es, es);
+                }
+            }
+            // [TAG_EH_RESIDENT] into the resident copy: slots nothing reads until adapt() admits them
+            for (const ram_swap & s : ram_in_flight) {
+                const layer & l = layers[s.il];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    if (s.ptr[ip] != nullptr) {
+                        const ggml_tensor * w = l.experts[ip];
+                        const size_t es = eh_expert_stride(w);
+                        memcpy((uint8_t *) res_mem + ((const uint8_t *) s.ptr[ip] - (const uint8_t *) res_mem), (const uint8_t *) w->data + (size_t) s.in*es, es);
+                    }
                 }
             }
             helper_busy.store(false, std::memory_order_release);
@@ -837,10 +1219,21 @@ struct llama_expert_handoff::impl {
         n_rounds++;
 
         // the last round's copies have landed: they serve from the next graph on
-        if (!in_flight.empty()) {
+        if (!in_flight.empty() || !ram_in_flight.empty()) {
             if (helper_busy.load(std::memory_order_acquire)) {
                 return;
             }
+            // [TAG_EH_RESIDENT] the host pool reads the slot arrays only while it answers a graph's layers
+            for (const ram_swap & s : ram_in_flight) {
+                const layer & l = layers[s.il];
+                for (size_t ip = 0; ip < l.res.size(); ++ip) {
+                    if (s.ptr[ip] != nullptr) {
+                        l.res[ip][s.in] = s.ptr[ip];
+                    }
+                }
+            }
+            n_ram_swaps += ram_in_flight.size();
+            ram_in_flight.clear();
             std::lock_guard<std::mutex> lk(mtx);
             std::vector<int32_t> touched;
             for (const swap & s : in_flight) {
@@ -861,10 +1254,13 @@ struct llama_expert_handoff::impl {
         }
         if (usage.empty()) {
             usage.assign(dc.size(), 0.0f);
+            ram_usage.assign(dc.size(), 0.0f);
             counts_seen.assign(dc.size(), 0);
         }
         for (size_t i = 0; i < dc.size(); ++i) {
-            usage[i] += (float) (uint32_t) (dc[i] - counts_seen[i]);
+            const float d = (float) (uint32_t) (dc[i] - counts_seen[i]);
+            usage[i]     += d;
+            ram_usage[i] += d;
             counts_seen[i] = dc[i];
         }
 
@@ -900,10 +1296,74 @@ struct llama_expert_handoff::impl {
                 swaps.push_back({ miss[i].first - held[i].first, il, miss[i].second, held[i].second });
             }
         }
+        // [TAG_EH_RESIDENT] the resident copy, per group (its experts share a size): the most used experts the host
+        // reads from the tensor take the slots of the least used ones in the copy, and first those of experts the
+        // VRAM cache holds by now (the host never reads them)
+        std::vector<std::tuple<float, int32_t, int32_t, int32_t, int32_t>> ram_swaps; // gain, il in, in, il out, out
+        if (res_mem != nullptr) {
+            auto in_ram = [&](const layer & l, int32_t e) {
+                for (const auto & r : l.res) {
+                    if (!r.empty()) {
+                        return r[e] != nullptr;
+                    }
+                }
+                return false;
+            };
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                const group & g = groups[ig];
+                std::vector<std::tuple<float, int32_t, int32_t>> rin, rout; // usage, il, e
+                for (int32_t il : g.layers) {
+                    const layer & l = layers[il];
+                    if (il >= il_nextn || l.state != 1 || l.res.empty()) {
+                        continue;
+                    }
+                    const float * u = ram_usage.data() + (size_t) il*counts_stride;
+                    for (int32_t e = 0; e < g.n_expert; ++e) {
+                        const bool vram = l.slots[e] < g.n_slots;
+                        if (in_ram(l, e)) {
+                            rout.emplace_back(vram ? -1.0f : u[e], il, e);
+                        } else if (!vram && u[e] >= 2.0f) {
+                            rin.emplace_back(u[e], il, e);
+                        }
+                    }
+                }
+                const size_t n = std::min({ rin.size(), rout.size(), (size_t) params.adapt_swaps });
+                std::partial_sort(rin.begin(),  rin.begin()  + n, rin.end(),  [](const auto & a, const auto & b) { return std::get<0>(a) > std::get<0>(b); });
+                std::partial_sort(rout.begin(), rout.begin() + n, rout.end(), [](const auto & a, const auto & b) { return std::get<0>(a) < std::get<0>(b); });
+                for (size_t i = 0; i < n && std::get<0>(rin[i]) >= std::get<0>(rout[i]) + min_gain; ++i) {
+                    ram_swaps.emplace_back(std::get<0>(rin[i]) - std::get<0>(rout[i]), std::get<1>(rin[i]), std::get<2>(rin[i]),
+                                           std::get<1>(rout[i]), std::get<2>(rout[i]));
+                }
+            }
+            std::sort(ram_swaps.begin(), ram_swaps.end(), [](const auto & a, const auto & b) { return std::get<0>(a) > std::get<0>(b); });
+            if ((int32_t) ram_swaps.size() > params.adapt_swaps) {
+                ram_swaps.resize(params.adapt_swaps);
+            }
+            // evict: the host pool reads the tensor for those experts from the next graph on, and the helper fills
+            // their slots for the experts coming in
+            for (const auto & [gain, il_in, e_in, il_out, e_out] : ram_swaps) {
+                const layer & lo = layers[il_out];
+                ram_swap s;
+                s.il = il_in;
+                s.in = e_in;
+                s.ptr.assign(lo.res.size(), nullptr);
+                for (size_t ip = 0; ip < lo.res.size(); ++ip) {
+                    if (!lo.res[ip].empty()) {
+                        s.ptr[ip] = lo.res[ip][e_out];
+                        lo.res[ip][e_out] = nullptr;
+                    }
+                }
+                ram_in_flight.push_back(std::move(s));
+            }
+        }
+
         for (float & v : usage) {
             v *= params.adapt_decay;
         }
-        if (swaps.empty()) {
+        for (float & v : ram_usage) {
+            v *= ram_decay;
+        }
+        if (swaps.empty() && ram_swaps.empty()) {
             return;
         }
         std::sort(swaps.begin(), swaps.end(), [](const cand & a, const cand & b) { return a.gain > b.gain; });
@@ -912,7 +1372,7 @@ struct llama_expert_handoff::impl {
         }
 
         // evict: the victims go to the miss slot in the maps; the graphs queued before may still read their slots
-        {
+        if (!swaps.empty()) {
             std::lock_guard<std::mutex> lk(mtx);
             std::vector<int32_t> touched;
             for (const cand & c : swaps) {
@@ -986,8 +1446,29 @@ struct llama_expert_handoff::impl {
                     "(%" PRIu64 " of them multi-token, %.0f us each), %" PRIu64 " experts swapped in\n",
                     __func__, d_routed, 100.0*(1.0 - (double) d_host/d_routed), d_layers, d_layers ? d_busy/1000.0/d_layers : 0.0,
                     d_multi, d_multi ? (st.busy_ns_multi - last.busy_ns_multi)/1000.0/d_multi : 0.0, n_swaps - n_swaps_reported);
+                if (res_mem != nullptr) {
+                    LLAMA_LOG_WARN("%s: %" PRIu64 " experts swapped into the resident RAM copy\n", __func__, n_ram_swaps - n_ram_swaps_reported);
+                }
+                // [TAG_EH_LOCAL_SUM] where the host's time goes, per layer it computed
+                if (d_layers > 0) {
+                    double sp[5];
+                    for (int k = 0; k < 5; ++k) {
+                        sp[k] = (st.step_ns[k] - last.step_ns[k])/1000.0/d_layers;
+                    }
+                    const uint64_t d_copy = st.n_read_copy - last.n_read_copy;
+                    const uint64_t d_tens = st.n_read_tensor - last.n_read_tensor;
+                    LLAMA_LOG_WARN("%s: host steps per layer: send %.0f, inputs %.0f, gate/up %.0f, activation %.0f, down %.0f us; "
+                        "%.2f missed experts per layer, %.1f%% of the distinct ones read from the resident copy\n", __func__,
+                        sp[0], sp[1], sp[2], sp[3], sp[4], (double) d_host/d_layers,
+                        d_copy + d_tens ? 100.0*d_copy/(d_copy + d_tens) : 0.0);
+                    const uint64_t d_ngap = st.n_gap - last.n_gap;
+                    LLAMA_LOG_WARN("%s: host gather %.0f us per layer; the device's time from an answer to its next send %.0f us\n",
+                        __func__, (st.gather_ns - last.gather_ns)/1000.0/d_layers,
+                        d_ngap ? (st.gap_ns - last.gap_ns)/1000.0/d_ngap : 0.0);
+                }
             }
             n_swaps_reported = n_swaps;
+            n_ram_swaps_reported = n_ram_swaps;
             // the estimates of host_sooner(): the share of routed experts the host computed, its bytes per second
             if (n_routed > 10000) {
                 est_miss = (double) st.n_host/n_routed;
@@ -1046,6 +1527,10 @@ ggml_expert_handoff_params llama_expert_handoff::params(int32_t il) const {
 
 int64_t llama_expert_handoff::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) const {
     return pimpl->copy_experts(backend, w, dst, e, last);
+}
+
+const void * llama_expert_handoff::host_source(const ggml_tensor * w, int64_t e, int64_t last, int64_t & n) const {
+    return pimpl->host_source(w, e, last, n);
 }
 
 void llama_expert_handoff::wake() const {

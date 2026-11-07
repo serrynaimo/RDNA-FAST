@@ -70,6 +70,8 @@ struct llama_cparams {
     int32_t     adapt_every;
     int32_t     adapt_swaps;
     float       adapt_decay;
+    float       resident_budget_gib; // [TAG_EH_RESIDENT]
+    float       ram_keep_gib;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

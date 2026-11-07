@@ -3,11 +3,15 @@
 //  - ggml_expert_handoff_host_*: the pool of threads that answers a mailbox by computing the routed experts the
 //    device does not hold, in place from host memory, while the device computes the ones it holds
 
+#define GGML_COMMON_DECL_CPP
+#include "ggml-common.h"
+
 #include "ggml-cpu.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-expert-handoff.h"
 #include "ggml-impl.h"
 #include "ops.h"
+#include "simd-mappings.h"
 
 #include <algorithm>
 #include <atomic>
@@ -193,6 +197,76 @@ struct eh_barrier {
     }
 };
 
+// [TAG_EH_MULTI_DOT] one weight row against the rows of several tokens (the tokens of a batch that miss the same
+// expert): the generic path calls vec_dot per token; Q2_0 with AVX-512 VBMI/VNNI unpacks each weight block once for
+// all of them (an MTP verify window or a short prompt, where the host computed each token's dot from scratch)
+constexpr int eh_multi_max = 8;
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+#define EH_Q2_0_MULTI 1
+// the same steps as ggml_vec_dot_q2_0_q8_0's AVX-512 block (arch/x86/quants.c), with the unpacked weights reused
+template <int NY>
+void eh_q2_0_dot_n(int n, const uint8_t * vx, const uint8_t * const * vy, float * s) {
+    static const uint8_t lane_bytes[64] = {
+         0,  1,  1,  1,  1,  1,  1,  1,   2,  3,  3,  3,  3,  3,  3,  3,
+         4,  5,  5,  5,  5,  5,  5,  5,   6,  7,  7,  7,  7,  7,  7,  7,
+         8,  9,  9,  9,  9,  9,  9,  9,  10, 11, 11, 11, 11, 11, 11, 11,
+        12, 13, 13, 13, 13, 13, 13, 13,  14, 15, 15, 15, 15, 15, 15, 15,
+    };
+    const block_q2_0 * x = (const block_q2_0 *) vx;
+    const int nb = n / QK2_0;
+    const __m512i idx   = _mm512_loadu_si512((const void *) lane_bytes);
+    const __m512i ctl   = _mm512_set1_epi64(0x0E0C0A0806040200LL);
+    const __m512i three = _mm512_set1_epi8(3);
+    const __m512i ones  = _mm512_set1_epi8(1);
+    const __m512i zero  = _mm512_setzero_si512();
+    __m512 acc[NY];
+    for (int k = 0; k < NY; ++k) {
+        acc[k] = _mm512_setzero_ps();
+    }
+    for (int i = 0; i < nb; ++i) {
+        const __m512i q  = _mm512_permutexvar_epi8(idx, _mm512_castsi128_si512(_mm_loadu_si128((const __m128i *) x[i].qs)));
+        const __m512i v  = _mm512_and_si512(_mm512_multishift_epi64_epi8(ctl, q), three);
+        const float   dx = GGML_CPU_FP16_TO_FP32(x[i].d);
+        for (int k = 0; k < NY; ++k) {
+            const block_q8_0 * y = (const block_q8_0 *) vy[k] + 2*i;
+            const __m512i yy = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) y[0].qs)),
+                                                  _mm256_loadu_si256((const __m256i *) y[1].qs), 1);
+            const __m512i p  = _mm512_sub_epi32(_mm512_dpbusd_epi32(zero, v, yy), _mm512_dpbusd_epi32(zero, ones, yy));
+            const __m512  d  = _mm512_mask_blend_ps((__mmask16) 0xFF00, _mm512_set1_ps(dx*GGML_CPU_FP16_TO_FP32(y[0].d)),
+                                                                        _mm512_set1_ps(dx*GGML_CPU_FP16_TO_FP32(y[1].d)));
+            acc[k] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(p), d, acc[k]);
+        }
+    }
+    for (int k = 0; k < NY; ++k) {
+        s[k] = _mm512_reduce_add_ps(acc[k]);
+    }
+}
+#endif
+
+// s[k] = row . ys[k] for k < ny (ny <= eh_multi_max), the row of type t, the ys of its vec_dot type
+void eh_dot_n(ggml_type t, const ggml_type_traits_cpu * tr, int n, const uint8_t * row, const uint8_t * const * ys, int ny, float * s) {
+#if defined(EH_Q2_0_MULTI)
+    if (t == GGML_TYPE_Q2_0 && tr->vec_dot_type == GGML_TYPE_Q8_0 && ny > 1) {
+        switch (ny) {
+            case 2: eh_q2_0_dot_n<2>(n, row, ys, s); return;
+            case 3: eh_q2_0_dot_n<3>(n, row, ys, s); return;
+            case 4: eh_q2_0_dot_n<4>(n, row, ys, s); return;
+            case 5: eh_q2_0_dot_n<5>(n, row, ys, s); return;
+            case 6: eh_q2_0_dot_n<6>(n, row, ys, s); return;
+            case 7: eh_q2_0_dot_n<7>(n, row, ys, s); return;
+            case 8: eh_q2_0_dot_n<8>(n, row, ys, s); return;
+            default: break;
+        }
+    }
+#else
+    GGML_UNUSED(t);
+#endif
+    for (int k = 0; k < ny; ++k) {
+        tr->vec_dot(n, s + k, 0, row, 0, ys[k], 0, 1);
+    }
+}
+
 struct eh_layer {
     bool    set = false;
     ggml_expert_handoff_layer l = {};
@@ -268,6 +342,11 @@ struct ggml_expert_handoff_host {
     std::vector<uint8_t> hq;               // [n_miss] rows of the down vec_dot type
     size_t hq_row = 0;
     std::vector<float>   hf;               // [n_workers][n_ff] f32 scratch for the activation
+    // [TAG_EH_LOCAL_SUM] [n_tokens][max_embd] the sum of the host's experts, in ordinary memory: the mailbox is mapped
+    // into the device (hipHostMallocCoherent), which Windows gives the CPU uncached, so adding each expert's output to
+    // it column by column read it back from RAM uncached every time (Flash-Next Q2_0, 2026-11-08: ~185 us per missed
+    // expert in the server against ~35 us in --bench); each worker copies its columns over once at the end
+    std::vector<float>   ysum;
 
     // stats
     std::atomic<uint64_t> st_layers{0};
@@ -285,8 +364,17 @@ struct ggml_expert_handoff_host {
     std::atomic<int32_t>  st_max_miss{0};
     std::atomic<int32_t>  st_max_uniq{0};
     std::atomic<uint64_t> st_max_step[4] = {};
+    std::atomic<uint64_t> st_step[5] = {}; // [TAG_EH_LOCAL_SUM]
+    std::atomic<uint64_t> st_gather{0};      // [TAG_EH_LOCAL_SUM]
+    std::atomic<uint64_t> st_gap{0};
+    std::atomic<uint64_t> st_n_gap{0};
+    std::atomic<int64_t>  t_first{0};        // when a worker first saw the job's send
+    int64_t t_prev_end = 0;                  // worker 0: when the last answer was stored
+    std::atomic<uint64_t> st_read_copy{0};   // [TAG_EH_RESIDENT]
+    std::atomic<uint64_t> st_read_tensor{0};
     int32_t job_il = -1;
     int64_t t_step[4] = {};      // worker 0: the end of each step of the job in run()
+    int64_t t_prep    = 0;       // worker 0: the end of prepare() [TAG_EH_LOCAL_SUM]
 
     void wake() {
         spin_until.store(eh_now_ns() + linger_ns, std::memory_order_release);
@@ -318,6 +406,8 @@ struct ggml_expert_handoff_host {
         for (;;) {
             s = eh_load(&hdr->seq_send);
             if (s != seen) {
+                int64_t z = 0;
+                t_first.compare_exchange_strong(z, eh_now_ns(), std::memory_order_relaxed);
                 return true;
             }
             if (stop.load(std::memory_order_acquire)) {
@@ -438,6 +528,17 @@ struct ggml_expert_handoff_host {
             }
         }
 
+        // [TAG_EH_RESIDENT] where the distinct missed experts are read from
+        {
+            const void * const * src = L.l.down_src;
+            uint64_t n_copy = 0;
+            for (const int32_t e : uniq) {
+                n_copy += src != nullptr && src[de(e)] != nullptr;
+            }
+            st_read_copy.fetch_add(n_copy, std::memory_order_relaxed);
+            st_read_tensor.fetch_add(uniq.size() - n_copy, std::memory_order_relaxed);
+        }
+
         st_layers.fetch_add(1, std::memory_order_relaxed);
         st_routed.fetch_add((uint64_t) n_tokens*n_used, std::memory_order_relaxed);
         st_host.fetch_add(misses.size(), std::memory_order_relaxed);
@@ -458,21 +559,33 @@ struct ggml_expert_handoff_host {
         if (hf.size() < (size_t) n_workers*J.n_ff) {
             hf.resize((size_t) n_workers*J.n_ff);
         }
+        if (ysum.size() < (size_t) n_tokens*dims.max_embd) {
+            ysum.resize((size_t) n_tokens*dims.max_embd);
+        }
+    }
+
+    // [TAG_EH_RESIDENT] where expert e of t starts: its copy if src has one, else in the tensor
+    const uint8_t * expert_base(const ggml_tensor * t, const void * const * src, int32_t e) const {
+        const int64_t ed = de(e);
+        if (src != nullptr && src[ed] != nullptr) {
+            return (const uint8_t *) src[ed];
+        }
+        return (const uint8_t *) t->data + ed*t->nb[2];
     }
 
     // gate/up row r (0 .. gu_rows - 1: gate rows first, or the up rows alone without a gate) of expert e
     const uint8_t * gu_row(const eh_layer & J, int32_t e, int64_t r) const {
-        const int64_t ed = de(e);
         if (J.l.gate_up) {
             const ggml_tensor * t = J.l.gate_up;
-            return (const uint8_t *) t->data + ed*t->nb[2] + r*t->nb[1];
+            return expert_base(t, J.l.gate_up_src, e) + r*t->nb[1];
         }
         if (!J.has_gate) {
             const ggml_tensor * t = J.l.up;
-            return (const uint8_t *) t->data + ed*t->nb[2] + r*t->nb[1];
+            return expert_base(t, J.l.up_src, e) + r*t->nb[1];
         }
-        const ggml_tensor * t = r < J.n_ff ? J.l.gate : J.l.up;
-        return (const uint8_t *) t->data + ed*t->nb[2] + (r % J.n_ff)*t->nb[1];
+        const bool g = r < J.n_ff;
+        const ggml_tensor * t = g ? J.l.gate : J.l.up;
+        return expert_base(t, g ? J.l.gate_src : J.l.up_src, e) + (r % J.n_ff)*t->nb[1];
     }
 
     float gu_scale(const eh_layer & J, int32_t e, int64_t r) const {
@@ -580,12 +693,19 @@ struct ggml_expert_handoff_host {
                 const uint8_t * row = gu_row(J, e, r);
                 const float sc = gu_scale(J, e, r);
                 const float bi = gu_bias(J, e, r);
-                for (int32_t k = uniq_begin[u]; k < uniq_begin[u + 1]; ++k) {
-                    const int32_t m = by_expert[k];
-                    const eh_miss & ms = misses[m];
-                    float s;
-                    tr_gu->vec_dot((int) n_embd, &s, 0, row, 0, xq.data() + ms.t*xq_row, 0, 1);
-                    gu[m*rows + r] = s*sc*(J.l.weight_before ? ms.w : 1.0f) + bi;
+                // [TAG_EH_MULTI_DOT] the tokens that miss this expert, up to eh_multi_max per call
+                for (int32_t k0 = uniq_begin[u]; k0 < uniq_begin[u + 1]; k0 += eh_multi_max) {
+                    const int nk = std::min<int>(eh_multi_max, uniq_begin[u + 1] - k0);
+                    const uint8_t * ys[eh_multi_max];
+                    float s[eh_multi_max];
+                    for (int j = 0; j < nk; ++j) {
+                        ys[j] = xq.data() + misses[by_expert[k0 + j]].t*xq_row;
+                    }
+                    eh_dot_n(J.type_gu, tr_gu, (int) n_embd, row, ys, nk, s);
+                    for (int j = 0; j < nk; ++j) {
+                        const int32_t m = by_expert[k0 + j];
+                        gu[m*rows + r] = s[j]*sc*(J.l.weight_before ? misses[m].w : 1.0f) + bi;
+                    }
                 }
             }
         }
@@ -613,30 +733,41 @@ struct ggml_expert_handoff_host {
         }
 
         // 4. down rows: each worker owns a range of output columns for every token (tokens without misses get
-        //    zeros); each missed expert's rows in that range are read once for all the tokens that miss it
+        //    zeros); each missed expert's rows in that range are read once for all the tokens that miss it. The
+        //    sums go to ysum, then into the mailbox in one pass [TAG_EH_LOCAL_SUM]
         {
             const ggml_tensor * dn = J.l.down;
             const int64_t c0 = n_embd*iw/n_workers;
             const int64_t c1 = n_embd*(iw + 1)/n_workers;
+            float * ys_ = ysum.data();
             for (int32_t t = 0; t < n_tokens; ++t) {
-                memset(y + (int64_t) t*dims.max_embd + c0, 0, (c1 - c0)*sizeof(float));
+                memset(ys_ + (int64_t) t*dims.max_embd + c0, 0, (c1 - c0)*sizeof(float));
             }
             for (size_t u = 0; u < uniq.size(); ++u) {
                 const int32_t e = uniq[u];
-                const uint8_t * base = (const uint8_t *) dn->data + de(e)*dn->nb[2];
+                const uint8_t * base = expert_base(dn, J.l.down_src, e);
                 const float sc = J.l.down_scale ? J.l.down_scale[e] : 1.0f;
                 const float * bias = J.l.down_bias ? J.l.down_bias + (int64_t) e*n_embd : nullptr;
                 for (int64_t c = c0; c < c1; ++c) {
                     const uint8_t * row = base + c*dn->nb[1];
-                    for (int32_t k = uniq_begin[u]; k < uniq_begin[u + 1]; ++k) {
-                        const int32_t m = by_expert[k];
-                        const eh_miss & ms = misses[m];
-                        float s;
-                        tr_down->vec_dot((int) n_ff, &s, 0, row, 0, hq.data() + m*hq_row, 0, 1);
-                        s = s*sc + (bias ? bias[c] : 0.0f);
-                        y[(int64_t) ms.t*dims.max_embd + c] += (J.l.weight_before ? 1.0f : ms.w)*s;
+                    for (int32_t k0 = uniq_begin[u]; k0 < uniq_begin[u + 1]; k0 += eh_multi_max) {
+                        const int nk = std::min<int>(eh_multi_max, uniq_begin[u + 1] - k0);
+                        const uint8_t * ys[eh_multi_max];
+                        float s[eh_multi_max];
+                        for (int j = 0; j < nk; ++j) {
+                            ys[j] = hq.data() + by_expert[k0 + j]*hq_row;
+                        }
+                        eh_dot_n(J.type_down, tr_down, (int) n_ff, row, ys, nk, s);
+                        for (int j = 0; j < nk; ++j) {
+                            const eh_miss & ms = misses[by_expert[k0 + j]];
+                            const float v = s[j]*sc + (bias ? bias[c] : 0.0f);
+                            ys_[(int64_t) ms.t*dims.max_embd + c] += (J.l.weight_before ? 1.0f : ms.w)*v;
+                        }
                     }
                 }
+            }
+            for (int32_t t = 0; t < n_tokens; ++t) {
+                memcpy(y + (int64_t) t*dims.max_embd + c0, ys_ + (int64_t) t*dims.max_embd + c0, (c1 - c0)*sizeof(float));
             }
         }
     }
@@ -661,6 +792,7 @@ struct ggml_expert_handoff_host {
             }
             if (iw == 0) {
                 prepare(eh_load(&hdr->seq_send));
+                t_prep = eh_now_ns(); // [TAG_EH_LOCAL_SUM]
             }
             barrier.wait();
             if (job_layer != nullptr && !misses.empty() && !sim_nohost) {
@@ -678,11 +810,29 @@ struct ggml_expert_handoff_host {
             barrier.wait();
             seen = seq;
             if (iw == 0) {
+                // [TAG_EH_LOCAL_SUM] before the answer: no worker looks for the next send until the device has it
+                const int64_t tf = t_first.exchange(0, std::memory_order_relaxed);
+                if (tf > 0) {
+                    st_gather.fetch_add((uint64_t) std::max<int64_t>(0, t_seen - tf), std::memory_order_relaxed);
+                    const int64_t gap = tf - t_prev_end;
+                    if (t_prev_end > 0 && gap >= 0 && gap < 5*1000*1000) {
+                        st_gap.fetch_add((uint64_t) gap, std::memory_order_relaxed);
+                        st_n_gap.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
                 eh_store(&hdr->seq_done, seq);
+                t_prev_end = eh_now_ns();
                 const int64_t t_end = eh_now_ns();
                 t_active.store(t_end, std::memory_order_relaxed);
                 st_busy_ns.fetch_add((uint64_t) (t_end - t_seen), std::memory_order_relaxed);
                 // [TAG_EH_TIMEOUT_DIAG]
+                if (job_layer != nullptr && !misses.empty() && !sim_nohost) {
+                    // [TAG_EH_LOCAL_SUM]
+                    const int64_t ts[6] = { t_seen, t_prep, t_step[0], t_step[1], t_step[2], t_end };
+                    for (int k = 0; k < 5; ++k) {
+                        st_step[k].fetch_add((uint64_t) std::max<int64_t>(0, ts[k + 1] - ts[k]), std::memory_order_relaxed);
+                    }
+                }
                 if (n_tokens > 1) {
                     st_multi.fetch_add(1, std::memory_order_relaxed);
                     st_busy_multi.fetch_add((uint64_t) (t_end - t_seen), std::memory_order_relaxed);
@@ -834,6 +984,14 @@ void ggml_expert_handoff_host_get_stats(ggml_expert_handoff_host_t h, ggml_exper
     for (int k = 0; k < 4; ++k) {
         st->max_step_ns[k] = h->st_max_step[k].load();
     }
+    for (int k = 0; k < 5; ++k) {
+        st->step_ns[k] = h->st_step[k].load();
+    }
+    st->gather_ns     = h->st_gather.load();
+    st->gap_ns        = h->st_gap.load();
+    st->n_gap         = h->st_n_gap.load();
+    st->n_read_copy   = h->st_read_copy.load();
+    st->n_read_tensor = h->st_read_tensor.load();
 }
 
 const uint64_t * ggml_expert_handoff_host_counts(ggml_expert_handoff_host_t h, int32_t il) {

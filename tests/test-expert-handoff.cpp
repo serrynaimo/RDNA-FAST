@@ -322,6 +322,27 @@ static bool run_case(ggml_backend_t be, ggml_backend_t cpu, const mailbox_alloc 
     if (dus) { ggml_backend_tensor_copy(hm.up_s,   dus); }
     if (dds) { ggml_backend_tensor_copy(hm.down_s, dds); }
 
+    // [TAG_EH_RESIDENT] the odd experts' weights come from copies (as from a resident RAM copy), and their bytes in the
+    // tensors are overwritten (0x7f: Inf/NaN scales): the host is right only if it reads the copies
+    std::vector<std::vector<uint8_t>>      copies;
+    std::vector<std::vector<const void *>> srcs;
+    copies.reserve(4);
+    srcs.reserve(4);
+    auto copy_src = [&](ggml_tensor * t) -> const void * const * {
+        if (t == nullptr) {
+            return nullptr;
+        }
+        const size_t es = t->nb[2];
+        copies.emplace_back((size_t) c.n_expert*es);
+        srcs.emplace_back(c.n_expert, nullptr);
+        for (int64_t e = 1; e < c.n_expert; e += 2) {
+            memcpy(copies.back().data() + e*es, (const uint8_t *) t->data + e*es, es);
+            memset((uint8_t *) t->data + e*es, 0x7f, es);
+            srcs.back()[e] = copies.back().data() + e*es;
+        }
+        return srcs.back().data();
+    };
+
     // the mailbox and the pool
     const ggml_expert_handoff_dims dims = { 32, (int32_t) c.n_embd, (int32_t) c.n_used };
     const size_t mb_size = ggml_expert_handoff_size(dims);
@@ -349,6 +370,10 @@ static bool run_case(ggml_backend_t be, ggml_backend_t cpu, const mailbox_alloc 
     hl.weight_before = c.weight_before;
     hl.n_used = (int32_t) c.n_count;
     hl.miss_slot = (int32_t) c.n_slots;
+    hl.gate_src    = copy_src(hm.gate);
+    hl.up_src      = copy_src(hm.up);
+    hl.gate_up_src = copy_src(hm.gate_up);
+    hl.down_src    = copy_src(hm.down);
     if (!ggml_expert_handoff_host_set_layer(host, 0, &hl)) {
         fprintf(stderr, "  the pool rejected the layer\n");
         ggml_expert_handoff_host_free(host);

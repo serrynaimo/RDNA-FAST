@@ -33,6 +33,10 @@ struct llama_expert_handoff_params {
     int32_t     adapt_every      =  4; // the adaptive cache: a round every N decode graphs, 0 = off
     int32_t     adapt_swaps      = 96; // most swaps per round
     float       adapt_decay      = 0.7f; // the usage counts are multiplied by this after each round
+    // [TAG_EH_RESIDENT] the resident RAM copy: the experts the VRAM cache misses, hottest first by the profile, copied
+    // into locked host memory (the host pool and the prompt uploads read them there, not from the mapped file)
+    float       resident_budget_gib = 0.0f; // GiB, 0 = no copy, < 0 = what fits in the available RAM less ram_keep_gib
+    float       ram_keep_gib        = 4.0f; // RAM left available
 };
 
 // how a layer's routed experts are computed, as build_moe_ffn does it (the host pool repeats it)
@@ -71,6 +75,10 @@ public:
 
     // large batches: copy the cached experts in [e, last] of w from the banks, returns how many consecutive ones
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) const;
+
+    // [TAG_EH_RESIDENT] large batches: where to upload expert e of w from, its resident RAM copy or NULL (the tensor);
+    // n gets how many consecutive experts in [e, last] come from the same kind of source, contiguous there
+    const void * host_source(const ggml_tensor * w, int64_t e, int64_t last, int64_t & n) const;
 
     void wake()  const; // a graph that may hand off experts is about to run
     void idle()  const; // the graphs are done: the host pool stops spinning
