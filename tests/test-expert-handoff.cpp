@@ -9,6 +9,9 @@
 //
 // usage: test-expert-handoff [--gpu] [-v]
 //        test-expert-handoff --bench [type] [workers,...]   (the host pool's speed, CPU only)
+//        test-expert-handoff --upload-engine                (the GPU's upload engine against its contract)
+//        test-expert-handoff --upload-bench [MiB] [ring_mib stage_mib stages threads]
+//                                                           (its speed against plain pageable uploads)
 //   without --gpu the handoff graph runs on the CPU backend (the protocol and the pool, no device involved)
 
 #include "ggml.h"
@@ -717,6 +720,199 @@ static int run_bench(ggml_type type, int64_t n_embd, int64_t n_ff, int64_t n_exp
     return 0;
 }
 
+// [TAG_EH_COPY_ENGINE] the GPU's upload engine
+struct ue_api {
+    ggml_upload_engine_new_t       make   = nullptr;
+    ggml_upload_engine_free_t      free   = nullptr;
+    ggml_upload_engine_push_t      push   = nullptr;
+    ggml_upload_engine_gather_t    gather = nullptr;
+    ggml_upload_engine_reset_t     reset  = nullptr;
+    ggml_upload_engine_get_stats_t stats  = nullptr;
+    bool load(ggml_backend_reg_t reg) {
+        make   = (ggml_upload_engine_new_t)       ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_new");
+        free   = (ggml_upload_engine_free_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_free");
+        push   = (ggml_upload_engine_push_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_push");
+        gather = (ggml_upload_engine_gather_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_gather");
+        reset  = (ggml_upload_engine_reset_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_reset");
+        stats  = (ggml_upload_engine_get_stats_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_get_stats");
+        return make && free && push && gather && reset && stats;
+    }
+};
+
+// the contract: pieces pushed in gather order (all of a graph's at once, or each gather's just before it), pieces
+// pushed and never gathered (skipped between gathers, dropped at the end), copies from device memory and zeros, any
+// byte alignment, a ring small enough to wrap many times and to split a gather into parts
+static int run_upload_engine_test() {
+    ggml_backend_load_all();
+    ggml_backend_t gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+    if (gpu == nullptr) { fprintf(stderr, "no GPU backend\n"); return 1; }
+    ue_api ue;
+    if (!ue.load(ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu)))) { fprintf(stderr, "no upload engine\n"); return 1; }
+    ggml_upload_engine_params up = { 4u << 20, 256u << 10, 4, 2 };
+    ggml_upload_engine_t eng = ue.make(gpu, &up);
+    if (eng == nullptr) { fprintf(stderr, "the engine failed to start\n"); return 1; }
+
+    std::mt19937 rng(11);
+    std::vector<uint8_t> host(32u << 20);
+    for (auto & b : host) { b = (uint8_t) rng(); }
+    ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * dsrc = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, 1 << 20);
+    ggml_tensor * dst  = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, 8 << 20);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, gpu);
+    std::vector<uint8_t> dsrc_h(ggml_nbytes(dsrc));
+    for (auto & b : dsrc_h) { b = (uint8_t) rng(); }
+    ggml_backend_tensor_set(dsrc, dsrc_h.data(), 0, dsrc_h.size());
+
+    struct ent { int kind; size_t src_off; size_t dst_off; size_t bytes; int64_t piece; }; // kind 0 piece, 1 device, 2 zeros
+    int n_fail = 0, n_gathers = 0, n_entries = 0;
+    std::vector<uint8_t> got(ggml_nbytes(dst)), want(ggml_nbytes(dst));
+    for (int graph = 0; graph < 24 && n_fail == 0; ++graph) {
+        const bool upfront = graph % 2 == 0;
+        const int n_g = 1 + (int) (rng() % 6);
+        std::vector<std::vector<ent>> gs(n_g);
+        for (auto & g : gs) {
+            const int n_e = 1 + (int) (rng() % 48);
+            size_t at = rng() % 64;
+            for (int k = 0; k < n_e; ++k) {
+                ent e;
+                const uint32_t r = rng() % 100;
+                e.kind = r < 60 ? 0 : r < 85 ? 1 : 2;
+                e.bytes = 1 + rng() % (e.kind == 0 ? up.stage_bytes : 64u << 10);
+                e.src_off = rng() % ((e.kind == 0 ? host.size() : dsrc_h.size()) - e.bytes);
+                if (at + e.bytes > got.size()) { break; }
+                e.dst_off = at;
+                e.piece = -1;
+                at += e.bytes + rng() % 4096;
+                g.push_back(e);
+            }
+        }
+        auto push_gather = [&](std::vector<ent> & g) {
+            for (ent & e : g) {
+                if (e.kind == 0) {
+                    if (rng() % 8 == 0) { ue.push(eng, host.data() + rng() % (host.size() - 4096), 1 + rng() % 4096); } // skipped
+                    e.piece = ue.push(eng, host.data() + e.src_off, e.bytes);
+                    if (e.piece < 0) { fprintf(stderr, "push refused %zu bytes\n", e.bytes); n_fail++; }
+                }
+            }
+        };
+        if (upfront) {
+            for (auto & g : gs) { push_gather(g); }
+        }
+        for (auto & g : gs) {
+            if (!upfront) { push_gather(g); }
+            ggml_backend_tensor_memset(dst, 0xAB, 0, ggml_nbytes(dst));
+            std::fill(want.begin(), want.end(), (uint8_t) 0xAB);
+            std::vector<ggml_upload_copy> cps;
+            for (const ent & e : g) {
+                ggml_upload_copy c = { e.piece, nullptr, e.dst_off, e.bytes };
+                if (e.kind == 0) {
+                    memcpy(want.data() + e.dst_off, host.data() + e.src_off, e.bytes);
+                } else if (e.kind == 1) {
+                    c.src = (const uint8_t *) dsrc->data + e.src_off;
+                    memcpy(want.data() + e.dst_off, dsrc_h.data() + e.src_off, e.bytes);
+                } else {
+                    memset(want.data() + e.dst_off, 0, e.bytes);
+                }
+                cps.push_back(c);
+            }
+            if (!ue.gather(eng, gpu, dst->data, cps.data(), (int) cps.size())) { fprintf(stderr, "gather failed\n"); n_fail++; break; }
+            ggml_backend_synchronize(gpu);
+            ggml_backend_tensor_get(dst, got.data(), 0, got.size());
+            n_gathers++;
+            n_entries += (int) g.size();
+            if (got != want) {
+                size_t first = 0;
+                while (got[first] == want[first]) { first++; }
+                fprintf(stderr, "graph %d: gather %d differs from byte %zu on\n", graph, n_gathers, first);
+                n_fail++;
+                break;
+            }
+        }
+        if (graph % 3 == 1) {
+            for (int k = 0; k < 20; ++k) { ue.push(eng, host.data() + k*4096, 100000); } // never gathered: dropped
+        }
+        ue.reset(eng);
+    }
+    ggml_upload_engine_stats st = {};
+    ue.stats(eng, &st);
+    printf("upload engine: %d gathers of %d ranges, %llu pieces in %llu DMAs (%.1f MB), %llu dropped: %s\n", n_gathers,
+        n_entries, (unsigned long long) st.n_pieces, (unsigned long long) st.n_dma, st.bytes/1e6,
+        (unsigned long long) st.dropped, n_fail == 0 ? "OK" : "FAIL");
+    ue.free(eng);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(gpu);
+    return n_fail == 0 ? 0 : 1;
+}
+
+// the speed: Flash-Next-sized expert pieces (450 KiB) from pageable host memory into VRAM, gathered 64 per graph
+// split as the scheduler would ask, against one plain pageable upload per piece (what the scheduler did before)
+static int run_upload_bench(size_t mib, const ggml_upload_engine_params & up) {
+    ggml_backend_load_all();
+    ggml_backend_t gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+    if (gpu == nullptr) { fprintf(stderr, "no GPU backend\n"); return 1; }
+    ue_api ue;
+    if (!ue.load(ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu)))) { fprintf(stderr, "no upload engine\n"); return 1; }
+    size_t free_b = 0, total_b = 0;
+    ggml_backend_dev_memory(ggml_backend_get_device(gpu), &free_b, &total_b);
+    printf("bench: %zu MiB of pieces, ring %zu MiB, %d x %zu MiB staging, %d threads; %.0f MiB of VRAM free\n", mib,
+        up.ring_bytes >> 20, up.n_stage, up.stage_bytes >> 20, up.n_threads, free_b/1048576.0);
+    const size_t piece = 460800, per_gather = 64;
+    const size_t n_pieces = (mib << 20)/piece;
+    std::vector<uint8_t> host(n_pieces*piece);
+    for (size_t i = 0; i < host.size(); i += 4096) { host[i] = (uint8_t) i; }
+    ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * dst = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) (piece*per_gather));
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, gpu);
+    // the pieces in a scattered order, as a RAM copy laid out by rank hands them out
+    std::vector<size_t> order(n_pieces);
+    for (size_t i = 0; i < n_pieces; ++i) { order[i] = i; }
+    std::mt19937 rng(5);
+    std::shuffle(order.begin(), order.end(), rng);
+
+    for (int rep = 0; rep < 2; ++rep) {
+        // plain: one pageable upload per piece
+        auto t0 = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < n_pieces; ++i) {
+            ggml_backend_tensor_set_async(gpu, dst, host.data() + order[i]*piece, (i % per_gather)*piece, piece);
+        }
+        ggml_backend_synchronize(gpu);
+        const double t_plain = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+        ggml_upload_engine_t eng = ue.make(gpu, &up);
+        if (eng == nullptr) { fprintf(stderr, "the engine failed to start\n"); return 1; }
+        t0 = std::chrono::steady_clock::now();
+        std::vector<int64_t> ids(n_pieces);
+        for (size_t i = 0; i < n_pieces; ++i) {
+            ids[i] = ue.push(eng, host.data() + order[i]*piece, piece);
+        }
+        std::vector<ggml_upload_copy> cps;
+        for (size_t g0 = 0; g0 < n_pieces; g0 += per_gather) {
+            cps.clear();
+            for (size_t i = g0; i < std::min(n_pieces, g0 + per_gather); ++i) {
+                cps.push_back({ ids[i], nullptr, (i - g0)*piece, piece });
+            }
+            ue.gather(eng, gpu, dst->data, cps.data(), (int) cps.size());
+        }
+        ggml_backend_synchronize(gpu);
+        const double t_eng = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        ue.reset(eng);
+        ggml_upload_engine_stats st = {};
+        ue.stats(eng, &st);
+        printf("  %.2f GB: plain %.2f s (%.2f GB/s), engine %.2f s (%.2f GB/s) in %llu DMAs; copies %.2f s, issuer waited "
+            "%.2f s for copies, %.2f s for ring; gathers waited %.2f s\n", host.size()/1e9, t_plain, host.size()/1e9/t_plain,
+            t_eng, host.size()/1e9/t_eng, (unsigned long long) st.n_dma, st.copy_ns/1e9, st.wait_copy_ns/1e9,
+            st.wait_ring_ns/1e9, st.wait_gather_ns/1e9);
+        ue.free(eng);
+    }
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(gpu);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     bool use_gpu = false;
@@ -785,6 +981,20 @@ int main(int argc, char ** argv) {
             }
             printf("%s\n", n_fail == 0 ? "all passed" : "FAILED");
             return n_fail == 0 ? 0 : 1;
+        }
+        if (strcmp(argv[i], "--upload-engine") == 0) {
+            return run_upload_engine_test();
+        }
+        if (strcmp(argv[i], "--upload-bench") == 0) {
+            const size_t mib = i + 1 < argc ? (size_t) atoi(argv[i + 1]) : 1024;
+            ggml_upload_engine_params up = { 128u << 20, 16u << 20, 8, 4 };
+            if (i + 5 < argc) {
+                up.ring_bytes  = (size_t) atoi(argv[i + 2]) << 20;
+                up.stage_bytes = (size_t) atoi(argv[i + 3]) << 20;
+                up.n_stage     = atoi(argv[i + 4]);
+                up.n_threads   = atoi(argv[i + 5]);
+            }
+            return run_upload_bench(mib, up);
         }
         if (strcmp(argv[i], "--bench-gpu") == 0) {
             // the round trip on the device: 48 layers of send -> join in one graph, Flash-Next's expert shape, the

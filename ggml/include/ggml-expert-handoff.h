@@ -96,6 +96,56 @@ enum ggml_expert_handoff_mode {
     GGML_EXPERT_HANDOFF_JOIN = 1,
 };
 
+// [TAG_EH_COPY_ENGINE] the upload engine of a GPU backend (get_proc_address "ggml_backend_upload_engine_*"): moves
+// expert bytes from pageable host memory into a ring in VRAM ahead of the graph that reads them, and gathers them
+// (with ranges already in VRAM) into a destination tensor on the backend's stream.
+//
+// Pieces are pushed in the order the gathers will read them. Host threads copy runs of consecutive pieces into pinned
+// staging buffers, an issuer thread sends each run with one DMA on a stream of its own into the ring, and a gather
+// waits on the DMAs of its pieces only, so the copies of later layers run while earlier layers compute. A gather
+// frees the ring space of its pieces and of every piece pushed before them (pieces a gather skips are dropped).
+
+typedef struct ggml_upload_engine * ggml_upload_engine_t;
+
+struct ggml_upload_engine_params {
+    size_t ring_bytes;   // the VRAM ring; a gather larger than about half of it runs in parts
+    size_t stage_bytes;  // one pinned staging buffer: the largest piece and the most bytes per DMA
+    int    n_stage;      // pinned staging buffers (how far the host copies run ahead of the DMAs)
+    int    n_threads;    // host copy threads
+};
+
+// one range of a gather: from a pushed piece (piece >= 0, its whole size), from device memory (piece < 0, src), or
+// zeros (piece < 0, src NULL), to dst + dst_off
+struct ggml_upload_copy {
+    int64_t      piece;
+    const void * src;
+    size_t       dst_off;
+    size_t       bytes;
+};
+
+struct ggml_upload_engine_stats {
+    uint64_t n_pieces;        // pieces sent
+    uint64_t n_dma;           // DMAs (runs of pieces)
+    uint64_t bytes;           // bytes sent
+    uint64_t n_gathers;       // gather kernels
+    uint64_t copy_ns;         // the host copy threads' time in memcpy (summed over the threads)
+    uint64_t wait_ring_ns;    // the issuer waiting for gathers to free ring space (the device is the bottleneck)
+    uint64_t wait_copy_ns;    // the issuer waiting for host copies (the host memory is the bottleneck)
+    uint64_t wait_gather_ns;  // gathers waiting on the host for their pieces' DMAs to be sent
+    uint64_t dropped;         // pieces pushed and never gathered
+};
+
+typedef ggml_upload_engine_t (*ggml_upload_engine_new_t)      (void * backend, const struct ggml_upload_engine_params * params);
+typedef void                 (*ggml_upload_engine_free_t)     (ggml_upload_engine_t eng);
+// returns the piece's index, or -1 if it is larger than a staging buffer
+typedef int64_t              (*ggml_upload_engine_push_t)     (ggml_upload_engine_t eng, const void * src, size_t bytes);
+// on backend's stream (a backend of the engine's device): dst[copies[i].dst_off ...] = the copies, after their DMAs
+typedef bool                 (*ggml_upload_engine_gather_t)   (ggml_upload_engine_t eng, void * backend, void * dst,
+                                                               const struct ggml_upload_copy * copies, int n_copies);
+// drops the pieces not yet gathered (the end of a graph); the engine is ready for the next one
+typedef void                 (*ggml_upload_engine_reset_t)    (ggml_upload_engine_t eng);
+typedef void                 (*ggml_upload_engine_get_stats_t)(ggml_upload_engine_t eng, struct ggml_upload_engine_stats * st);
+
 #ifdef __cplusplus
 }
 #endif

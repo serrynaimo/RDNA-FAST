@@ -80,6 +80,13 @@ public:
     // n gets how many consecutive experts in [e, last] come from the same kind of source, contiguous there
     const void * host_source(const ggml_tensor * w, int64_t e, int64_t last, int64_t & n) const;
 
+    // [TAG_EH_COPY_ENGINE] large batches through the GPU's upload engine: before a graph, plan its scheduler's expert
+    // uploads (a batch routed to nearly every expert queues them all at once); for each upload, true if the engine
+    // filled dst (without used, the routing, only such a batch can be); after the graph, drop what was not used
+    void uploads_begin(ggml_backend_sched_t sched, ggml_cgraph * gf) const;
+    bool upload(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, const std::vector<bool> * used) const;
+    void uploads_end(ggml_backend_sched_t sched) const;
+
     void wake()  const; // a graph that may hand off experts is about to run
     void idle()  const; // the graphs are done: the host pool stops spinning
     void check() const; // before a graph: report joins that timed out, the periodic hit-rate line

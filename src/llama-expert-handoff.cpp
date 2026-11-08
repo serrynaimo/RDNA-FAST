@@ -167,6 +167,31 @@ struct eh_host_api {
 using eh_mapped_alloc_t = void * (*)(size_t);
 using eh_mapped_free_t  = void   (*)(void *);
 
+// [TAG_EH_COPY_ENGINE] the GPU backend's upload engine (ggml-expert-handoff.h)
+struct eh_upload_api {
+    ggml_upload_engine_new_t       make   = nullptr;
+    ggml_upload_engine_free_t      free   = nullptr;
+    ggml_upload_engine_push_t      push   = nullptr;
+    ggml_upload_engine_gather_t    gather = nullptr;
+    ggml_upload_engine_reset_t     reset  = nullptr;
+    ggml_upload_engine_get_stats_t stats  = nullptr;
+
+    bool load(ggml_backend_reg_t reg) {
+        make   = (ggml_upload_engine_new_t)       ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_new");
+        free   = (ggml_upload_engine_free_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_free");
+        push   = (ggml_upload_engine_push_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_push");
+        gather = (ggml_upload_engine_gather_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_gather");
+        reset  = (ggml_upload_engine_reset_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_reset");
+        stats  = (ggml_upload_engine_get_stats_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_get_stats");
+        return make && free && push && gather && reset && stats;
+    }
+};
+
+int64_t eh_env_int(const char * name, int64_t def) {
+    const char * v = getenv(name);
+    return v != nullptr && *v != '\0' ? std::strtoll(v, nullptr, 10) : def;
+}
+
 // the per-expert tensors of a layer, each cached in a bank: the weights (gate_up or gate and up, or up alone; down),
 // then their biases ([n, n_expert], F32), which the graph adds by slot so that a miss adds nothing
 std::vector<ggml_tensor *> eh_layer_experts(const llama_layer & layer) {
@@ -321,6 +346,31 @@ struct llama_expert_handoff::impl {
     size_t res_size   = 0;
     size_t res_locked = 0;
 
+    // [TAG_EH_COPY_ENGINE] large batches: each GPU's upload engine, and the plan of the graph being computed: the
+    // expert tensors its scheduler will upload, in the order it will ask for them (the order of their MUL_MAT_IDs).
+    // A batch that routes to nearly every expert (all_experts) queues every expert outside VRAM of every planned
+    // tensor before the graph starts, so the copies of later layers run while earlier ones compute (and no layer waits
+    // to read its routing); a smaller one queues a layer's routed experts when the scheduler reaches the layer.
+    eh_upload_api uapi;
+    std::vector<ggml_upload_engine_t> engines;    // [device], NULL without
+    struct plan_item {
+        const ggml_tensor *  w;
+        int32_t              il;
+        int32_t              ip;
+        ggml_backend_t       be;                    // the backend its split runs on
+        ggml_upload_engine_t eng;
+        bool                 queued = false;
+        std::vector<int64_t> piece;                 // [e]: its piece in the engine, -1 if cached (or not queued)
+    };
+    mutable std::mutex             plan_mtx;
+    mutable std::vector<plan_item> plan;
+    mutable size_t                 plan_next  = 0;
+    mutable bool                   plan_all   = false;
+    mutable const void *           plan_owner = nullptr; // the scheduler whose graph the plan is for
+    mutable std::vector<ggml_upload_copy> copies; // scratch
+    mutable ggml_upload_engine_stats up_last = {};
+    mutable uint64_t n_up_graphs = 0, n_up_graphs_last = 0, n_up_fallback = 0;
+
     mutable std::mutex mtx;
 
     // batches of up to n_small tokens are always split; larger ones (prompts) where the host's estimated time beats
@@ -443,6 +493,38 @@ struct llama_expert_handoff::impl {
         }
 
         load_profile();
+
+        // [TAG_EH_COPY_ENGINE] before the cache takes the free VRAM (its ring) and before the RAM copy is locked (its
+        // pinned buffers: on Windows the first pinned allocation after the lock stalls for a minute)
+        if (!model.hparams.no_alloc && eh_env_int("ROCMFPX_EH_COPY_ENGINE", 1) != 0) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(devices[0].dev);
+            engines.assign(devices.size(), nullptr);
+            if (uapi.load(reg)) {
+                ggml_upload_engine_params up = {};
+                // test-expert-handoff --upload-bench, RX 7900 XT under Windows, 450 KiB pieces from pageable RAM:
+                // 2/4/8/16/32 MiB per DMA moved 7.0/10.4/13.5/15.4/16.0 GB/s (each DMA costs ~0.2 ms here), plain
+                // pageable uploads of the pieces 2.8 GB/s
+                up.ring_bytes  = (size_t) eh_env_int("ROCMFPX_EH_RING_MIB", 128) << 20;
+                up.stage_bytes = (size_t) eh_env_int("ROCMFPX_EH_STAGE_MIB", 16) << 20;
+                up.n_stage     = (int) eh_env_int("ROCMFPX_EH_STAGES", 8);
+                up.n_threads   = (int) eh_env_int("ROCMFPX_EH_COPY_THREADS", 4);
+                for (const group & g : groups) { // a staging buffer holds at least one expert of any tensor
+                    for (const ggml_tensor * t : g.ref) {
+                        up.stage_bytes = std::max(up.stage_bytes, eh_expert_stride(t));
+                    }
+                }
+                for (size_t id = 0; id < devices.size(); ++id) {
+                    if (devices[id].host_bytes == 0) {
+                        continue;
+                    }
+                    engines[id] = uapi.make(devices[id].backend, &up);
+                    if (engines[id] == nullptr) {
+                        LLAMA_LOG_WARN("%s: %s: no upload engine; large batches upload their experts directly\n", __func__,
+                            ggml_backend_dev_name(devices[id].dev));
+                    }
+                }
+            }
+        }
 
         // each GPU's budget: its free VRAM less the reserve, or its share of an explicit size (n_slots of the
         // largest expert, or bytes) by the experts of its layers
@@ -633,6 +715,11 @@ struct llama_expert_handoff::impl {
     }
 
     ~impl() {
+        for (ggml_upload_engine_t e : engines) { // [TAG_EH_COPY_ENGINE]
+            if (e) {
+                uapi.free(e);
+            }
+        }
         if (helper.joinable()) {
             {
                 std::lock_guard<std::mutex> lk(helper_mtx);
@@ -1159,6 +1246,134 @@ struct llama_expert_handoff::impl {
         return n;
     }
 
+    // [TAG_EH_COPY_ENGINE] before a graph: plan the uploads of its scheduler (see plan above)
+    void uploads_begin(ggml_backend_sched_t sched, ggml_cgraph * gf) const {
+        std::lock_guard<std::mutex> lk(plan_mtx);
+        if (plan_owner != nullptr || engines.empty()) {
+            return; // another context's graph holds the plan (an MTP draft's graphs never upload experts)
+        }
+        plan.clear();
+        plan_next = 0;
+        plan_all  = false;
+        const int n = ggml_graph_n_nodes(gf);
+        for (int i = 0; i < n; ++i) {
+            const ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node->op != GGML_OP_MUL_MAT_ID || !eh_is_host_weight(node->src[0])) {
+                continue;
+            }
+            const auto it = bindings.find(node->src[0]);
+            if (it == bindings.end()) {
+                continue;
+            }
+            const int32_t id = groups[layers[it->second.il].ig].id;
+            ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sched, const_cast<ggml_tensor *>(node));
+            if (engines[id] == nullptr || be == nullptr || ggml_backend_get_device(be) != devices[id].dev) {
+                continue;
+            }
+            plan_item pi;
+            pi.w   = node->src[0];
+            pi.il  = it->second.il;
+            pi.ip  = it->second.ip;
+            pi.be  = be;
+            pi.eng = engines[id];
+            plan.push_back(std::move(pi));
+            // ids [n_used, n_tokens]: at 4 routings per expert, ~98% of the experts are routed to
+            const ggml_tensor * ids = node->src[2];
+            plan_all = plan_all || ids->ne[0]*ids->ne[1] >= 4*node->src[0]->ne[2];
+        }
+        if (plan.empty()) {
+            return;
+        }
+        plan_owner = sched;
+        n_up_graphs++;
+        if (plan_all) {
+            for (plan_item & pi : plan) {
+                queue(pi, nullptr);
+            }
+        }
+    }
+
+    // under plan_mtx: the experts of pi outside VRAM (those used, with used) go to its engine
+    void queue(plan_item & pi, const std::vector<bool> * used) const {
+        const layer & l = layers[pi.il];
+        const group & g = groups[l.ig];
+        const size_t es = eh_expert_stride(pi.w);
+        pi.piece.assign(g.n_expert, -1);
+        for (int64_t e = 0; e < g.n_expert; ++e) {
+            if (l.slots[e] < g.n_slots || (used != nullptr && !(*used)[e])) {
+                continue;
+            }
+            const void * r = resident(pi.il, (size_t) pi.ip, e); // [TAG_EH_RESIDENT]
+            pi.piece[e] = uapi.push(pi.eng, r ? r : (const uint8_t *) pi.w->data + (size_t) e*es, es);
+        }
+        pi.queued = true;
+    }
+
+    // the scheduler's upload of w into dst (its copy on be): true if the engine did it. Without used (the routing,
+    // read from the device) only a batch that routes to every expert can be served
+    bool upload(ggml_backend_t be, const ggml_tensor * w, ggml_tensor * dst, const std::vector<bool> * used) const {
+        std::lock_guard<std::mutex> lk(plan_mtx);
+        if (plan_owner == nullptr || (used == nullptr && !plan_all)) {
+            return false;
+        }
+        size_t k = plan_next;
+        while (k < plan.size() && plan[k].w != w) {
+            k++;
+        }
+        if (k == plan.size() || plan[k].be != be) {
+            n_up_fallback++;
+            return false;
+        }
+        plan_next = k + 1;
+        plan_item & pi = plan[k];
+        if (!pi.queued) {
+            // the layer's routing is known now: its tensors from here on (their gathers follow in this order)
+            for (size_t j = k; j < plan.size() && plan[j].il == pi.il; ++j) {
+                if (!plan[j].queued) {
+                    queue(plan[j], plan_all ? nullptr : used);
+                }
+            }
+        }
+        const layer & l = layers[pi.il];
+        const group & g = groups[l.ig];
+        const ggml_tensor * bank = g.banks[pi.ip];
+        const size_t es = eh_expert_stride(w);
+        copies.clear();
+        for (int64_t e = 0; e < g.n_expert; ++e) {
+            const bool u = plan_all || (*used)[e];
+            if (!u) {
+                // MMQ reads a little past the last expert it uses: zeros there, not garbage that may be NaN
+                if (e > 0 && (*used)[e - 1]) {
+                    copies.push_back({ -1, nullptr, (size_t) e*es, std::min<size_t>(es, 512) });
+                }
+                continue;
+            }
+            if (l.slots[e] < g.n_slots) {
+                copies.push_back({ -1, (const uint8_t *) bank->data + (size_t) l.slots[e]*es, (size_t) e*es, es });
+            } else if (pi.piece[e] >= 0) {
+                copies.push_back({ pi.piece[e], nullptr, (size_t) e*es, es });
+            } else {
+                n_up_fallback++;
+                return false; // not queued (a different routing than its layer's first tensor)
+            }
+        }
+        return uapi.gather(pi.eng, be, dst->data, copies.data(), (int) copies.size());
+    }
+
+    void uploads_end(ggml_backend_sched_t sched) const {
+        std::lock_guard<std::mutex> lk(plan_mtx);
+        if (plan_owner != sched) {
+            return;
+        }
+        for (ggml_upload_engine_t e : engines) {
+            if (e) {
+                uapi.reset(e);
+            }
+        }
+        plan.clear();
+        plan_owner = nullptr;
+    }
+
     // the helper thread: copies the experts of in_flight from host memory into their slots. The copies go through
     // the device's per-thread stream (ggml_backend_tensor_set), beside the graphs; nothing reads those slots
     // until adapt() admits them.
@@ -1467,6 +1682,30 @@ struct llama_expert_handoff::impl {
                         d_ngap ? (st.gap_ns - last.gap_ns)/1000.0/d_ngap : 0.0);
                 }
             }
+            // [TAG_EH_COPY_ENGINE] the uploads of large batches since the last report
+            {
+                ggml_upload_engine_stats us = {};
+                for (ggml_upload_engine_t e : engines) {
+                    if (e) {
+                        ggml_upload_engine_stats s = {};
+                        uapi.stats(e, &s);
+                        us.n_pieces += s.n_pieces; us.n_dma += s.n_dma; us.bytes += s.bytes; us.n_gathers += s.n_gathers;
+                        us.copy_ns += s.copy_ns; us.wait_ring_ns += s.wait_ring_ns; us.wait_copy_ns += s.wait_copy_ns;
+                        us.wait_gather_ns += s.wait_gather_ns; us.dropped += s.dropped;
+                    }
+                }
+                if (us.bytes > up_last.bytes) {
+                    LLAMA_LOG_WARN("%s: uploads: %" PRIu64 " graphs, %.2f GB in %" PRIu64 " DMAs (%" PRIu64 " experts), %" PRIu64
+                        " gathers; host copies %.1f s (all threads), the issuer waited %.1f s for copies and %.1f s for ring "
+                        "space, the graphs %.1f s for DMAs; %" PRIu64 " experts dropped, %" PRIu64 " uploads not planned\n",
+                        __func__, n_up_graphs - n_up_graphs_last, (us.bytes - up_last.bytes)/1e9, us.n_dma - up_last.n_dma,
+                        us.n_pieces - up_last.n_pieces, us.n_gathers - up_last.n_gathers, (us.copy_ns - up_last.copy_ns)/1e9,
+                        (us.wait_copy_ns - up_last.wait_copy_ns)/1e9, (us.wait_ring_ns - up_last.wait_ring_ns)/1e9,
+                        (us.wait_gather_ns - up_last.wait_gather_ns)/1e9, us.dropped - up_last.dropped, n_up_fallback);
+                }
+                up_last = us;
+                n_up_graphs_last = n_up_graphs;
+            }
             n_swaps_reported = n_swaps;
             n_ram_swaps_reported = n_ram_swaps;
             // the estimates of host_sooner(): the share of routed experts the host computed, its bytes per second
@@ -1531,6 +1770,18 @@ int64_t llama_expert_handoff::copy_experts(ggml_backend_t backend, const ggml_te
 
 const void * llama_expert_handoff::host_source(const ggml_tensor * w, int64_t e, int64_t last, int64_t & n) const {
     return pimpl->host_source(w, e, last, n);
+}
+
+void llama_expert_handoff::uploads_begin(ggml_backend_sched_t sched, ggml_cgraph * gf) const {
+    pimpl->uploads_begin(sched, gf);
+}
+
+bool llama_expert_handoff::upload(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, const std::vector<bool> * used) const {
+    return pimpl->upload(backend, w, dst, used);
+}
+
+void llama_expert_handoff::uploads_end(ggml_backend_sched_t sched) const {
+    pimpl->uploads_end(sched);
 }
 
 void llama_expert_handoff::wake() const {

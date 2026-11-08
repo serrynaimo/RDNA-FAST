@@ -3056,10 +3056,19 @@ ggml_status llama_context::graph_compute(
         expert_handoff->wake();
     }
 
+    // [TAG_EH_COPY_ENGINE] the experts this graph uploads, planned before the scheduler asks for them
+    if (expert_handoff) {
+        expert_handoff->uploads_begin(sched.get(), gf);
+    }
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         if (auto * qsa = dynamic_cast<llama_memory_hybrid_idx *>(memory.get())) { qsa->qsa_invalidate(); }
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+    }
+
+    if (expert_handoff) {
+        expert_handoff->uploads_end(sched.get());
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
@@ -3089,6 +3098,12 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     const int64_t n_expert    = src->ne[2];
     const size_t  expert_size = src->nb[2];
 
+    // [TAG_EH_COPY_ENGINE] a batch routed to nearly every expert: queued before the graph, no routing to read
+    const llama_expert_handoff * ehu = lctx->get_expert_handoff();
+    if (ehu && ehu->upload(backend, src, dst, nullptr)) {
+        return true;
+    }
+
     if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
         ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
@@ -3104,6 +3119,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
 
         st.ids = ids;
+    }
+
+    // [TAG_EH_COPY_ENGINE] the routed experts through the engine: the layer's other tensors are queued with them
+    if (ehu && ehu->upload(backend, src, dst, &st.used)) {
+        return true;
     }
 
     // group consecutive experts and copy them together

@@ -78,6 +78,7 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx, const 
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/expert-handoff.cuh"
+#include "ggml-cuda/upload-engine.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -7673,6 +7674,25 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_host_mapped_free") == 0) {
         return (void *)ggml_backend_cuda_host_mapped_free;
+    }
+    // ROCmFPX [TAG_EH_COPY_ENGINE]
+    if (strcmp(name, "ggml_backend_upload_engine_new") == 0) {
+        return (void *)ggml_backend_cuda_upload_engine_new;
+    }
+    if (strcmp(name, "ggml_backend_upload_engine_free") == 0) {
+        return (void *)ggml_backend_cuda_upload_engine_free;
+    }
+    if (strcmp(name, "ggml_backend_upload_engine_push") == 0) {
+        return (void *)ggml_backend_cuda_upload_engine_push;
+    }
+    if (strcmp(name, "ggml_backend_upload_engine_gather") == 0) {
+        return (void *)ggml_backend_cuda_upload_engine_gather;
+    }
+    if (strcmp(name, "ggml_backend_upload_engine_reset") == 0) {
+        return (void *)ggml_backend_cuda_upload_engine_reset;
+    }
+    if (strcmp(name, "ggml_backend_upload_engine_get_stats") == 0) {
+        return (void *)ggml_backend_cuda_upload_engine_get_stats;
     }
     return nullptr;
 }
