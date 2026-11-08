@@ -139,6 +139,9 @@ jobs:
       - name: Install Ninja
         run: choco install ninja -y
       - name: ccache
+        # a build cache that cannot be restored only makes the build slower: v0.9.2's first run stopped all three
+        # Windows jobs here ("Restoring cache failed: ... sh.exe failed with exit code 9")
+        continue-on-error: true
         uses: ggml-org/ccache-action@v1.2.24
         with:
           key: rdna-fast-windows-rocm-${{ env.ROCM_VERSION }}-${{ matrix.family }}
@@ -243,6 +246,8 @@ jobs:
         with:
           tool-cache: true
       - name: ccache
+        # a build cache that cannot be restored only makes the build slower
+        continue-on-error: true
         uses: ggml-org/ccache-action@v1.2.24
         with:
           key: rdna-fast-linux-rocm-${{ env.ROCM_VERSION }}-${{ matrix.family }}
@@ -250,6 +255,7 @@ jobs:
           max-size: "2G"
       - name: Tune ccache for the reinstalled ROCm toolchain
         # the pip-installed clang gets a new mtime every run: hash its contents instead
+        continue-on-error: true
         run: |
           ccache --set-config=compiler_check=content
           ccache --set-config=sloppiness=time_macros,include_file_mtime,include_file_ctime
