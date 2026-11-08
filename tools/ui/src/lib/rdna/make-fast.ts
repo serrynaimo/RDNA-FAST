@@ -65,9 +65,13 @@ export function primaryChatModel(): string | null {
 	return loaded[0]?.id ?? null;
 }
 
-/** A new chat with the prompt, answered by the primary model; the window switches to it */
+/**
+ * A new chat with the prompt, answered by the primary model; the window switches to it. Sent as from an empty chat:
+ * with no conversation active, sendMessage creates one, navigates to it and names it from the prompt the way the title
+ * settings say (its first line, or the model's title), not "Chat <date>"
+ */
 export async function startRdnaChat(prompt: string): Promise<void> {
-	await conversationsStore.createConversation(); // navigates to the new chat and makes it active
+	conversationsStore.clearActiveConversation();
 
 	const id = primaryChatModel();
 	const model = id ? modelsStore.findModelByName(id) : null;
