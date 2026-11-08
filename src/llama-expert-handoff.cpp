@@ -372,6 +372,11 @@ struct llama_expert_handoff::impl {
     mutable const void *           plan_owner = nullptr; // the scheduler whose graph the plan is for
     mutable std::vector<ggml_upload_copy> copies; // scratch
     mutable ggml_upload_engine_stats up_last = {};
+    // ROCMFPX_EH_UPLOAD_TRACE=1: per graph, the host's times from its start to the first and last upload and to the
+    // device's end of the graph (waited for here), and from the last graph's end
+    const bool tr_on = getenv("ROCMFPX_EH_UPLOAD_TRACE") != nullptr && atoi(getenv("ROCMFPX_EH_UPLOAD_TRACE")) != 0;
+    mutable int64_t tr_begin = 0, tr_first = 0, tr_last = 0, tr_prev_done = 0;
+    mutable ggml_backend_t tr_be = nullptr;
     mutable uint64_t n_up_graphs = 0, n_up_graphs_last = 0, n_up_fallback = 0;
 
     mutable std::mutex mtx;
@@ -1314,6 +1319,11 @@ struct llama_expert_handoff::impl {
         }
         plan_owner = sched;
         n_up_graphs++;
+        if (tr_on) {
+            tr_begin = ggml_time_us();
+            tr_first = 0;
+            tr_be    = plan[0].be;
+        }
         if (plan_all) {
             for (plan_item & pi : plan) {
                 queue(pi, nullptr);
@@ -1354,6 +1364,10 @@ struct llama_expert_handoff::impl {
         }
         plan_next = k + 1;
         plan_item & pi = plan[k];
+        if (tr_on) {
+            tr_last = ggml_time_us();
+            tr_first = tr_first ? tr_first : tr_last;
+        }
         if (!pi.queued) {
             // the layer's routing is known now: its tensors from here on (their gathers follow in this order)
             for (size_t j = k; j < plan.size() && plan[j].il == pi.il; ++j) {
@@ -1392,6 +1406,15 @@ struct llama_expert_handoff::impl {
         std::lock_guard<std::mutex> lk(plan_mtx);
         if (plan_owner != sched) {
             return;
+        }
+        if (tr_on && tr_be) {
+            ggml_backend_synchronize(tr_be);
+            const int64_t t = ggml_time_us();
+            LLAMA_LOG_WARN("%s: trace: %zu expert tensors; host: start -> first upload %.0f ms, first -> last upload %.0f ms, "
+                "last upload -> device done %.0f ms; previous graph done -> start %.0f ms\n", __func__, plan.size(),
+                (tr_first - tr_begin)/1e3, (tr_last - tr_first)/1e3, (t - tr_last)/1e3,
+                tr_prev_done ? (tr_begin - tr_prev_done)/1e3 : 0.0);
+            tr_prev_done = t;
         }
         for (ggml_upload_engine_t e : engines) {
             if (e) {

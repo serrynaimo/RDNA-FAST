@@ -178,12 +178,12 @@ struct ggml_upload_engine {
         for (size_t k = 0; k < marks.size(); ++k) {
             float ms = 0.0f;
             CUDA_CHECK(UE_EVENT_ELAPSED(&ms, marks[k].a, marks[k].b));
-            st_dev_wait.fetch_add((uint64_t) (ms*1e6), std::memory_order_relaxed);
+            st_dev_wait.fetch_add((uint64_t) (std::max(ms, 0.0f)*1e6), std::memory_order_relaxed);
             CUDA_CHECK(UE_EVENT_ELAPSED(&ms, marks[k].b, marks[k].c));
-            st_dev_gather.fetch_add((uint64_t) (ms*1e6), std::memory_order_relaxed);
+            st_dev_gather.fetch_add((uint64_t) (std::max(ms, 0.0f)*1e6), std::memory_order_relaxed);
             if (k + 1 < marks.size()) {
                 CUDA_CHECK(UE_EVENT_ELAPSED(&ms, marks[k].c, marks[k + 1].a));
-                st_dev_between.fetch_add((uint64_t) (ms*1e6), std::memory_order_relaxed);
+                st_dev_between.fetch_add((uint64_t) (std::max(ms, 0.0f)*1e6), std::memory_order_relaxed);
             }
         }
         for (const tmark & m : marks) {
