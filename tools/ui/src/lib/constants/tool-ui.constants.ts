@@ -69,7 +69,7 @@ export const TOOL_UI: Readonly<Record<BuiltInTool, ToolUiEntry>> = {
 		source: ToolSource.RDNA
 	},
 	[BuiltInTool.RDNA_SAVE_PRESET]: { icon: Save, label: 'Save preset', source: ToolSource.RDNA },
-	[BuiltInTool.RDNA_SYSTEM_INFO]: { icon: Cpu, label: 'System info', source: ToolSource.RDNA },
+	[BuiltInTool.RDNA_SERVER_INFO]: { icon: Cpu, label: 'Server info', source: ToolSource.RDNA },
 	[BuiltInTool.SERVER_EDIT_FILE]: { icon: FilePen, label: 'Edit file', source: ToolSource.SERVER },
 	[BuiltInTool.SERVER_EXEC_SHELL_COMMAND]: {
 		icon: Terminal,

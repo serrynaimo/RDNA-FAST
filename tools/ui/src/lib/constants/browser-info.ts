@@ -25,7 +25,7 @@ export function buildBrowserInfoToolDefinition(): OpenAIToolDefinition {
 	return {
 		function: {
 			description:
-				// RDNA-FAST: the browser's machine, which can be another one than the server's (system_info has the server's)
+				// RDNA-FAST: the browser's machine, which can be another one than the server's (server_info has the server's)
 				"The browser's runtime info (its OS name), not the server's: may call when user asks about local files or shell commands",
 			name: BROWSER_INFO_TOOL_NAME,
 			parameters: {

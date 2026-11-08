@@ -990,7 +990,7 @@ size_t common_process_resident_bytes() {
 }
 
 // the OS the server runs on, e.g. "Windows 11 (build 26300)", "Ubuntu 24.04.1 LTS", "macOS 15.1", for the web UI's
-// system_info tool (its browser can be on another machine)
+// server_info tool (its browser can be on another machine)
 std::string common_host_os() {
 #if defined(_WIN32)
     // RtlGetVersion reports the real version (GetVersionEx answers as the manifest says); Windows 11 is 10.0 from

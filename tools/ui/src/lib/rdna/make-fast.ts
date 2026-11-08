@@ -1,6 +1,6 @@
 /**
  * RDNA-FAST guided chats (owner, 2026-11-08): "Make it RDNA-FAST!" in Discover Models and "Help me go RDNA-FASTer"
- * on the status page. Each asks the model that runs to work through the RDNA-FAST tools (system_info, router_config,
+ * on the status page. Each asks the model that runs to work through the RDNA-FAST tools (server_info, router_config,
  * download_model, save_preset) and the project's docs on GitHub (web_fetch). The prompts are short numbered steps: the
  * model reads them at its prefill speed, and the steps keep a small model on track.
  */
@@ -15,7 +15,7 @@ const DOCS_STEP = `Read the RDNA-FAST docs with web_fetch: ${DOCS}/README.md, th
 export function makeItFastPrompt(repo: string, quants: string[]): string {
 	return [
 		`Make ${repo} RDNA-FAST on this machine.`,
-		'1. system_info: GPU, VRAM, RAM.',
+		'1. server_info: OS, GPU, VRAM, RAM.',
 		`2. ${DOCS_STEP}`,
 		`3. Pick the quant of ${repo} that runs fastest here at good quality${quants.length ? ` (it has ${quants.join(', ')})` : ''}.`,
 		`4. download_model "${repo}:<QUANT>" (it says so if the model is there already).`,
@@ -28,7 +28,7 @@ export function makeItFastPrompt(repo: string, quants: string[]): string {
 export function fasterPrompt(modelId: string): string {
 	return [
 		`Can ${modelId} run RDNA-FASTer?`,
-		`1. router_config for "${modelId}": its flags. system_info: GPU, VRAM, RAM.`,
+		`1. router_config for "${modelId}": its flags. server_info: OS, GPU, VRAM, RAM.`,
 		`2. ${DOCS_STEP}`,
 		"3. Compare the model's flags and env vars with the docs' recipe for this GPU and list what would make it faster.",
 		'4. If a change clearly helps, save_preset the improved recipe for that model (it applies on its next load).',

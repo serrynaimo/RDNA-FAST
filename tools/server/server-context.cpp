@@ -6617,7 +6617,7 @@ static json get_res_system_memory() {
     return res;
 }
 
-// the machine the server runs on, for the web UI's system_info tool (the browser can be on another machine, and a GPU
+// the machine the server runs on, for the web UI's server_info tool (the browser can be on another machine, and a GPU
 // model's own devices do not include the CPU): its OS, its CPU and how many threads that CPU runs
 static json get_res_host() {
     std::string cpu_name;

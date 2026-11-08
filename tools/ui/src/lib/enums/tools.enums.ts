@@ -55,7 +55,7 @@ export enum BuiltInTool {
 	RDNA_RECENT_CONVERSATIONS = 'recent_conversations',
 	RDNA_ROUTER_CONFIG = 'router_config',
 	RDNA_SAVE_PRESET = 'save_preset',
-	RDNA_SYSTEM_INFO = 'system_info',
+	RDNA_SERVER_INFO = 'server_info',
 	SERVER_EDIT_FILE = 'edit_file',
 	SERVER_EXEC_SHELL_COMMAND = 'exec_shell_command',
 	SERVER_FILE_GLOB_SEARCH = 'file_glob_search',

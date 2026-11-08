@@ -2,7 +2,7 @@
  * RDNA-FAST chat tools (owner, 2026-11-08), their own "RDNA-FAST" section in the chat's tools, on by default:
  *   recent_conversations  this browser's chats: find them by words, or read one's last messages
  *   download_model        a GGUF from Hugging Face through the router, unless it is there or on its way already
- *   system_info           GPU, VRAM, CPU, RAM, the server build and the models it runs
+ *   server_info           the server's machine: OS, CPU, RAM, GPU and VRAM, the build
  *   save_preset           the flags and env vars a model runs with, kept by the router ([TAG_MODEL_PRESET])
  *   router_config         what the router runs: each model's status, preset (its flags) and saved recipe
  * Descriptions and answers stay short: a local model reads every tool schema and result at its prefill speed.
@@ -25,7 +25,7 @@ import { getAuthHeaders } from '$lib/utils/api-headers';
 const RDNA_TOOLS = new Set<string>([
 	BuiltInTool.RDNA_RECENT_CONVERSATIONS,
 	BuiltInTool.RDNA_DOWNLOAD_MODEL,
-	BuiltInTool.RDNA_SYSTEM_INFO,
+	BuiltInTool.RDNA_SERVER_INFO,
 	BuiltInTool.RDNA_SAVE_PRESET,
 	BuiltInTool.RDNA_ROUTER_CONFIG
 ]);
@@ -84,7 +84,7 @@ export function buildRdnaToolDefinitions(): OpenAIToolDefinition[] {
 			['model']
 		),
 		fn(
-			BuiltInTool.RDNA_SYSTEM_INFO,
+			BuiltInTool.RDNA_SERVER_INFO,
 			"The server's machine: OS, CPU, RAM, GPU and VRAM, build. (Not the browser's.)",
 			{}
 		),
@@ -328,7 +328,7 @@ function modelArgs(m: ApiModelDataEntry): string[] | undefined {
  * the running models' /props (a GPU model names its GPUs; the host block and the RAM come with every model). The
  * models themselves are router_config's.
  */
-async function systemInfo(signal?: AbortSignal): Promise<ToolExecutionResult> {
+async function serverInfo(signal?: AbortSignal): Promise<ToolExecutionResult> {
 	await modelsStore.fetch();
 
 	const router = serverStore.isRouterMode;
@@ -559,8 +559,8 @@ export async function executeRdnaTool(
 				return await recentConversations(args);
 			case BuiltInTool.RDNA_DOWNLOAD_MODEL:
 				return await downloadModel(args);
-			case BuiltInTool.RDNA_SYSTEM_INFO:
-				return await systemInfo(signal);
+			case BuiltInTool.RDNA_SERVER_INFO:
+				return await serverInfo(signal);
 			case BuiltInTool.RDNA_SAVE_PRESET:
 				return await savePreset(args, signal);
 			case BuiltInTool.RDNA_ROUTER_CONFIG:
