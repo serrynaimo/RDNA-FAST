@@ -989,6 +989,50 @@ size_t common_process_resident_bytes() {
 #endif
 }
 
+// the OS the server runs on, e.g. "Windows 11 (build 26300)", "Ubuntu 24.04.1 LTS", "macOS 15.1", for the web UI's
+// system_info tool (its browser can be on another machine)
+std::string common_host_os() {
+#if defined(_WIN32)
+    // RtlGetVersion reports the real version (GetVersionEx answers as the manifest says); Windows 11 is 10.0 from
+    // build 22000
+    using rtl_get_version_t = LONG (WINAPI *)(OSVERSIONINFOW *);
+    if (HMODULE ntdll = GetModuleHandleW(L"ntdll.dll")) {
+        auto rtl_get_version = (rtl_get_version_t) (void *) GetProcAddress(ntdll, "RtlGetVersion");
+        OSVERSIONINFOW v = {};
+        v.dwOSVersionInfoSize = sizeof(v);
+        if (rtl_get_version && rtl_get_version(&v) == 0) {
+            const char * name = v.dwMajorVersion == 10 ? (v.dwBuildNumber >= 22000 ? "Windows 11" : "Windows 10") : "Windows";
+            return std::string(name) + " (build " + std::to_string(v.dwBuildNumber) + ")";
+        }
+    }
+    return "Windows";
+#elif defined(__linux__)
+    std::ifstream f("/etc/os-release");
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("PRETTY_NAME=", 0) == 0) {
+            std::string v = line.substr(12);
+            if (v.size() >= 2 && (v.front() == '"' || v.front() == '\'')) {
+                v = v.substr(1, v.size() - 2);
+            }
+            if (!v.empty()) {
+                return v;
+            }
+        }
+    }
+    return "Linux";
+#elif defined(__APPLE__)
+    char ver[64] = {};
+    size_t len = sizeof(ver);
+    if (sysctlbyname("kern.osproductversion", ver, &len, nullptr, 0) == 0 && ver[0]) {
+        return std::string("macOS ") + ver;
+    }
+    return "macOS";
+#else
+    return "unknown";
+#endif
+}
+
 std::filesystem::path common_get_path_from_env(const std::string & name) {
 #if defined(_WIN32)
     const std::wstring wname = utf8_to_wstring(name);

@@ -85,7 +85,7 @@ export function buildRdnaToolDefinitions(): OpenAIToolDefinition[] {
 		),
 		fn(
 			BuiltInTool.RDNA_SYSTEM_INFO,
-			'This machine: GPU, VRAM, CPU, RAM, server build, models running.',
+			"The server's machine: OS, CPU, RAM, GPU and VRAM, build. (Not the browser's.)",
 			{}
 		),
 		fn(
@@ -314,47 +314,79 @@ interface PropsDevice {
 interface PropsAnswer {
 	build_info?: string;
 	devices?: PropsDevice[];
+	/** the machine the server runs on: its OS, CPU and thread count (server-context.cpp get_res_host) */
+	host?: { os?: string; cpu?: string; threads?: number };
+	system_memory?: { memory_total?: number; memory_free?: number };
 }
 
 function modelArgs(m: ApiModelDataEntry): string[] | undefined {
 	return m.status?.args;
 }
 
+/**
+ * The server's machine, never the browser's (which can be another one): OS, CPU, RAM and GPUs with their VRAM, from
+ * the running models' /props (a GPU model names its GPUs; the host block and the RAM come with every model). The
+ * models themselves are router_config's.
+ */
 async function systemInfo(signal?: AbortSignal): Promise<ToolExecutionResult> {
 	await modelsStore.fetch();
 
 	const router = serverStore.isRouterMode;
-	const models = modelsStore.routerModels;
-	const running = models.filter((m) => m.status?.value === ServerModelStatus.LOADED);
-	// a chat model's /props names every device of the machine (a CPU-only classifier only the CPU)
-	const probe = running.find((m) => !isClassifier(modelArgs(m))) ?? running[0];
-	const res = await rdnaGet<PropsAnswer>('/props', modelQuery(probe?.id ?? null, router), signal);
-	const lines: string[] = [];
+	const running = modelsStore.routerModels.filter(
+		(m) => m.status?.value === ServerModelStatus.LOADED
+	);
+	// chat models first: their devices are the GPUs; a CPU-only classifier adds nothing but the CPU
+	const probes = router
+		? [
+				...running.filter((m) => !isClassifier(modelArgs(m))),
+				...running.filter((m) => isClassifier(modelArgs(m)))
+			]
+		: [null];
+	const answers: PropsAnswer[] = [];
 
-	for (const d of res.data?.devices ?? []) {
-		const cpu = (d.type ?? '').toLowerCase() === 'cpu' || d.name === 'CPU';
-		const memory = `${gb(d.memory_total)} ${cpu ? 'RAM' : 'VRAM'}, ${gb(d.memory_free)} free`;
+	for (const m of probes.slice(0, 3)) {
+		const res = await rdnaGet<PropsAnswer>('/props', modelQuery(m?.id ?? null, router), signal);
 
-		lines.push(`${cpu ? 'CPU' : 'GPU'}: ${d.description || d.name} (${d.name}): ${memory}`);
+		if (res.data) answers.push(res.data);
 	}
 
-	if (lines.length === 0) {
-		lines.push(
-			running.length === 0
-				? 'GPU, CPU and memory: unknown until a model is loaded.'
-				: 'GPU, CPU and memory: the server does not report them.'
+	if (answers.length === 0) {
+		return ok(
+			router && running.length === 0
+				? 'Unknown until a model is loaded: the server reports its machine through a running model.'
+				: 'The server does not report its machine.'
 		);
 	}
 
-	if (res.data?.build_info)
-		lines.push(`Server: RDNA-FAST ${res.data.build_info}${router ? ', router mode' : ''}`);
+	const host = answers.find((a) => a.host?.os || a.host?.cpu)?.host;
+	const ram = answers.find((a) => a.system_memory?.memory_total)?.system_memory;
+	const cpuDevice = answers
+		.flatMap((a) => a.devices ?? [])
+		.find((d) => (d.type ?? '').toLowerCase() === 'cpu');
+	const gpus = new Map<string, PropsDevice>();
 
-	if (router) {
+	for (const d of answers.flatMap((a) => a.devices ?? [])) {
+		if ((d.type ?? '').toLowerCase() !== 'cpu' && d.name && !gpus.has(d.name)) gpus.set(d.name, d);
+	}
+
+	const cpuName = host?.cpu || cpuDevice?.description;
+	const lines = [
+		`OS: ${host?.os || 'unknown (an older server build)'}`,
+		`CPU: ${cpuName || 'unknown'}${host?.threads ? `, ${host.threads} threads` : ''}`,
+		`RAM: ${ram ? `${gb(ram.memory_total)}, ${gb(ram.memory_free)} free` : 'unknown'}`
+	];
+
+	for (const d of gpus.values()) {
 		lines.push(
-			`Running: ${running.length ? running.map((m) => m.id).join(', ') : 'none'}`,
-			`Downloaded: ${models.filter((m) => !NOT_ON_DISK.has(m.status?.value ?? '')).length} models`
+			`GPU: ${d.description || d.name} (${d.name}): ${gb(d.memory_total)} VRAM, ${gb(d.memory_free)} free`
 		);
 	}
+
+	if (gpus.size === 0) lines.push('GPU: none in use by the running models');
+
+	const build = answers.find((a) => a.build_info)?.build_info;
+
+	if (build) lines.push(`Server: RDNA-FAST ${build}`);
 
 	return ok(lines.join('\n'));
 }

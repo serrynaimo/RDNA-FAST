@@ -6617,6 +6617,20 @@ static json get_res_system_memory() {
     return res;
 }
 
+// the machine the server runs on, for the web UI's system_info tool (the browser can be on another machine, and a GPU
+// model's own devices do not include the CPU): its OS, its CPU and how many threads that CPU runs
+static json get_res_host() {
+    std::string cpu_name;
+    if (ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        cpu_name = string_strip(ggml_backend_dev_description(cpu)); // the brand string is space-padded
+    }
+    return {
+        {"os",      common_host_os()},
+        {"cpu",     cpu_name},
+        {"threads", std::thread::hardware_concurrency()},
+    };
+}
+
 json server_routes::get_model_info() const {
     return get_res_model_info(*meta);
 }
@@ -6789,6 +6803,7 @@ void server_routes::init_routes() {
         // counters from the copy the main loop publishes (a thread-safe call that does not touch the model)
         props["devices"]           = get_res_devices(meta->devices);
         props["system_memory"]     = get_res_system_memory();
+        props["host"]              = get_res_host();
         props["prompt_cache_disk"] = ctx_server.disk_stats_to_json();
         res->ok(props);
         return res;
