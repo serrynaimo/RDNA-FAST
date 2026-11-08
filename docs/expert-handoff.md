@@ -85,6 +85,9 @@ VRAM, Gemma 4 with half its experts on the CPU has a KL divergence of about 0.08
 - **Keep the default batch size.** `-ub 4096` makes the compute buffers larger, which leaves fewer experts in VRAM: on
   the 20 GB card prompts and answers both got slower.
 - **Workers.** Lower `--pool-workers` only if other CPU-heavy programs share the machine.
+- **If you choose the quant:** experts in Q2_0, Q4_0, Q8_0, IQ4_NL, MXFP4, IQ4_XS, Q4_K, Q5_K or Q6_K make prompts
+  faster than IQ2, IQ3, Q2_K or Q3_K ones: the CPU computes them up to twice as fast when several tokens share an
+  expert. Nothing to set; the server uses this wherever the CPU supports it (AMD Zen 4 and newer, recent Intel Xeons).
 - **Qwen3.8-Flash-Next:** add `-ot per_layer_token_embd=CPU`. Its 28.8 GB per-layer token embedding table stays on the
   SSD and is read a few rows at a time; keep `--lazy-mode` at its default (`off` would load the table into RAM).
 - **Placement.** `--cpu-moe` / `--n-cpu-moe N` still decide which layers keep their experts in RAM, and expert handoff

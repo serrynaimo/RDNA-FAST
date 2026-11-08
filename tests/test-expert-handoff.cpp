@@ -3,7 +3,8 @@
 // A synthetic layer with random quantized experts in host memory. The reference computes it with mul_mat_id on the
 // CPU backend, the way build_moe_ffn does. The handoff graph runs on the tested backend: the experts of a
 // VRAM-cache-like bank (a random subset) are computed there, the others by the host pool, and the join adds them.
-// Both must agree. The cases cover the expert forms build_moe_ffn has: the activations, merged gate_up, experts
+// Both must agree, and the handoff must be no further from the exact result (the experts dequantized to F32) than the
+// reference: the pool quantizes the activations its own way. The cases cover the expert forms build_moe_ffn has: the activations, merged gate_up, experts
 // without a gate, per-expert scales and biases, routing weights applied to the input, and a used-expert count below
 // the selection.
 //
@@ -269,6 +270,53 @@ static bool run_case(ggml_backend_t be, ggml_backend_t cpu, const mailbox_alloc 
         ggml_free(ctx);
     }
 
+    // the exact result: the experts dequantized to F32, the activations kept in F32. The pool quantizes the activations
+    // its own way (an int8 scale per 32 values, ggml's K-quant dots one per 256), so it may differ from the reference
+    // by more than rounding; it must not be further from the exact result than the reference is
+    std::vector<float> exact(c.n_embd*c.n_tokens);
+    {
+        ggml_context * ctx_f = ggml_init(ip);
+        moe_tensors hf = hm;
+        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> deq;
+        for (ggml_tensor ** t : { &hf.gate, &hf.up, &hf.gate_up, &hf.down }) {
+            if (*t) {
+                ggml_tensor * f = ggml_new_tensor_3d(ctx_f, GGML_TYPE_F32, (*t)->ne[0], (*t)->ne[1], (*t)->ne[2]);
+                deq.emplace_back(*t, f);
+                *t = f;
+            }
+        }
+        ggml_backend_buffer_t buf_f = ggml_backend_alloc_ctx_tensors(ctx_f, cpu);
+        for (const auto & [q, f] : deq) {
+            if (q->type == GGML_TYPE_F32) {
+                memcpy(f->data, q->data, ggml_nbytes(q));
+            } else {
+                ggml_get_type_traits(q->type)->to_float(q->data, (float *) f->data, ggml_nelements(q));
+            }
+        }
+        ggml_init_params gp = { 256*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(gp);
+        ggml_tensor * out = moe_graph(ctx, c, hf, x, ids, ids, weights);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, out);
+        ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu));
+        ggml_gallocr_alloc_graph(ga, gf);
+        ggml_backend_graph_compute(cpu, gf);
+        ggml_backend_tensor_get(out, exact.data(), 0, ggml_nbytes(out));
+        ggml_gallocr_free(ga);
+        ggml_free(ctx);
+        ggml_backend_buffer_free(buf_f);
+        ggml_free(ctx_f);
+    }
+    auto nmse_of = [](const std::vector<float> & a, const std::vector<float> & b) {
+        double err = 0.0, norm = 0.0;
+        for (size_t i = 0; i < b.size(); ++i) {
+            err  += (a[i] - b[i])*(double) (a[i] - b[i]);
+            norm += b[i]*(double) b[i];
+        }
+        return norm > 0.0 ? err/norm : err;
+    };
+    const double nmse_ref = nmse_of(ref, exact);
+
     // the banks on the tested backend: n_slots random experts, then the zeroed miss slot and padding;
     // weights [k, n, slots] and biases [n, slots], selected by slot like the expert handoff's cache
     std::vector<int32_t> slot_of(c.n_expert, (int32_t) c.n_slots);
@@ -398,7 +446,7 @@ static bool run_case(ggml_backend_t be, ggml_backend_t cpu, const mailbox_alloc 
     const int n_rep = 3;
     std::vector<float> got(c.n_embd*c.n_tokens);
     bool ok = true;
-    double nmse = 0.0;
+    double nmse = 0.0, nmse_exact = 0.0;
     int rep = 0;
     for (; rep < n_rep && ok; ++rep) {
         ggml_init_params gp = { 256*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
@@ -429,13 +477,11 @@ static bool run_case(ggml_backend_t be, ggml_backend_t cpu, const mailbox_alloc 
         ggml_gallocr_free(ga);
         ggml_free(ctx);
 
-        double err = 0.0, norm = 0.0;
-        for (size_t i = 0; i < ref.size(); ++i) {
-            err  += (got[i] - ref[i])*(double) (got[i] - ref[i]);
-            norm += ref[i]*(double) ref[i];
-        }
-        nmse = norm > 0.0 ? err/norm : err;
-        if (!(nmse < 5e-4)) {
+        nmse       = nmse_of(got, ref);
+        nmse_exact = nmse_of(got, exact);
+        // no further from the exact result than ggml's CPU path (a little slack: with the same int8 scheme as ggml's
+        // dots the two round differently case by case), and close to ggml's
+        if (!(nmse_exact <= 1.25*nmse_ref + 1e-7) || !(nmse < 1e-3)) {
             ok = false;
         }
     }
@@ -476,12 +522,13 @@ static bool run_case(ggml_backend_t be, ggml_backend_t cpu, const mailbox_alloc 
         }
     }
 
-    printf("  %-7s/%-7s %-7s %-11s embd %4lld ff %4lld exp %3lld used %2lld%s tok %2lld cached %3lld%s%s%s: nmse %.2e, host %llu, timeouts %u  %s\n",
+    printf("  %-7s/%-7s %-7s %-11s embd %4lld ff %4lld exp %3lld used %2lld%s tok %2lld cached %3lld%s%s%s: nmse %.2e "
+           "(vs exact %.2e, ggml's %.2e), host %llu, timeouts %u  %s\n",
         ggml_type_name(c.type_gu), ggml_type_name(c.type_down), c.merged ? "gate_up" : (c.gated() ? "gate+up" : "up"),
         act_name(c.act), (long long) c.n_embd, (long long) c.n_ff, (long long) c.n_expert, (long long) c.n_used,
         c.n_count ? (" count " + std::to_string(c.n_count)).c_str() : "", (long long) c.n_tokens, (long long) c.n_slots,
         c.scales ? " scales" : "", c.biases ? " biases" : "", c.weight_before ? " w-before" : "",
-        nmse, (unsigned long long) st.n_host, timeouts, ok ? "OK" : "FAIL");
+        nmse, nmse_exact, nmse_ref, (unsigned long long) st.n_host, timeouts, ok ? "OK" : "FAIL");
     if (verbose && !ok) {
         for (int i = 0; i < 8 && i < (int) ref.size(); ++i) {
             printf("    [%d] ref %.6f got %.6f\n", i, ref[i], got[i]);
@@ -665,7 +712,12 @@ static int run_bench(ggml_type type, int64_t n_embd, int64_t n_ff, int64_t n_exp
         printf("  %2d workers, reading a plain buffer: %.1f GB/s\n", nw, bench_read_gbps(nw, (size_t) 2 << 30));
         ggml_expert_handoff_host_t host = ggml_expert_handoff_host_new(mb, dims.max_tokens, dims.max_embd, dims.max_used, n_layer, nw);
         for (int il = 0; il < n_layer; ++il) {
-            ggml_expert_handoff_host_set_layer(host, il, &hls[il]);
+            if (!ggml_expert_handoff_host_set_layer(host, il, &hls[il])) {
+                fprintf(stderr, "the pool rejected the layer (%s, %lld x %lld)\n", ggml_type_name(type), (long long) n_embd, (long long) n_ff);
+                ggml_expert_handoff_host_free(host);
+                ggml_free(ctx);
+                return 1;
+            }
         }
         for (int nt : token_list) {
           for (int shared = 0; shared <= (nt > 1 ? 1 : 0); ++shared) {
@@ -1204,7 +1256,12 @@ int main(int argc, char ** argv) {
                 workers.clear();
                 for (const char * p = argv[i + 2]; *p; ) { workers.push_back(atoi(p)); while (*p && *p != ',') { ++p; } if (*p) { ++p; } }
             }
-            return run_bench(type, 2560, 640, 512, 4, workers, { 1, 2, 4, 10 }, { 1, 4 });
+            if (ggml_blck_size(type) > 64) {
+                // the K-quants and IQ4_XS take rows of a multiple of 256: Qwen3-30B-A3B's experts (2048 x 768, 128 per
+                // layer), 16 layers for about as many bytes
+                return run_bench(type, 2048, 768, 128, 16, workers, { 1, 2, 4, 8 }, { 1, 4, 16 });
+            }
+            return run_bench(type, 2560, 640, 512, 4, workers, { 1, 2, 4, 10 }, { 1, 4, 16 });
         }
     }
 
@@ -1243,6 +1300,14 @@ int main(int argc, char ** argv) {
         { GGML_TYPE_F32,    GGML_TYPE_F32,     128,  64,  8, 2,  1,  3, false, SILU, false },
         { GGML_TYPE_Q2_0,   GGML_TYPE_Q2_0,    512, 128, 32, 8,  4, 12, false, SILU, false }, // Flash-Next's experts
         { GGML_TYPE_Q2_0,   GGML_TYPE_Q2_0,    512, 128, 32, 8, 12,  4, false, SILU, false }, // tokens sharing misses
+        // [TAG_EH_Q2_ACT] the other types with an int8 path, one token and several sharing misses
+        { GGML_TYPE_Q5_K,   GGML_TYPE_Q5_K,    512, 256, 32, 8,  1, 12, false, SILU, false },
+        { GGML_TYPE_Q5_K,   GGML_TYPE_Q6_K,    512, 256, 32, 8, 12,  4, false, SILU, false },
+        { GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL,  256, 128, 16, 4,  1,  6, false, SILU, false },
+        { GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0,    256, 128, 16, 4, 12,  2, false, SILU, false },
+        { GGML_TYPE_Q6_K,   GGML_TYPE_Q6_K,    512, 256, 32, 8,  1, 12, false, SILU, false },
+        { GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0,    512, 256, 32, 8, 12,  4, false, SILU, false },
+        { GGML_TYPE_MXFP4,  GGML_TYPE_MXFP4,   256, 128, 16, 4, 12,  2, false, SILU, false },
     };
     auto add = [&](test_case c) { cases.push_back(c); return &cases.back(); };
     {   // gpt-oss: swiglu_oai with biases on every projection

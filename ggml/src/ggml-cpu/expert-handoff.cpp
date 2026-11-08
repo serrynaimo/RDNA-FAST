@@ -22,6 +22,7 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #if defined(_WIN32) // [TAG_EH_POOL2] the physical cores
@@ -197,76 +198,338 @@ void eh_dot_n(const ggml_type_traits_cpu * tr, int n, const uint8_t * row, const
 }
 
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
-#define EH_Q2_FAST 1
-// [TAG_EH_Q2_ACT] Q2_0 rows against int8 activations (AVX-512 VBMI/VNNI). An activation is int8 in chunks of 32 with
-// an f32 scale d per chunk, 64-byte aligned, plus hx = d * (sum of the chunk's int8): a Q2_0 weight is (code - 1) * dw,
-// so row . x = sum over blocks of dw * (d * sum(code * q) - hx), and the hx part is one FMA per eight blocks. Per
-// 64-weight block that is one unpack (shared by all tokens), then per token one VNNI dot, one convert, one permute of
-// the block's two scale products and one FMA into a float accumulator reduced once per row. ggml's Q2_0 x Q8_0 dot
-// does two dots, scalar fp16 conversions and a blend per block, and reduces per call.
+#define EH_INT8_FAST 1
+// [TAG_EH_Q2_ACT] expert rows against int8 activations (AVX-512 VBMI/VNNI), for the expert types below. An activation
+// is int8 in chunks of 32 values with an f32 scale per chunk, 64-byte aligned, and per 64 values, lane by lane (16
+// lanes of 4 values), its chunk's scale d16. Every weight type is unpacked, 64 weights at a time, to bytes w and per
+// lane a scale a, the offsets going in one of three ways (eh_mode): the 32-block types and Q6_K unpack to signed codes
+// (weight = a * w) and take the activations plus 128 (as unsigned bytes), and per 64 weights and token a VNNI dot
+// started at -128 times the lane's weight sum (once for all the tokens) is the exact integer dot. The super-block
+// types with an offset per sub-block of 32 (the K-quants' mins, IQ4_XS's 128 times its scales: weight = a * w - m,
+// w unsigned) take the activations as they are, and their 8 offsets times the chunk sums h32 (d * the chunk's int8
+// sum) once per super-block. Q2_0 (one scale per 64 weights) takes them as they are too, its offset times the two
+// chunk sums a scalar per block and token: at 2 bits a weight one token is not bound by memory, and the weight sum
+// costs it 3-8% there. A token then costs per 64 weights one dot, a convert and two float ops, and loads only its 64
+// bytes and d16 (a third load, a per-lane offset sum, cost 25% at 8 tokens); the unpack is shared by all the tokens
+// that miss the expert. One or two tokens use 4 or 2 accumulators, as one would chain every block's FMA on the last.
+// The scale per 32 activations makes the K-quants' and IQ4_XS's dots 2-3x closer to the exact one than ggml's Q8_K
+// (one scale per 256).
 struct eh_act {
-    const int8_t * q;     // n values, 64-byte aligned
-    const float  * d16;   // per 64 values: the two chunk scales, each in 8 lanes
-    const float  * hx16;  // per 64 values: the two chunks' hx/8, each in 8 lanes (the lanes of a chunk add up to hx)
+    const uint8_t * q;   // the int8 values (plus 128 for the biased types)
+    const float   * d16;
+    const float   * h32; // the others: per 32 values d * (sum of the chunk's int8)
 };
 
-// x (n values, n % 64 == 0) into q, d16, hx16 (n/64*16 floats each)
-void eh_act_quant(const float * x, int n, int8_t * q, float * d16, float * hx16) {
-    for (int k = 0; k < n/32; ++k) {
-        const __m512 x0 = _mm512_loadu_ps(x + 32*k);
-        const __m512 x1 = _mm512_loadu_ps(x + 32*k + 16);
-        const float amax = _mm512_reduce_max_ps(_mm512_max_ps(_mm512_abs_ps(x0), _mm512_abs_ps(x1)));
-        const __m512 inv = _mm512_set1_ps(amax > 0.0f ? 127.0f/amax : 0.0f);
-        const __m512i v0 = _mm512_cvtps_epi32(_mm512_mul_ps(x0, inv));
-        const __m512i v1 = _mm512_cvtps_epi32(_mm512_mul_ps(x1, inv));
-        _mm_storeu_si128((__m128i *) (q + 32*k),      _mm512_cvtsepi32_epi8(v0));
-        _mm_storeu_si128((__m128i *) (q + 32*k + 16), _mm512_cvtsepi32_epi8(v1));
-        const float d  = amax/127.0f;
-        const float hx = d*(float) _mm512_reduce_add_epi32(_mm512_add_epi32(v0, v1));
-        // chunk k is half k % 2 of block k / 2: lanes 8*(k % 2) .. + 7
-        for (int l = 0; l < 8; ++l) {
-            d16 [16*(k/2) + 8*(k % 2) + l] = d;
-            hx16[16*(k/2) + 8*(k % 2) + l] = hx*0.125f;
+// x (n values, n % 64 == 0) into q (n bytes) and d16 (n/4 floats); biased: q holds the values plus 128, else h32 (n/32
+// floats) gets the chunk sums
+void eh_act_quant(const float * x, int n, uint8_t * q, float * d16, float * h32, bool biased) {
+    const __m512i ones = _mm512_set1_epi8(1);
+    const __m128i bias = _mm_set1_epi8(biased ? (char) 0x80 : 0);
+    for (int b = 0; b < n/64; ++b) {
+        float d[2];
+        __m512i v[4];
+        for (int h = 0; h < 2; ++h) {
+            const __m512 x0 = _mm512_loadu_ps(x + 64*b + 32*h);
+            const __m512 x1 = _mm512_loadu_ps(x + 64*b + 32*h + 16);
+            const float amax = _mm512_reduce_max_ps(_mm512_max_ps(_mm512_abs_ps(x0), _mm512_abs_ps(x1)));
+            const __m512 inv = _mm512_set1_ps(amax > 0.0f ? 127.0f/amax : 0.0f);
+            v[2*h]     = _mm512_cvtps_epi32(_mm512_mul_ps(x0, inv));
+            v[2*h + 1] = _mm512_cvtps_epi32(_mm512_mul_ps(x1, inv));
+            d[h] = amax/127.0f;
+        }
+        uint8_t * qb = q + 64*b;
+        for (int i = 0; i < 4; ++i) {
+            _mm_storeu_si128((__m128i *) (qb + 16*i), _mm_xor_si128(_mm512_cvtsepi32_epi8(v[i]), bias));
+        }
+        const __m512 dv = _mm512_mask_blend_ps((__mmask16) 0xFF00, _mm512_set1_ps(d[0]), _mm512_set1_ps(d[1]));
+        _mm512_storeu_ps(d16 + 16*b, dv);
+        if (!biased) {
+            // the lane sums: a VNNI dot with ones adds each lane's 4 bytes
+            const __m512i sum = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, _mm512_load_si512((const void *) qb));
+            const __m512 sv = _mm512_mul_ps(dv, _mm512_cvtepi32_ps(sum));
+            h32[2*b]     = _mm512_mask_reduce_add_ps((__mmask16) 0x00FF, sv);
+            h32[2*b + 1] = _mm512_mask_reduce_add_ps((__mmask16) 0xFF00, sv);
         }
     }
 }
 
-// out[t] = row . a[t] for NT tokens; row: nb blocks of { f16 d; 16 bytes of 2-bit codes } (block_q2_0). Per block the
-// weight scale is read once and the codes unpacked once; per token, lane by lane, (code . q) * d - hx/8, times the weight
-// scale, into the token's accumulator. One or two tokens alone would chain every block's FMA on the last (4 cycles
-// each): U blocks go to U accumulators. (A vector of eight blocks' scales built through small stack stores stalled: 79
-// ns per row of 2560 against ggml's 63; per-token broadcasts of the two chunk scales: 176 ns for four tokens.)
-template <int NT>
-void eh_q2_rows(const uint8_t * row, int nb, const eh_act * a, float * out) {
-    static_assert(sizeof(block_q2_0) == 18, "block_q2_0 layout");
-    constexpr int U = NT == 1 ? 4 : NT == 2 ? 2 : 1;
-    __m512 acc[U][NT];
-    for (int u = 0; u < U; ++u) {
-        for (int t = 0; t < NT; ++t) {
-            acc[u][t] = _mm512_setzero_ps();
-        }
-    }
-    const __m512i ctl   = _mm512_set1_epi64(0x0E0C0A0806040200LL);
-    const __m512i three = _mm512_set1_epi8(3);
-    const __m512i zero  = _mm512_setzero_si512();
-    auto block = [&](int b, int u) {
+// two 16-byte nibble runs (two blocks of 32: low nibbles then high nibbles of each) -> 64 codes in value order, in the
+// low 4 bits of each byte (the high 4 are left over: the lookups below take 16 entries repeated 4 times)
+static inline __m512i eh_nib4(const uint8_t * p0, const uint8_t * p1) {
+    const __m512i v = _mm512_mask_broadcast_i32x4(_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) p0)),
+                                                  (__mmask16) 0xFF00, _mm_loadu_si128((const __m128i *) p1));
+    const long long s4 = 0x0004000400040004LL; // the high nibbles in the 2nd and 4th 16 bytes
+    return _mm512_srlv_epi16(v, _mm512_set_epi64(s4, s4, 0, 0, s4, s4, 0, 0));
+}
+
+static inline __m512 eh_two(float s0, float s1) {
+    return _mm512_mask_blend_ps((__mmask16) 0xFF00, _mm512_set1_ps(s0), _mm512_set1_ps(s1));
+}
+
+// lanes 0-7: v[i], lanes 8-15: v[i + 1] (v: 8 floats)
+static inline __m512 eh_pair(__m256 v, int i) {
+    return _mm512_permutexvar_ps(_mm512_add_epi32(_mm512_set1_epi32(i),
+        _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1)), _mm512_castps256_ps512(v));
+}
+
+// the 8 six-bit scales and mins of a Q4_K / Q5_K super-block (the steps of ggml's x86 K-quant dots)
+static inline void eh_k4_scales(const uint8_t * q, float d, float dmin, __m256 & sc, __m256 & mn) {
+    uint32_t utmp[4];
+    memcpy(utmp, q, 12);
+    const uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f, kmask3 = 0x03030303;
+    utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+    const uint32_t uaux = utmp[1] & kmask1;
+    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+    utmp[2] = uaux;
+    utmp[0] &= kmask1;
+    sc = _mm256_mul_ps(_mm256_set1_ps(d),    _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *) &utmp[0]))));
+    mn = _mm256_mul_ps(_mm256_set1_ps(dmin), _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *) &utmp[2]))));
+}
+
+// 64-byte lookup tables for vpermb (the low 6 bits of the index): 16 codes repeated 4 times; IQ4_XS's plus 128
+#define EH_LUT16(...) { __VA_ARGS__, __VA_ARGS__, __VA_ARGS__, __VA_ARGS__ }
+alignas(64) static const int8_t  eh_lut_q4_0[64]   = EH_LUT16(-8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7);
+alignas(64) static const int8_t  eh_lut_iq4nl[64]  = EH_LUT16(-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+alignas(64) static const int8_t  eh_lut_mxfp4[64]  = EH_LUT16(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+alignas(64) static const uint8_t eh_lut_iq4nl_u[64] = EH_LUT16(1, 24, 45, 63, 79, 93, 106, 118, 129, 141, 153, 166, 181, 197, 217, 241);
+#undef EH_LUT16
+
+// how a type's offsets go in (see above)
+enum eh_mode {
+    EH_BIASED, // signed codes against the activations plus 128
+    EH_MINS,   // unsigned codes; the 8 offsets of the current super-block in c8, against the chunk sums
+    EH_OFF64,  // unsigned codes, one scale per 64 weights; the block's offset in ak, against its two chunk sums
+};
+
+// the unpackers: block b of 64 weights of a row -> its bytes w and lane scales a
+struct eh_up_q2_0 {
+    static constexpr eh_mode kMode = EH_OFF64;
+    static constexpr int     kQ    = 64;
+    const uint8_t * row;
+    float ak; // the block's offset: its scale times 1 (codes 0-3 for -1..2)
+    void get(int b, __m512i & w, __m512 & a) {
         const uint8_t * blk = row + (size_t) b*18;
         uint16_t h;
         memcpy(&h, blk, 2);
-        const __m512 dw = _mm512_set1_ps(_cvtsh_ss(h));
-        // 16 code bytes as 8 u16 of 8 codes each -> 64 bytes, one code each
-        const __m512i w = _mm512_and_si512(_mm512_multishift_epi64_epi8(ctl,
-            _mm512_cvtepu16_epi64(_mm_loadu_si128((const __m128i *) (blk + 2)))), three);
+        w = _mm512_and_si512(_mm512_multishift_epi64_epi8(_mm512_set1_epi64(0x0E0C0A0806040200LL),
+                _mm512_cvtepu16_epi64(_mm_loadu_si128((const __m128i *) (blk + 2)))), _mm512_set1_epi8(3));
+        ak = _cvtsh_ss(h);
+        a = _mm512_set1_ps(ak);
+    }
+};
+
+// the 32-block 4-bit types: two blocks of a byte scale (or two) and 16 bytes of nibbles each
+template <int kBlk, int kHdr, const int8_t * kLut>
+struct eh_up_nib32 {
+    static constexpr eh_mode kMode = EH_BIASED;
+    static constexpr int     kQ    = 64;
+    const uint8_t * row;
+    __m512i lut = _mm512_load_si512((const void *) kLut);
+    void get(int b, __m512i & w, __m512 & a) {
+        const uint8_t * b0 = row + (size_t) (2*b)*kBlk;
+        const uint8_t * b1 = b0 + kBlk;
+        w = _mm512_permutexvar_epi8(eh_nib4(b0 + kHdr, b1 + kHdr), lut);
+        if constexpr (kHdr == 2) {
+            uint16_t h0, h1;
+            memcpy(&h0, b0, 2);
+            memcpy(&h1, b1, 2);
+            a = eh_two(_cvtsh_ss(h0), _cvtsh_ss(h1));
+        } else {
+            a = eh_two(GGML_E8M0_TO_FP32_HALF(b0[0]), GGML_E8M0_TO_FP32_HALF(b1[0]));
+        }
+    }
+};
+using eh_up_q4_0   = eh_up_nib32<18, 2, eh_lut_q4_0>;
+using eh_up_iq4_nl = eh_up_nib32<18, 2, eh_lut_iq4nl>;
+using eh_up_mxfp4  = eh_up_nib32<17, 1, eh_lut_mxfp4>;
+
+struct eh_up_q8_0 {
+    static constexpr eh_mode kMode = EH_BIASED;
+    static constexpr int     kQ    = 64;
+    const uint8_t * row;
+    void get(int b, __m512i & w, __m512 & a) {
+        const uint8_t * b0 = row + (size_t) (2*b)*34;
+        const uint8_t * b1 = b0 + 34;
+        uint16_t h0, h1;
+        memcpy(&h0, b0, 2);
+        memcpy(&h1, b1, 2);
+        w = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) (b0 + 2))),
+                               _mm256_loadu_si256((const __m256i *) (b1 + 2)), 1);
+        a = eh_two(_cvtsh_ss(h0), _cvtsh_ss(h1));
+    }
+};
+
+struct eh_up_iq4_xs {
+    static constexpr eh_mode kMode = EH_MINS;
+    static constexpr int     kQ    = 256;
+    const uint8_t * row;
+    __m512i lut = _mm512_load_si512((const void *) eh_lut_iq4nl_u);
+    int    cur = -1;
+    __m256 dl, c8; // the 8 scales, and 128 times them (the codes come plus 128)
+    void get(int b, __m512i & w, __m512 & a) {
+        const block_iq4_xs * x = (const block_iq4_xs *) row + b/4;
+        const int j = b % 4;
+        if (b/4 != cur) {
+            cur = b/4;
+            // the 8 six-bit scales: four bits each from scales_l, two from scales_h, spread into bytes
+            uint32_t sl;
+            memcpy(&sl, x->scales_l, 4);
+            const uint64_t ls = _pdep_u64(sl, 0x0F0F0F0F0F0F0F0FULL) | (_pdep_u64(x->scales_h, 0x0303030303030303ULL) << 4);
+            const __m256 v = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_cvtsi64_si128((long long) ls)));
+            dl = _mm256_mul_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x->d)), _mm256_sub_ps(v, _mm256_set1_ps(32.0f)));
+            c8 = _mm256_mul_ps(dl, _mm256_set1_ps(128.0f));
+        }
+        w = _mm512_permutexvar_epi8(eh_nib4(x->qs + 32*j, x->qs + 32*j + 16), lut);
+        a = eh_pair(dl, 2*j);
+    }
+};
+
+// Q4_K / Q5_K: per 64 weights, 32 bytes of nibbles (low: the first 32 values, high: the next 32), two sub-block
+// scales and mins
+struct eh_up_q4_K {
+    static constexpr eh_mode kMode = EH_MINS;
+    static constexpr int     kQ    = 256;
+    const uint8_t * row;
+    int    cur = -1;
+    __m256 a8, c8;
+    void get(int b, __m512i & u, __m512 & a) {
+        const block_q4_K * x = (const block_q4_K *) row + b/4;
+        const int j = b % 4;
+        if (b/4 != cur) {
+            cur = b/4;
+            ggml_fp16_t dm[2]; // d, then dmin (the union is named differently in C and C++)
+            memcpy(dm, x, sizeof(dm));
+            eh_k4_scales(x->scales, GGML_CPU_FP16_TO_FP32(dm[0]), GGML_CPU_FP16_TO_FP32(dm[1]), a8, c8);
+        }
+        const __m256i y = _mm256_loadu_si256((const __m256i *) (x->qs + 32*j));
+        const __m256i mk = _mm256_set1_epi8(0x0F);
+        u = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_and_si256(y, mk)),
+                               _mm256_and_si256(_mm256_srli_epi16(y, 4), mk), 1);
+        a = eh_pair(a8, 2*j);
+    }
+};
+
+struct eh_up_q5_K {
+    static constexpr eh_mode kMode = EH_MINS;
+    static constexpr int     kQ    = 256;
+    const uint8_t * row;
+    int    cur = -1;
+    __m256 a8, c8;
+    void get(int b, __m512i & u, __m512 & a) {
+        const block_q5_K * x = (const block_q5_K *) row + b/4;
+        const int j = b % 4;
+        if (b/4 != cur) {
+            cur = b/4;
+            ggml_fp16_t dm[2]; // d, then dmin (the union is named differently in C and C++)
+            memcpy(dm, x, sizeof(dm));
+            eh_k4_scales(x->scales, GGML_CPU_FP16_TO_FP32(dm[0]), GGML_CPU_FP16_TO_FP32(dm[1]), a8, c8);
+        }
+        const __m256i y  = _mm256_loadu_si256((const __m256i *) (x->qs + 32*j));
+        const __m256i qh = _mm256_loadu_si256((const __m256i *) x->qh);
+        const __m256i mk = _mm256_set1_epi8(0x0F), one = _mm256_set1_epi8(1);
+        // the fifth bit: bit 2j of qh[l] for the first 32 values, bit 2j + 1 for the next 32
+        const __m256i b0 = _mm256_and_si256(_mm256_srl_epi16(qh, _mm_cvtsi32_si128(2*j)), one);
+        const __m256i b1 = _mm256_and_si256(_mm256_srl_epi16(qh, _mm_cvtsi32_si128(2*j + 1)), one);
+        const __m256i lo = _mm256_or_si256(_mm256_and_si256(y, mk), _mm256_slli_epi16(b0, 4));
+        const __m256i hi = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(y, 4), mk), _mm256_slli_epi16(b1, 4));
+        u = _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+        a = eh_pair(a8, 2*j);
+    }
+};
+
+// Q6_K (signed: the codes less 32): per 128 weights (half a super-block) ql 64 bytes, qh 32 bytes, 8 sub-block scales
+// of 16 weights; the first 64 weights take the low nibbles of ql and qh bits 0-3, the next 64 the high nibbles and qh
+// bits 4-7
+struct eh_up_q6_K {
+    static constexpr eh_mode kMode = EH_BIASED;
+    static constexpr int     kQ    = 256;
+    const uint8_t * row;
+    int   cur = -1;
+    float sd[16]; // the super-block's 16 scales times d
+    void get(int b, __m512i & w, __m512 & a) {
+        const block_q6_K * x = (const block_q6_K *) row + b/4;
+        const int j = b % 4;
+        const int n = j/2, p = j % 2;
+        const uint8_t * ql = x->ql + 64*n;
+        const uint8_t * qh = x->qh + 32*n;
+        if (b/4 != cur) {
+            cur = b/4;
+            const __m512 d = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(x->d));
+            _mm512_storeu_ps(sd, _mm512_mul_ps(d, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *) x->scales)))));
+        }
+        const __m256i L0 = _mm256_loadu_si256((const __m256i *) ql);
+        const __m256i L1 = _mm256_loadu_si256((const __m256i *) (ql + 32));
+        const __m256i H  = _mm256_loadu_si256((const __m256i *) qh);
+        const __m256i mk = _mm256_set1_epi8(0x0F), m3 = _mm256_set1_epi8(3);
+        const __m128i sl = _mm_cvtsi32_si128(4*p), sh0 = _mm_cvtsi32_si128(4*p), sh1 = _mm_cvtsi32_si128(4*p + 2);
+        const __m256i lo = _mm256_or_si256(_mm256_and_si256(_mm256_srl_epi16(L0, sl), mk),
+                                           _mm256_slli_epi16(_mm256_and_si256(_mm256_srl_epi16(H, sh0), m3), 4));
+        const __m256i hi = _mm256_or_si256(_mm256_and_si256(_mm256_srl_epi16(L1, sl), mk),
+                                           _mm256_slli_epi16(_mm256_and_si256(_mm256_srl_epi16(H, sh1), m3), 4));
+        w = _mm512_sub_epi8(_mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1), _mm512_set1_epi8(32));
+        // lanes of 4 weights: lanes 0-3 take scale 8n + 4p, 4-7 the next, ...
+        const int s0 = 8*n + 4*p;
+        a = _mm512_permutexvar_ps(_mm512_add_epi32(_mm512_set1_epi32(s0),
+                _mm512_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3)), _mm512_loadu_ps(sd));
+    }
+};
+
+// out[t] = row . a[t] for NT tokens; n values per row (a multiple of UP::kQ)
+template <int NT, typename UP>
+void eh_rows(const uint8_t * row, int n, const eh_act * act, float * out) {
+    constexpr int U = NT == 1 ? 4 : NT == 2 ? 2 : 1;
+    // EH_MINS: a sub-block's offset weighs the sum of its 32 activations, so the offsets go in once per super-block:
+    // its 8 offsets times the 8 chunk sums (as a vector per 64 weights they cost more than the dot: 4 tokens 407 ns per
+    // row of 2560 for Q4_K against ggml's 229)
+    __m512 acc[U][NT];
+    __m256 accm[NT];
+    float  accs[NT] = {};
+    for (int k = 0; k < U; ++k) {
         for (int t = 0; t < NT; ++t) {
-            const __m512i dot = _mm512_dpbusd_epi32(zero, w, _mm512_load_si512((const void *) (a[t].q + (size_t) b*64)));
-            const __m512 v = _mm512_fmsub_ps(_mm512_cvtepi32_ps(dot), _mm512_loadu_ps(a[t].d16 + 16*b), _mm512_loadu_ps(a[t].hx16 + 16*b));
-            acc[u][t] = _mm512_fmadd_ps(dw, v, acc[u][t]);
+            acc[k][t] = _mm512_setzero_ps();
+        }
+    }
+    for (int t = 0; t < NT; ++t) {
+        accm[t] = _mm256_setzero_ps();
+    }
+    UP up;
+    up.row = row;
+    const __m512i zero = _mm512_setzero_si512();
+    const __m512i c128 = _mm512_set1_epi8((char) 0x80);
+    // inlined by force: from 3-6 tokens up clang called it per block, with the accumulators on the stack (Q4_K at 4
+    // tokens 342 ns per row of 2560 against 220 for ggml)
+    auto block = [&](int b, int k) __attribute__((always_inline)) {
+        __m512i w;
+        __m512 a;
+        up.get(b, w, a);
+        __m512i init = zero;
+        if constexpr (UP::kMode == EH_MINS) {
+            if (b % 4 == 0) {
+                for (int t = 0; t < NT; ++t) {
+                    accm[t] = _mm256_fmadd_ps(up.c8, _mm256_loadu_ps(act[t].h32 + 2*b), accm[t]);
+                }
+            }
+        } else if constexpr (UP::kMode == EH_BIASED) {
+            // the activations come plus 128: each lane's dot starts at -128 times its weights' sum
+            init = _mm512_sub_epi32(zero, _mm512_dpbusd_epi32(zero, c128, w));
+        }
+        for (int t = 0; t < NT; ++t) {
+            const __m512i x = _mm512_load_si512((const void *) (act[t].q + (size_t) b*64));
+            const __m512i dot = UP::kMode == EH_BIASED ? _mm512_dpbusd_epi32(init, x, w) : _mm512_dpbusd_epi32(zero, w, x);
+            if constexpr (UP::kMode == EH_OFF64) {
+                accs[t] += up.ak*(act[t].h32[2*b] + act[t].h32[2*b + 1]);
+            }
+            const __m512 d16 = _mm512_loadu_ps(act[t].d16 + 16*b);
+            acc[k][t] = _mm512_fmadd_ps(a, _mm512_mul_ps(_mm512_cvtepi32_ps(dot), d16), acc[k][t]);
         }
     };
+    const int nb = n/64;
     int b = 0;
     for (; b + U <= nb; b += U) {
-        for (int u = 0; u < U; ++u) {
-            block(b + u, u);
+        // unrolled by force too: as a loop (Q5_K, 1 token) the accumulators went through the stack
+#pragma GCC unroll 4
+        for (int k = 0; k < U; ++k) {
+            block(b + k, k);
         }
     }
     for (; b < nb; ++b) {
@@ -274,23 +537,68 @@ void eh_q2_rows(const uint8_t * row, int nb, const eh_act * a, float * out) {
     }
     for (int t = 0; t < NT; ++t) {
         __m512 s = acc[0][t];
-        for (int u = 1; u < U; ++u) {
-            s = _mm512_add_ps(s, acc[u][t]);
+        for (int k = 1; k < U; ++k) {
+            s = _mm512_add_ps(s, acc[k][t]);
         }
-        out[t] = _mm512_reduce_add_ps(s);
+        float r = _mm512_reduce_add_ps(s) - accs[t];
+        if constexpr (UP::kMode == EH_MINS) {
+            __m128 m = _mm_add_ps(_mm256_castps256_ps128(accm[t]), _mm256_extractf128_ps(accm[t], 1));
+            m = _mm_hadd_ps(m, m);
+            m = _mm_hadd_ps(m, m);
+            r -= _mm_cvtss_f32(m);
+        }
+        out[t] = r;
     }
 }
 
-void eh_q2_dot(const uint8_t * row, int nb, const eh_act * a, int nt, float * out) {
+template <typename UP>
+void eh_rows_n(const uint8_t * row, int n, const eh_act * a, int nt, float * out) {
     switch (nt) {
-        case 1: eh_q2_rows<1>(row, nb, a, out); break;
-        case 2: eh_q2_rows<2>(row, nb, a, out); break;
-        case 3: eh_q2_rows<3>(row, nb, a, out); break;
-        case 4: eh_q2_rows<4>(row, nb, a, out); break;
-        case 5: eh_q2_rows<5>(row, nb, a, out); break;
-        case 6: eh_q2_rows<6>(row, nb, a, out); break;
-        case 7: eh_q2_rows<7>(row, nb, a, out); break;
-        default: eh_q2_rows<8>(row, nb, a, out); break;
+        case 1: eh_rows<1, UP>(row, n, a, out); break;
+        case 2: eh_rows<2, UP>(row, n, a, out); break;
+        case 3: eh_rows<3, UP>(row, n, a, out); break;
+        case 4: eh_rows<4, UP>(row, n, a, out); break;
+        case 5: eh_rows<5, UP>(row, n, a, out); break;
+        case 6: eh_rows<6, UP>(row, n, a, out); break;
+        case 7: eh_rows<7, UP>(row, n, a, out); break;
+        default: eh_rows<8, UP>(row, n, a, out); break;
+    }
+}
+
+// calls f with a null pointer to the unpacker of type t; false for the types without an int8 path
+template <typename F>
+static bool eh_with_up(ggml_type t, F && f) {
+    switch (t) {
+        case GGML_TYPE_Q2_0:   f((eh_up_q2_0   *) nullptr); return true;
+        case GGML_TYPE_Q4_0:   f((eh_up_q4_0   *) nullptr); return true;
+        case GGML_TYPE_Q8_0:   f((eh_up_q8_0   *) nullptr); return true;
+        case GGML_TYPE_IQ4_NL: f((eh_up_iq4_nl *) nullptr); return true;
+        case GGML_TYPE_MXFP4:  f((eh_up_mxfp4  *) nullptr); return true;
+        case GGML_TYPE_IQ4_XS: f((eh_up_iq4_xs *) nullptr); return true;
+        case GGML_TYPE_Q4_K:   f((eh_up_q4_K   *) nullptr); return true;
+        case GGML_TYPE_Q5_K:   f((eh_up_q5_K   *) nullptr); return true;
+        case GGML_TYPE_Q6_K:   f((eh_up_q6_K   *) nullptr); return true;
+        default:               return false;
+    }
+}
+
+// rows of n values of type t have an int8 path (n a multiple of its unpack size)
+bool eh_fast_ok(ggml_type t, int64_t n) {
+    bool ok = false;
+    eh_with_up(t, [&](auto up) { ok = n % std::remove_pointer_t<decltype(up)>::kQ == 0; });
+    return ok;
+}
+
+// whether type t takes the activations plus 128 (EH_BIASED), for eh_act_quant
+bool eh_fast_biased(ggml_type t) {
+    bool biased = false;
+    eh_with_up(t, [&](auto up) { biased = std::remove_pointer_t<decltype(up)>::kMode == EH_BIASED; });
+    return biased;
+}
+
+void eh_fast_dot(ggml_type t, const uint8_t * row, int n, const eh_act * a, int nt, float * out) {
+    if (!eh_with_up(t, [&](auto up) { eh_rows_n<std::remove_pointer_t<decltype(up)>>(row, n, a, nt, out); })) {
+        GGML_ABORT("fatal error");
     }
 }
 #endif
@@ -417,7 +725,7 @@ struct ggml_expert_handoff_host {
     uint32_t seq = 0;
     const eh_layer * job_layer = nullptr;
     int32_t n_tokens = 0;
-    bool fast_gu = false, fast_dn = false;       // [TAG_EH_Q2_ACT] the Q2_0 path for gate/up, for down
+    bool fast_gu = false, fast_dn = false;       // [TAG_EH_Q2_ACT] the int8 path for gate/up, for down
     std::vector<eh_miss> misses;
     std::vector<int32_t> miss_tokens;      // the tokens with misses
     std::vector<int32_t> tok_slot;         // [n_tokens]: the token's index in miss_tokens, -1 without misses
@@ -428,13 +736,13 @@ struct ggml_expert_handoff_host {
     std::vector<int32_t> cnt, fill;        // scratch of prepare()
     std::vector<uint8_t> xq;               // generic: [max_tokens] rows of the gate/up vec_dot type
     size_t xq_row = 0;
-    eh_abuf xa_q;                          // Q2_0 path: [n_tokens][n_embd] int8, and per 64 values d16 and hx16
-    std::vector<float> xa_d, xa_hx;        //   ([n_tokens][n_embd/4] each)
+    eh_abuf xa_q;                          // int8 path: [n_tokens][n_embd] bytes, d16 ([n_tokens][n_embd/4]) and
+    std::vector<float> xa_d, xa_h;         //   the chunk sums ([n_tokens][n_embd/32])
     std::vector<float> hf;                 // [n_miss][n_ff] the activations, f32
     std::vector<uint8_t> hq;               // generic: [n_miss] rows of the down vec_dot type
     size_t hq_row = 0;
-    eh_abuf ha_q;                          // Q2_0 path: [n_miss][n_ff] int8, d16, hx16 ([n_miss][n_ff/4] each)
-    std::vector<float> ha_d, ha_hx;
+    eh_abuf ha_q;                          // int8 path: [n_miss][n_ff] bytes, d16 and the chunk sums
+    std::vector<float> ha_d, ha_h;
     std::vector<std::vector<float>> acc;   // [worker] the down task's sums: [miss token][column]
 
     // stats
@@ -690,16 +998,16 @@ struct ggml_expert_handoff_host {
 
         // scratch
         const eh_layer & J = *job_layer;
-#if defined(EH_Q2_FAST)
-        fast_gu = J.type_gu   == GGML_TYPE_Q2_0 && J.n_embd % 64 == 0;
-        fast_dn = J.type_down == GGML_TYPE_Q2_0 && J.n_ff   % 64 == 0;
+#if defined(EH_INT8_FAST)
+        fast_gu = eh_fast_ok(J.type_gu,   J.n_embd);
+        fast_dn = eh_fast_ok(J.type_down, J.n_ff);
 #endif
         const size_t n_miss = misses.size();
         if (fast_gu) {
             xa_q.get((size_t) n_tokens*J.n_embd);
             if (xa_d.size() < (size_t) n_tokens*J.n_embd/4) {
                 xa_d.resize((size_t) n_tokens*J.n_embd/4);
-                xa_hx.resize((size_t) n_tokens*J.n_embd/4);
+                xa_h.resize((size_t) n_tokens*J.n_embd/32);
             }
         } else {
             xq_row = ggml_row_size(J.vt_gu, J.n_embd);
@@ -714,7 +1022,7 @@ struct ggml_expert_handoff_host {
             ha_q.get(n_miss*J.n_ff);
             if (ha_d.size() < n_miss*J.n_ff/4) {
                 ha_d.resize(n_miss*J.n_ff/4);
-                ha_hx.resize(n_miss*J.n_ff/4);
+                ha_h.resize(n_miss*J.n_ff/32);
             }
         } else {
             hq_row = ggml_row_size(J.vt_down, J.n_ff);
@@ -807,10 +1115,10 @@ struct ggml_expert_handoff_host {
         for (int64_t i = i0; i < i1; ++i) {
             const int32_t t = miss_tokens[i];
             const float * xt = x + (int64_t) t*dims.max_embd;
-#if defined(EH_Q2_FAST)
+#if defined(EH_INT8_FAST)
             if (fast_gu) {
-                eh_act_quant(xt, (int) J.n_embd, (int8_t *) xa_q.p + (size_t) t*J.n_embd,
-                    xa_d.data() + (size_t) t*J.n_embd/4, xa_hx.data() + (size_t) t*J.n_embd/4);
+                eh_act_quant(xt, (int) J.n_embd, xa_q.p + (size_t) t*J.n_embd, xa_d.data() + (size_t) t*J.n_embd/4,
+                    xa_h.data() + (size_t) t*J.n_embd/32, eh_fast_biased(J.type_gu));
                 continue;
             }
 #endif
@@ -844,19 +1152,18 @@ struct ggml_expert_handoff_host {
             for (int32_t k0 = uniq_begin[u]; k0 < uniq_begin[u + 1]; k0 += eh_multi_max) {
                 const int nk = std::min<int>(eh_multi_max, uniq_begin[u + 1] - k0);
                 float g[eh_multi_max] = {}, up[eh_multi_max];
-#if defined(EH_Q2_FAST)
+#if defined(EH_INT8_FAST)
                 if (fast_gu) {
                     eh_act a[eh_multi_max];
                     for (int j = 0; j < nk; ++j) {
                         const int32_t t = misses[by_expert[k0 + j]].t;
-                        a[j] = { (const int8_t *) xa_q.p + (size_t) t*J.n_embd, xa_d.data() + (size_t) t*J.n_embd/4,
-                                 xa_hx.data() + (size_t) t*J.n_embd/4 };
+                        a[j] = { xa_q.p + (size_t) t*J.n_embd, xa_d.data() + (size_t) t*J.n_embd/4,
+                                 xa_h.data() + (size_t) t*J.n_embd/32 };
                     }
-                    const int nb = (int) (J.n_embd/QK2_0);
                     if (rg) {
-                        eh_q2_dot(rg, nb, a, nk, g);
+                        eh_fast_dot(J.type_gu, rg, (int) J.n_embd, a, nk, g);
                     }
-                    eh_q2_dot(ru, nb, a, nk, up);
+                    eh_fast_dot(J.type_gu, ru, (int) J.n_embd, a, nk, up);
                 } else
 #endif
                 {
@@ -884,10 +1191,10 @@ struct ggml_expert_handoff_host {
         const int64_t n_ff = J.n_ff;
         for (int64_t m = m0; m < m1; ++m) {
             const float * h = hf.data() + (size_t) m*n_ff;
-#if defined(EH_Q2_FAST)
+#if defined(EH_INT8_FAST)
             if (fast_dn) {
-                eh_act_quant(h, (int) n_ff, (int8_t *) ha_q.p + (size_t) m*n_ff, ha_d.data() + (size_t) m*n_ff/4,
-                    ha_hx.data() + (size_t) m*n_ff/4);
+                eh_act_quant(h, (int) n_ff, ha_q.p + (size_t) m*n_ff, ha_d.data() + (size_t) m*n_ff/4,
+                    ha_h.data() + (size_t) m*n_ff/32, eh_fast_biased(J.type_down));
                 continue;
             }
 #endif
@@ -920,7 +1227,7 @@ struct ggml_expert_handoff_host {
             const float * bias = J.l.down_bias ? J.l.down_bias + (int64_t) e*J.n_embd : nullptr;
             for (int32_t k0 = uniq_begin[u]; k0 < uniq_begin[u + 1]; k0 += eh_multi_max) {
                 const int nk = std::min<int>(eh_multi_max, uniq_begin[u + 1] - k0);
-#if defined(EH_Q2_FAST)
+#if defined(EH_INT8_FAST)
                 eh_act a[eh_multi_max];
 #endif
                 const uint8_t * ys[eh_multi_max];
@@ -930,10 +1237,10 @@ struct ggml_expert_handoff_host {
                     const int32_t m = by_expert[k0 + j];
                     wm[j] = J.l.weight_before ? 1.0f : misses[m].w;
                     ts[j] = tok_slot[misses[m].t];
-#if defined(EH_Q2_FAST)
+#if defined(EH_INT8_FAST)
                     if (fast_dn) {
-                        a[j] = { (const int8_t *) ha_q.p + (size_t) m*J.n_ff, ha_d.data() + (size_t) m*J.n_ff/4,
-                                 ha_hx.data() + (size_t) m*J.n_ff/4 };
+                        a[j] = { ha_q.p + (size_t) m*J.n_ff, ha_d.data() + (size_t) m*J.n_ff/4,
+                                 ha_h.data() + (size_t) m*J.n_ff/32 };
                         continue;
                     }
 #endif
@@ -942,9 +1249,9 @@ struct ggml_expert_handoff_host {
                 for (int64_t c = c0; c < c1; ++c) {
                     const uint8_t * row = base + c*dn->nb[1];
                     float s[eh_multi_max];
-#if defined(EH_Q2_FAST)
+#if defined(EH_INT8_FAST)
                     if (fast_dn) {
-                        eh_q2_dot(row, (int) (J.n_ff/QK2_0), a, nk, s);
+                        eh_fast_dot(J.type_down, row, (int) J.n_ff, a, nk, s);
                     } else
 #endif
                     {
