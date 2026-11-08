@@ -4,11 +4,12 @@
 	 * small rotating spinner in place of its avatar (no text; a static ring without motion). The tabs
 	 * stay on one row; when they do not fit, the row scrolls sideways (the selected tab is kept in
 	 * view) and a dropdown on the right lists every model (owner, 2026-11-03: servers with many
-	 * models loaded).
+	 * models loaded). Names, tags and the grouping by family follow Settings > Display (display.ts).
 	 */
 	import RdnaAvatar from './RdnaAvatar.svelte';
 	import { Check, ChevronDown } from '@lucide/svelte';
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
+	import { modelDisplayName, modelGroups, rdnaDisplay } from '$lib/rdna/display';
 	import type { HfView, ModelView } from '$lib/rdna/status-store.svelte';
 
 	interface Props {
@@ -19,6 +20,16 @@
 	}
 
 	let { hf, models, onSelect, selectedId }: Props = $props();
+
+	let display = $derived(rdnaDisplay());
+	let groups = $derived(modelGroups(models, display));
+	let ordered = $derived(groups.flatMap((g) => g.models));
+
+	function tagsOf(m: ModelView): string[] {
+		if (!display.tags) return [];
+
+		return [m.runtime, m.classifier ? 'classifier' : null].filter((t): t is string => !!t);
+	}
 
 	let row = $state<HTMLElement | null>(null);
 	let overflowing = $state(false);
@@ -56,7 +67,7 @@
 
 <div class="rf-tabbar">
 	<div bind:this={row} aria-label="Models" class="rf-tabs" role="tablist">
-		{#each models as m (m.id)}
+		{#each ordered as m (m.id)}
 			{@const active = m.id === selectedId}
 			<button
 				class:rf-tab-active={active}
@@ -75,15 +86,11 @@
 					<RdnaAvatar name={m.label} size={22} src={hf[m.id]?.avatar} />
 				{/if}
 
-				<span class="rf-tab-name">{m.label}</span>
+				<span class="rf-tab-name">{modelDisplayName(m, display)}</span>
 
-				{#if m.runtime}
-					<span class:rf-tag-on={active} class="rf-tag">{m.runtime}</span>
-				{/if}
-
-				{#if m.classifier}
-					<span class:rf-tag-on={active} class="rf-tag">classifier</span>
-				{/if}
+				{#each tagsOf(m) as tag (tag)}
+					<span class:rf-tag-on={active} class="rf-tag">{tag}</span>
+				{/each}
 
 				{#if !m.loaded && !m.loading}
 					<span class="rf-tab-state">{m.status}</span>
@@ -103,24 +110,34 @@
 			</DropdownMenu.Trigger>
 
 			<DropdownMenu.Content align="end" class="max-h-[60vh] min-w-64 overflow-y-auto">
-				{#each models as m (m.id)}
-					<DropdownMenu.Item class="gap-3" onSelect={() => onSelect(m.id)}>
-						{#if m.id === selectedId}
-							<Check class="h-4 w-4 shrink-0" />
-						{:else}
-							<span class="h-4 w-4 shrink-0"></span>
+				{#each groups as g, gi (g.key)}
+					{#if groups.length > 1}
+						{#if gi > 0}
+							<DropdownMenu.Separator />
 						{/if}
 
-						<span class:rf-tab-off={!m.loaded && !m.loading} class="min-w-0 flex-1 truncate"
-							>{m.label}</span
+						<DropdownMenu.Label class="text-xs font-semibold text-muted-foreground"
+							>{g.key}</DropdownMenu.Label
 						>
+					{/if}
 
-						<span class="text-xs text-muted-foreground"
-							>{[m.runtime, m.classifier ? 'classifier' : null, m.loaded ? null : m.status]
-								.filter(Boolean)
-								.join(' · ')}</span
-						>
-					</DropdownMenu.Item>
+					{#each g.models as m (m.id)}
+						<DropdownMenu.Item class="gap-3" onSelect={() => onSelect(m.id)}>
+							{#if m.id === selectedId}
+								<Check class="h-4 w-4 shrink-0" />
+							{:else}
+								<span class="h-4 w-4 shrink-0"></span>
+							{/if}
+
+							<span class:rf-tab-off={!m.loaded && !m.loading} class="min-w-0 flex-1 truncate"
+								>{modelDisplayName(m, display)}</span
+							>
+
+							<span class="text-xs text-muted-foreground"
+								>{[...tagsOf(m), m.loaded ? null : m.status].filter(Boolean).join(' · ')}</span
+							>
+						</DropdownMenu.Item>
+					{/each}
 				{/each}
 			</DropdownMenu.Content>
 		</DropdownMenu.Root>

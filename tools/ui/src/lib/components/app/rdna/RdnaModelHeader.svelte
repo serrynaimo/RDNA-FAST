@@ -2,9 +2,11 @@
 	/**
 	 * Model header: avatar, NAME (file stem without quant) and "<quant> · <HF repo>" (the repo linked
 	 * only when the Hub confirms it), then chips: parameters, size, context and slots, modalities.
+	 * Raw names, the quant and the repo's organization follow Settings > Display (display.ts).
 	 */
 	import RdnaAvatar from './RdnaAvatar.svelte';
 	import { HF_BASE_URL } from '$lib/constants/huggingface.constants';
+	import { rdnaDisplay, repoDisplay } from '$lib/rdna/display';
 	import { fmtBytes, fmtCtx, fmtParams } from '$lib/rdna/format';
 	import type { HfView, ModelView } from '$lib/rdna/status-store.svelte';
 	import type { RdnaProps } from '$lib/rdna/types';
@@ -19,9 +21,12 @@
 
 	let { hf, model, nCtx, props, totalSlots }: Props = $props();
 
+	let display = $derived(rdnaDisplay());
 	let repo = $derived(model.naming?.repo ?? null);
 	let quant = $derived(model.naming?.quant ?? null);
+	let shownQuant = $derived(display.quant ? quant : null);
 	let repoExists = $derived(!!hf?.repo?.exists && !!repo);
+	let title = $derived(display.raw ? model.id : (model.naming?.name ?? model.id));
 	let meta = $derived(model.entry.meta ?? null);
 	let chips = $derived.by(() => {
 		const out: string[] = [];
@@ -49,14 +54,14 @@
 		<RdnaAvatar alt={model.label} name={model.label} radius={14} size={56} src={hf?.avatar} />
 
 		<div class="rf-model-text">
-			<h1>{model.naming?.name ?? model.id}</h1>
+			<h1>{title}</h1>
 
 			<p>
-				{#if quant}
-					<span>{quant}</span>
+				{#if shownQuant}
+					<span>{shownQuant}</span>
 				{/if}
 
-				{#if quant && repoExists}
+				{#if shownQuant && repoExists}
 					<span aria-hidden="true">·</span>
 				{/if}
 
@@ -65,11 +70,11 @@
 						class="rf-link rf-model-repo"
 						href="{HF_BASE_URL}/{repo}"
 						rel="noopener noreferrer"
-						target="_blank">{repo}</a
+						target="_blank">{repoDisplay(repo, display)}</a
 					>
 				{/if}
 
-				{#if !quant && !repoExists}
+				{#if !quant && !repoExists && !display.raw}
 					<span>{model.id}</span>
 				{/if}
 

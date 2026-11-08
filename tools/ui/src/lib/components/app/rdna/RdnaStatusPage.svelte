@@ -17,6 +17,7 @@
 	import RdnaSpeedTile from './RdnaSpeedTile.svelte';
 	import { ServerErrorSplash } from '$lib/components/app';
 	import { benchRunner } from '$lib/rdna/bench/runner.svelte';
+	import { modelDisplayName, rdnaDisplay } from '$lib/rdna/display';
 	import { playEntrance } from '$lib/rdna/entrance';
 	import { ensureRdnaFonts } from '$lib/rdna/fonts';
 	import { StatusStore } from '$lib/rdna/status-store.svelte';
@@ -96,7 +97,7 @@
 </script>
 
 <svelte:head>
-	<title>RDNA-FAST status{model ? ` · ${model.label}` : ''}</title>
+	<title>RDNA-FAST status{model ? ` · ${modelDisplayName(model, rdnaDisplay())}` : ''}</title>
 </svelte:head>
 
 <!-- no or a refused API key: the chat's own splash (owner, 2026-11-03); a valid key stays here -->
@@ -173,8 +174,8 @@
 								loaded={model.loaded}
 								loading={model.loading}
 								memory={store.memory}
-								ram={store.ram}
 								pool={store.sharedPool}
+								ram={store.ram}
 								slots={store.shownSlots}
 								status={model.status}
 							/>
