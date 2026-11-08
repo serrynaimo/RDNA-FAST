@@ -105,6 +105,12 @@ batches keep Q4_K_M's spill into system RAM down while staying above Hermes'
 the better of two runs (IQ4_XS: best of six runs, Q4_K_M: one). LM Studio's Q4_K_S and Q4_K_M (runtime 2.64.0) sit at the edge of
 the card's memory and read every prompt again in full.</sub>
 
+**On AMD cards, prefer IQ quants.** When VRAM is the limit, the IQ quants
+usually give the best speed for their quality: they are smaller than K-quants of
+similar quality, so more of the model and its context stays on the card, and they
+decode faster here. In the table above, IQ4_XS is the smallest of the three and
+decodes about 40% faster than Q4_K_M.
+
 Decode, 450-token answers at temperature 1, best of six runs
 (nine answers each; without MTP from an earlier run):
 
