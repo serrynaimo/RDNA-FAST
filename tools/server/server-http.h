@@ -71,6 +71,13 @@ struct server_http_req {
     }
 };
 
+// [TAG_UI_ONLY] true for a request the web UI made: a fetch from a page this server served. The browser sets
+// Sec-Fetch-Site itself (page scripts cannot), another site's page gets "cross-site", and API clients send none, so
+// agents and scripts holding the API key do not reach the UI's own actions by accident. A client that writes the
+// header by hand passes: this keeps honest clients out, it is not a secret. The router forwards the header to its
+// children, so a child sees it as well
+bool server_req_from_ui(const server_http_req & req);
+
 struct server_http_context {
     class Impl;
     std::unique_ptr<Impl> pimpl;

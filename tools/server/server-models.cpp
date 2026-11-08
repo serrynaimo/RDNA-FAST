@@ -18,6 +18,7 @@
 #include <functional>
 #include <optional>
 #include <algorithm>
+#include <cmath>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -736,10 +737,131 @@ static std::string saved_preset_reserved_reason(const common_arg & opt) {
     return "";
 }
 
-// parse the args of a saved preset the way llama-server reads its command line, so a bad flag is refused when
-// it is saved rather than when the model next fails to load. Values are not checked beyond a whole number
-// for the options that take one: their handlers may load backends, read files or exit
+// [TAG_MODEL_PRESET_CHECK] value checks, so a recipe with a typo or an impossible number is refused when it is saved
+// rather than when the model next fails to load (or loads with a value that makes no sense)
+//
+// the options with a fixed set of values: llama-server's own parser runs on a scratch copy of the params, so the
+// error is the one the instance would print. These handlers only parse; most others are left alone, as they may load
+// backends, read files, write logs or exit
+static const char * const saved_preset_parsed_flags[] = {
+    "--flash-attn", "--cache-type-k", "--cache-type-v", "--cache-type-k-draft", "--cache-type-v-draft", "--spec-type",
+    "--split-mode", "--numa", "--rope-scaling", "--pooling", "--attention", "--reasoning-format", "--reasoning",
+    "--lazy-mode", "--chat-template-kwargs", "--expert-cache", "--tensor-split", "--gpu-layers",
+};
+
+// the numbers a recipe sets: a plausible range each (-1 / -2 where the option gives them a meaning: auto, unlimited)
+struct saved_preset_range {
+    const char * flag;
+    double       lo;
+    double       hi;
+    bool         whole;
+};
+static const saved_preset_range saved_preset_ranges[] = {
+    { "--ctx-size",            0, 16777216,   true  },
+    { "--batch-size",          1, 1048576,    true  },
+    { "--ubatch-size",         1, 1048576,    true  },
+    { "--parallel",           -1, 256,        true  },
+    { "--threads",            -1, 4096,       true  },
+    { "--threads-batch",      -1, 4096,       true  },
+    { "--n-predict",          -2, 1e9,        true  },
+    { "--temp",                0, 100,        false },
+    { "--top-k",               0, 1e6,        true  },
+    { "--top-p",               0, 1,          false },
+    { "--min-p",               0, 1,          false },
+    { "--repeat-penalty",      0, 10,         false },
+    { "--presence-penalty",   -2, 2,          false },
+    { "--frequency-penalty",  -2, 2,          false },
+    { "--spec-draft-n-max",    0, 256,        true  },
+    { "--spec-draft-n-min",    0, 256,        true  },
+    { "--spec-draft-p-min",    0, 1,          false },
+    { "--reasoning-budget",   -1, 1e9,        true  },
+    { "--gpu-keepalive-ms",    0, 3600000,    true  },
+    { "--vram-reserve-mib",    0, 1048576,    true  },
+    { "--cache-ram",          -1, 16777216,   true  },
+    { "--ctx-checkpoints",     0, 1024,       true  },
+    { "--checkpoint-min-step", 0, 1e9,        true  },
+    { "--cache-disk-limit",    0, 1e9,        true  },
+    { "--kv-unified-reserve",  0, 16777216,   true  },
+    { "--pool-workers",        0, 1024,       true  },
+};
+
+static bool saved_preset_flag_is(const common_arg & opt, const char * flag) {
+    return std::any_of(opt.args.begin(), opt.args.end(), [&](const char * a) { return strcmp(a, flag) == 0; });
+}
+
+// a flag in the tables that no option has (renamed upstream) would silently go unchecked: say so once
+static void saved_preset_check_tables(const common_preset_context & ctx) {
+    static std::once_flag once;
+    std::call_once(once, [&]() {
+        auto known = [&](const char * flag) {
+            return std::any_of(ctx.ctx_params.options.begin(), ctx.ctx_params.options.end(),
+                               [&](const common_arg & opt) { return saved_preset_flag_is(opt, flag); });
+        };
+        for (const auto & r : saved_preset_ranges) {
+            if (!known(r.flag)) {
+                SRV_WRN("preset checks: no option '%s' any more, its range goes unchecked\n", r.flag);
+            }
+        }
+        for (const char * f : saved_preset_parsed_flags) {
+            if (!known(f)) {
+                SRV_WRN("preset checks: no option '%s' any more, its values go unchecked\n", f);
+            }
+        }
+    });
+}
+
+static void check_saved_preset_value(const common_arg & opt, const std::string & given, const std::string & value) {
+    for (const auto & r : saved_preset_ranges) {
+        if (!saved_preset_flag_is(opt, r.flag)) {
+            continue;
+        }
+        double v  = 0;
+        bool   ok = false;
+        try {
+            size_t pos = 0;
+            v  = std::stod(value, &pos);
+            ok = pos == value.size() && std::isfinite(v);
+        } catch (const std::exception &) {
+            ok = false;
+        }
+        if (!ok || (r.whole && v != std::floor(v))) {
+            throw std::invalid_argument(string_format("option '%s' takes %s, got '%s'", given.c_str(),
+                r.whole ? "a whole number" : "a number", value.c_str()));
+        }
+        if (v < r.lo || v > r.hi) {
+            throw std::invalid_argument(string_format("option '%s' must be between %g and %g, got %s", given.c_str(),
+                r.lo, r.hi, value.c_str()));
+        }
+        return;
+    }
+    for (const char * f : saved_preset_parsed_flags) {
+        if (!saved_preset_flag_is(opt, f)) {
+            continue;
+        }
+        common_params scratch;
+        try {
+            if (opt.handler_string) {
+                opt.handler_string(scratch, value);
+            } else if (opt.handler_int) {
+                opt.handler_int(scratch, std::stoi(value));
+            }
+        } catch (const std::exception & e) {
+            // some handlers word it as "error: ...\n"
+            std::string why = string_strip(e.what());
+            if (why.rfind("error: ", 0) == 0) {
+                why = why.substr(7);
+            }
+            throw std::invalid_argument(string_format("option '%s' does not take '%s': %s", given.c_str(), value.c_str(), why.c_str()));
+        }
+        return;
+    }
+}
+
+// parse the args of a saved preset the way llama-server reads its command line, so a bad flag or value is refused
+// when it is saved rather than when the model next fails to load ([TAG_MODEL_PRESET_CHECK] for the values)
 static common_preset parse_saved_preset_args(const common_preset_context & ctx, const std::vector<std::string> & args) {
+    saved_preset_check_tables(ctx);
+
     std::map<std::string, const common_arg *> by_flag;
     for (const auto & opt : ctx.ctx_params.options) {
         if (opt.is_preset_only) {
@@ -792,6 +914,7 @@ static common_preset parse_saved_preset_args(const common_preset_context & ctx, 
                     throw std::invalid_argument(string_format("option '%s' takes a whole number, got '%s'", given.c_str(), value.c_str()));
                 }
             }
+            check_saved_preset_value(opt, given, value); // [TAG_MODEL_PRESET_CHECK]
         }
         preset.options[opt] = value; // a repeated option: the last one wins, as on the command line
     }
@@ -2680,8 +2803,9 @@ void server_models_routes::init_routes() {
                 model_info["context_length"] = meta.n_ctx_train;
             }
 
-            // [TAG_MODEL_PRESET] the recipe saved through POST /models/preset, for the UI to show
-            if (auto saved = models.preset_get(meta.name); saved.has_value()) {
+            // [TAG_MODEL_PRESET] the recipe saved through POST /models/preset, for the UI to show (and only to it,
+            // like GET /models/preset: [TAG_UI_ONLY])
+            if (auto saved = models.preset_get(meta.name); saved.has_value() && server_req_from_ui(req)) {
                 json rdna_preset = {
                     {"args", saved->args},
                     {"env",  saved->env},

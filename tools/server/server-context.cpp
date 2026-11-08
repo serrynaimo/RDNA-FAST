@@ -7003,7 +7003,7 @@ void server_routes::init_routes() {
         return res;
     };
 
-    this->get_props = [this](const server_http_req &) {
+    this->get_props = [this](const server_http_req & req) {
         auto res = create_response(true);
         // note: do NOT use ctx_server here, this endpoint must be accessible during sleep
         json props;
@@ -7015,9 +7015,12 @@ void server_routes::init_routes() {
         }
         // [TAG_REQUEST_HISTORY] read now, also during sleep: the device memory from the backend, the disk cache
         // counters from the copy the main loop publishes (a thread-safe call that does not touch the model)
-        props["devices"]           = get_res_devices(meta->devices);
-        props["system_memory"]     = get_res_system_memory();
-        props["host"]              = get_res_host();
+        // [TAG_UI_ONLY] the machine (GPUs and their memory, RAM, OS, CPU) only for the web UI
+        if (server_req_from_ui(req)) {
+            props["devices"]       = get_res_devices(meta->devices);
+            props["system_memory"] = get_res_system_memory();
+            props["host"]          = get_res_host();
+        }
         props["prompt_cache_disk"] = ctx_server.disk_stats_to_json();
         res->ok(props);
         return res;

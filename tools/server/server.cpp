@@ -546,19 +546,34 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
         };
     };
 
+    // [TAG_UI_ONLY] the web UI's own actions (downloading and deleting models, saving recipes): not for agents and
+    // scripts holding the API key. Loading, unloading and reloading stay open to them (the tray drives those)
+    auto ui_only = [](server_http_context::handler_t h) -> server_http_context::handler_t {
+        return [h](const server_http_req & req) -> server_http_res_ptr {
+            if (!server_req_from_ui(req)) {
+                auto res = std::make_unique<server_http_res>();
+                res->status = 403;
+                res->data = safe_json_to_str({{"error", {{"code", 403}, {"type", "permission_error"},
+                    {"message", "only available from the web UI"}}}});
+                return res;
+            }
+            return h(req);
+        };
+    };
+
     // custom routes for router
     routes.get_props                   = models_routes->get_router_props;
     routes.get_models                  = loopback_only(models_routes->get_router_models, true);
 
-    ctx_http.post("/models",               ex_wrapper(loopback_only(models_routes->post_router_models)));
+    ctx_http.post("/models",               ex_wrapper(loopback_only(ui_only(models_routes->post_router_models))));
     ctx_http.post("/models/load",          ex_wrapper(loopback_only(models_routes->post_router_models_load)));
     ctx_http.post("/models/unload",        ex_wrapper(loopback_only(models_routes->post_router_models_unload)));
     ctx_http.get ("/models/sse",           ex_wrapper(models_routes->get_router_models_sse));
-    ctx_http.del ("/models",               ex_wrapper(loopback_only(models_routes->del_router_models)));
+    ctx_http.del ("/models",               ex_wrapper(loopback_only(ui_only(models_routes->del_router_models))));
     // [TAG_MODEL_PRESET] the flags and env vars a model runs with, saved by the UI's chat tool
-    ctx_http.post("/models/preset",        ex_wrapper(loopback_only(models_routes->post_router_models_preset)));
-    ctx_http.get ("/models/preset",        ex_wrapper(loopback_only(models_routes->get_router_models_preset)));
-    ctx_http.del ("/models/preset",        ex_wrapper(loopback_only(models_routes->del_router_models_preset)));
+    ctx_http.post("/models/preset",        ex_wrapper(loopback_only(ui_only(models_routes->post_router_models_preset))));
+    ctx_http.get ("/models/preset",        ex_wrapper(loopback_only(ui_only(models_routes->get_router_models_preset))));
+    ctx_http.del ("/models/preset",        ex_wrapper(loopback_only(ui_only(models_routes->del_router_models_preset))));
 
     // Jev-style classifier routes: proxied to the child named by the request's "model" (e.g. a CPU child with --classifier-head)
     ctx_http.post("/v1/classifier", ex_wrapper(models_routes->proxy_post_classifier));

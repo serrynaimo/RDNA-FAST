@@ -6,6 +6,8 @@
 
 #include <cpp-httplib/httplib.h>
 
+#include <algorithm>
+#include <cctype>
 #include <functional>
 #include <future>
 #include <memory>
@@ -70,6 +72,18 @@ static void log_server_request(const httplib::Request & req, const httplib::Resp
 
     SRV_DBG("request:  %s\n", req.body.c_str());
     SRV_DBG("response: %s\n", res.body.c_str());
+}
+
+// [TAG_UI_ONLY]
+bool server_req_from_ui(const server_http_req & req) {
+    static const std::string name = "sec-fetch-site";
+    for (const auto & [key, value] : req.headers) {
+        if (key.size() == name.size() &&
+            std::equal(key.begin(), key.end(), name.begin(), [](char a, char b) { return std::tolower((unsigned char) a) == b; })) {
+            return value == "same-origin";
+        }
+    }
+    return false;
 }
 
 // returns true if the Origin header value's host is localhost / 127.0.0.1 / ::1 (any port)
