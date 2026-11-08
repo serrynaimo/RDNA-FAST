@@ -157,9 +157,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "rocm-sdk init failed with exit code $LASTEXITCODE" }
           $root = (rocm-sdk path --root).Trim()
           $bin  = (rocm-sdk path --bin).Trim()
-          # ROCm brings no resource compiler: the newest Windows SDK's rc.exe (README build step)
-          $rc = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\rc.exe" | Sort-Object FullName | Select-Object -Last 1
-          if (-not $rc) { throw "no rc.exe in the Windows SDK" }
+          # ROCm brings no resource compiler or manifest tool: the newest Windows SDK folder that has both rc.exe and
+          # mt.exe (README build step); lld-link needs mt.exe to embed the app manifest of every exe (cmake/win-app.cmake)
+          $rc = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\rc.exe" |
+            Where-Object { Test-Path (Join-Path $_.DirectoryName "mt.exe") } | Sort-Object FullName | Select-Object -Last 1
+          if (-not $rc) { throw "no Windows SDK folder with both rc.exe and mt.exe" }
+          "Windows SDK tools: $($rc.DirectoryName)"
           echo "HIP_PATH=$root" >> $env:GITHUB_ENV
           echo "ROCM_PATH=$root" >> $env:GITHUB_ENV
           echo "HIP_PLATFORM=amd" >> $env:GITHUB_ENV
@@ -168,7 +171,6 @@ jobs:
           echo "RC_EXE=$($rc.FullName -replace '\\', '/')" >> $env:GITHUB_ENV
           echo "$bin" >> $env:GITHUB_PATH
           echo "C:\TheRock\build\.venv\Scripts" >> $env:GITHUB_PATH
-          # lld-link calls mt.exe to embed the app manifest (cmake/win-app.cmake): it sits beside rc.exe
           echo "$($rc.DirectoryName)" >> $env:GITHUB_PATH
       - name: Build
         shell: pwsh
