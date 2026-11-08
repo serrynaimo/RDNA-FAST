@@ -28,6 +28,7 @@ import {
 	MimeTypePrefix,
 	ToolCallType
 } from '$lib/enums';
+import { executeRdnaTool } from '$lib/rdna/rdna-tools';
 import { executeWebTool, isWebTool } from '$lib/rdna/web-tools';
 import { ChatService } from '$lib/services';
 import { ReadMediaService } from '$lib/services/read-media.service';
@@ -822,6 +823,14 @@ class AgenticStore {
 							const args = this.parseToolArguments(toolCall.function.arguments);
 							const cwd = conversationsStore.activeConversation?.cwd;
 							const executionResult = await ToolsService.executeTool(toolName, args, signal, cwd);
+
+							result = executionResult.content;
+
+							if (executionResult.isError) toolSuccess = false;
+						} else if (toolSource === ToolSource.RDNA) {
+							// [RDNA-FAST] the RDNA-FAST section, src/lib/rdna/rdna-tools.ts
+							const args = this.parseToolArguments(toolCall.function.arguments);
+							const executionResult = await executeRdnaTool(toolName, args, signal);
 
 							result = executionResult.content;
 

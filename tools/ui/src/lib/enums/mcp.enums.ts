@@ -54,6 +54,9 @@ export enum MCPContentType {
  * JSON Schema types used in MCP tool definitions
  */
 export enum JsonSchemaType {
+	// RDNA-FAST: the RDNA-FAST chat tools take lists and switches (src/lib/rdna/rdna-tools.ts)
+	ARRAY = 'array',
+	BOOLEAN = 'boolean',
 	NUMBER = 'number',
 	OBJECT = 'object',
 	STRING = 'string'

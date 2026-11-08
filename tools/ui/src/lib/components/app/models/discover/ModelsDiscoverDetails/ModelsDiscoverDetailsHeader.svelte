@@ -6,7 +6,9 @@
 	import { ExternalLink } from '@lucide/svelte';
 	import { base } from '$app/paths';
 	import { Button } from '$lib/components/ui/button';
+	import { makeItFastPrompt, quantsOfFiles, startRdnaChat } from '$lib/rdna/make-fast';
 	import { HuggingFaceService } from '$lib/services';
+	import { uiStore } from '$lib/stores';
 	import type { HfModelDetailInfo, HfModelGguf } from '$lib/types/huggingface';
 	import { orgOf } from '$lib/utils';
 
@@ -30,6 +32,17 @@
 	let baseOrg = $derived(orgOf(baseModels[0]));
 	let avatarOrg = $derived(baseOrg || repoOrg);
 	let quantOrg = $derived(baseOrg && baseOrg !== repoOrg ? repoOrg : undefined);
+
+	// [RDNA-FAST] "Make it RDNA-FAST!": a new chat in which the model that runs picks the quant, downloads it and saves
+	// its recipe (src/lib/rdna/make-fast.ts)
+	function makeItFast(): void {
+		const repo = (details.id || modelId).split(':')[0];
+		const quants = quantsOfFiles((details.siblings ?? []).map((s) => s.rfilename));
+
+		uiStore.discoverModelsOpen = false;
+		uiStore.manageModelsOpen = false;
+		void startRdnaChat(makeItFastPrompt(repo, quants));
+	}
 </script>
 
 <header class="space-y-3">
@@ -74,20 +87,30 @@
 			</div>
 		</div>
 
-		<Button
-			class="h-auto gap-1.5 px-2.5 py-1.5 text-xs"
-			href={HuggingFaceService.getModelUrl(modelId)}
-			rel="noopener noreferrer"
-			size="sm"
-			target="_blank"
-			variant="tertiary"
-		>
-			<img alt="" class="h-3.5 w-3.5" src="{base}/recommended-mcp/huggingface.ico" />
+		<div class="flex flex-col items-end gap-2">
+			<Button
+				class="h-auto bg-[#ed1c24] px-2.5 py-1.5 text-xs font-bold text-white hover:bg-[#c9141b]"
+				onclick={makeItFast}
+				size="sm"
+			>
+				Make it RDNA-FAST!
+			</Button>
 
-			View on Hugging Face
+			<Button
+				class="h-auto gap-1.5 px-2.5 py-1.5 text-xs"
+				href={HuggingFaceService.getModelUrl(modelId)}
+				rel="noopener noreferrer"
+				size="sm"
+				target="_blank"
+				variant="tertiary"
+			>
+				<img alt="" class="h-3.5 w-3.5" src="{base}/recommended-mcp/huggingface.ico" />
 
-			<ExternalLink class="size-3.5" />
-		</Button>
+				View on Hugging Face
+
+				<ExternalLink class="size-3.5" />
+			</Button>
+		</div>
 	</div>
 
 	<ModelsDiscoverDetailsHfHubStats {details} />

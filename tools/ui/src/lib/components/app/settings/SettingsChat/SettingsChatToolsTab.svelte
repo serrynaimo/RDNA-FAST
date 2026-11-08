@@ -87,7 +87,9 @@
 						{#each group.tools as entry (entry.key)}
 							{@const toolName = entry.definition.function.name}
 							{@const toolUi =
-								entry.source === ToolSource.SERVER || entry.source === ToolSource.BROWSER
+								entry.source === ToolSource.SERVER ||
+								entry.source === ToolSource.BROWSER ||
+								entry.source === ToolSource.RDNA
 									? getToolUi(toolName)
 									: null}
 							{@const displayLabel = toolUi?.label ?? toolName}

@@ -10,15 +10,20 @@
 import {
 	Braces,
 	Clock,
+	Cpu,
+	Download,
 	Eye,
 	FilePen,
 	FilePlus,
 	FileSearch,
 	FileText,
 	Globe,
+	History,
 	Info,
 	Link,
+	Save,
 	SearchCode,
+	SlidersHorizontal,
 	Terminal
 } from '@lucide/svelte';
 import { BuiltInTool, ToolSource } from '$lib/enums';
@@ -47,6 +52,24 @@ export const TOOL_UI: Readonly<Record<BuiltInTool, ToolUiEntry>> = {
 		label: 'Web search',
 		source: ToolSource.BROWSER
 	},
+	// [RDNA-FAST] src/lib/rdna/rdna-tools.ts
+	[BuiltInTool.RDNA_DOWNLOAD_MODEL]: {
+		icon: Download,
+		label: 'Download model',
+		source: ToolSource.RDNA
+	},
+	[BuiltInTool.RDNA_RECENT_CONVERSATIONS]: {
+		icon: History,
+		label: 'Search chats',
+		source: ToolSource.RDNA
+	},
+	[BuiltInTool.RDNA_ROUTER_CONFIG]: {
+		icon: SlidersHorizontal,
+		label: 'Model config',
+		source: ToolSource.RDNA
+	},
+	[BuiltInTool.RDNA_SAVE_PRESET]: { icon: Save, label: 'Save preset', source: ToolSource.RDNA },
+	[BuiltInTool.RDNA_SYSTEM_INFO]: { icon: Cpu, label: 'System info', source: ToolSource.RDNA },
 	[BuiltInTool.SERVER_EDIT_FILE]: { icon: FilePen, label: 'Edit file', source: ToolSource.SERVER },
 	[BuiltInTool.SERVER_EXEC_SHELL_COMMAND]: {
 		icon: Terminal,

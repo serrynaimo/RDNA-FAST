@@ -20,6 +20,7 @@
 	import { modelDisplayName, rdnaDisplay } from '$lib/rdna/display';
 	import { playEntrance } from '$lib/rdna/entrance';
 	import { ensureRdnaFonts } from '$lib/rdna/fonts';
+	import { fasterPrompt, startRdnaChat } from '$lib/rdna/make-fast';
 	import { StatusStore } from '$lib/rdna/status-store.svelte';
 	import { onDestroy, onMount } from 'svelte';
 
@@ -161,6 +162,7 @@
 								{modelLabel}
 								{modelName}
 								nCtx={store.nCtx}
+								onFaster={() => void startRdnaChat(fasterPrompt(model.id))}
 								onHardwareChange={(label) => store.setHardwareLabel(label)}
 								onRunBench={runBench}
 								quant={model.naming?.quant ?? null}

@@ -2,6 +2,8 @@ export enum ToolSource {
 	BROWSER = 'browser',
 	CUSTOM = 'custom',
 	MCP = 'mcp',
+	// [RDNA-FAST] the RDNA-FAST tool section, run in the browser (src/lib/rdna/rdna-tools.ts)
+	RDNA = 'rdna',
 	SERVER = 'server'
 }
 
@@ -48,6 +50,12 @@ export enum BuiltInTool {
 	// [RDNA-FAST] Keenable web search and page reading, src/lib/rdna/web-tools.ts
 	BROWSER_WEB_FETCH = 'web_fetch',
 	BROWSER_WEB_SEARCH = 'web_search',
+	// [RDNA-FAST] the RDNA-FAST tool section, src/lib/rdna/rdna-tools.ts
+	RDNA_DOWNLOAD_MODEL = 'download_model',
+	RDNA_RECENT_CONVERSATIONS = 'recent_conversations',
+	RDNA_ROUTER_CONFIG = 'router_config',
+	RDNA_SAVE_PRESET = 'save_preset',
+	RDNA_SYSTEM_INFO = 'system_info',
 	SERVER_EDIT_FILE = 'edit_file',
 	SERVER_EXEC_SHELL_COMMAND = 'exec_shell_command',
 	SERVER_FILE_GLOB_SEARCH = 'file_glob_search',

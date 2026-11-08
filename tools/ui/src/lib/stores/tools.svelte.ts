@@ -26,6 +26,7 @@ import {
 	ToolCallType,
 	ToolSource
 } from '$lib/enums';
+import { buildRdnaToolDefinitions } from '$lib/rdna/rdna-tools';
 import { buildWebFetchToolDefinition, buildWebSearchToolDefinition } from '$lib/rdna/web-tools';
 import { ToolsService } from '$lib/services/tools.service';
 // direct imports between stores, not via the barrel, to avoid circular deps
@@ -84,6 +85,17 @@ class ToolsStore {
 				definition: def,
 				key: this.toolKey(ToolSource.BROWSER, name),
 				source: ToolSource.BROWSER
+			});
+		}
+
+		// [RDNA-FAST] the RDNA-FAST section (src/lib/rdna/rdna-tools.ts), on by default
+		for (const def of this.rdnaTools) {
+			const name = def.function.name;
+
+			push({
+				definition: def,
+				key: this.toolKey(ToolSource.RDNA, name),
+				source: ToolSource.RDNA
 			});
 		}
 
@@ -182,6 +194,11 @@ class ToolsStore {
 
 	get mcpTools(): OpenAIToolDefinition[] {
 		return this.mcpEntries().map((e) => e.definition);
+	}
+
+	/** [RDNA-FAST] the RDNA-FAST section's tools */
+	get rdnaTools(): OpenAIToolDefinition[] {
+		return buildRdnaToolDefinitions();
 	}
 
 	get serverHome(): string | null {
@@ -299,6 +316,7 @@ class ToolsStore {
 
 		for (const def of this._serverTools) take(def);
 		for (const def of this.browserTools) take(def);
+		for (const def of this.rdnaTools) take(def);
 		// mcpEntries() over mcpStore directly so wire shape stays normalized and aligned with the tools UI.
 		for (const entry of this.mcpEntries()) take(entry.definition);
 		for (const def of this.customTools) take(def);
@@ -329,6 +347,8 @@ class ToolsStore {
 		if (entry.source === ToolSource.CUSTOM) return TOOL_SERVER_LABELS[ToolSource.CUSTOM];
 
 		if (entry.source === ToolSource.BROWSER) return TOOL_SERVER_LABELS[ToolSource.BROWSER];
+
+		if (entry.source === ToolSource.RDNA) return TOOL_SERVER_LABELS[ToolSource.RDNA];
 
 		return '';
 	}
@@ -523,6 +543,8 @@ class ToolsStore {
 				return TOOL_GROUP_LABELS[ToolSource.CUSTOM];
 			case ToolSource.BROWSER:
 				return TOOL_GROUP_LABELS[ToolSource.BROWSER];
+			case ToolSource.RDNA:
+				return TOOL_GROUP_LABELS[ToolSource.RDNA];
 			default:
 				return TOOL_GROUP_LABELS[ToolSource.SERVER];
 		}
@@ -713,6 +735,8 @@ class ToolsStore {
 				return `custom:${name}`;
 			case ToolSource.BROWSER:
 				return `browser:${name}`;
+			case ToolSource.RDNA:
+				return `rdna:${name}`;
 			default:
 				return `server:${name}`;
 		}

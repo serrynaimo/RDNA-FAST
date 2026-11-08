@@ -36,6 +36,8 @@
 		onHardwareChange: (label: string | null) => void;
 		/** Does a figure glow (record-glow.svelte.ts): `card:prefill`, `chart:decode_4k`, ... */
 		isGlowing?: (key: string) => boolean;
+		/** "Help me go RDNA-FASTer": a chat about this model's recipe (owner, 2026-11-08) */
+		onFaster?: () => void;
 	}
 
 	let {
@@ -51,6 +53,7 @@
 		modelLabel,
 		modelName,
 		nCtx,
+		onFaster,
 		onHardwareChange,
 		onRunBench,
 		quant,
@@ -136,22 +139,28 @@
 	{/if}
 
 	<div class="rf-speed-bar">
-		<div aria-label="Speed view" class="rf-speed-tabs" role="tablist">
-			<button
-				class:rf-on={view === 'card'}
-				aria-selected={view === 'card'}
-				onclick={() => pick('card')}
-				role="tab"
-				type="button">Speed card</button
-			>
+		<div class="rf-speed-left">
+			<div aria-label="Speed view" class="rf-speed-tabs" role="tablist">
+				<button
+					class:rf-on={view === 'card'}
+					aria-selected={view === 'card'}
+					onclick={() => pick('card')}
+					role="tab"
+					type="button">Speed card</button
+				>
 
-			<button
-				class:rf-on={view === 'chart'}
-				aria-selected={view === 'chart'}
-				onclick={() => pick('chart')}
-				role="tab"
-				type="button">Bench chart</button
-			>
+				<button
+					class:rf-on={view === 'chart'}
+					aria-selected={view === 'chart'}
+					onclick={() => pick('chart')}
+					role="tab"
+					type="button">Bench chart</button
+				>
+			</div>
+
+			{#if onFaster}
+				<button class="rf-faster" onclick={onFaster} type="button">Help me go RDNA-FASTer</button>
+			{/if}
 		</div>
 
 		<div class="rf-speed-actions">
@@ -214,6 +223,30 @@
 		gap: 10px;
 	}
 
+	.rf-speed-left {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 10px;
+	}
+
+	/* text only beside the view tabs: no outline, the page's text colour (white on the dark default) */
+	.rf-faster {
+		padding: 8px 4px;
+		border: none;
+		background: transparent;
+		color: var(--rf-text);
+		font-size: 13px;
+		font-weight: 700;
+		font-family: inherit;
+		cursor: pointer;
+	}
+
+	.rf-faster:hover {
+		text-decoration: underline;
+		text-underline-offset: 3px;
+	}
+
 	.rf-speed-tabs {
 		display: inline-flex;
 		gap: 4px;
@@ -268,6 +301,7 @@
 	}
 
 	.rf-speed-tabs button:focus-visible,
+	.rf-faster:focus-visible,
 	.rf-run:focus-visible,
 	.rf-save:focus-visible {
 		outline: 2px solid var(--rf-orange);

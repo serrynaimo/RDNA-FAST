@@ -827,6 +827,29 @@ const mcpServerOverridesToToolPolicyMigration: Migration = {
 			);
 	}
 };
+const RDNA_DISCOVER_ON_MIGRATION_ID = 'rdna-discover-models-on-v1';
+/**
+ * RDNA-FAST: Discover Models is on by default (owner, 2026-11-08). The persisted config carries
+ * every key, so a browser that saved the old default (off) gets it turned on once; turning it off
+ * again afterwards sticks.
+ */
+const rdnaDiscoverOnMigration: Migration = {
+	description: 'RDNA-FAST: turn Discover Models on once',
+	id: RDNA_DISCOVER_ON_MIGRATION_ID,
+
+	async run(): Promise<void> {
+		const configRaw = localStorage.getItem(CONFIG_LOCALSTORAGE_KEY);
+
+		if (configRaw === null) return;
+
+		const config = JSON.parse(configRaw);
+
+		if (config[SETTINGS_KEYS.ENABLE_DISCOVER_MODELS] === true) return;
+
+		config[SETTINGS_KEYS.ENABLE_DISCOVER_MODELS] = true;
+		localStorage.setItem(CONFIG_LOCALSTORAGE_KEY, JSON.stringify(config));
+	}
+};
 const migrations: Migration[] = [
 	localStorageMigration,
 	idxdbMigration,
@@ -838,7 +861,8 @@ const migrations: Migration[] = [
 	configTypesMigration,
 	renderKeysMigration,
 	modelOrgNameKeyMigration,
-	mcpServerOverridesToToolPolicyMigration
+	mcpServerOverridesToToolPolicyMigration,
+	rdnaDiscoverOnMigration
 ];
 
 export const MigrationService = {

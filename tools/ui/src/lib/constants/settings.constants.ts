@@ -127,7 +127,8 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				type: SettingsFieldType.CHECKBOX
 			},
 			{
-				defaultValue: false,
+				// RDNA-FAST: on by default (owner, 2026-11-08), with the "Make it RDNA-FAST!" button in its details
+				defaultValue: true,
 				help: 'Show the Discover Models sidebar action to browse and download HuggingFace GGUF models. Turns the Hugging Face Hub API on while it is enabled. Only available in router mode.',
 				key: SETTINGS_KEYS.ENABLE_DISCOVER_MODELS,
 				label: 'Enable Discover Models',

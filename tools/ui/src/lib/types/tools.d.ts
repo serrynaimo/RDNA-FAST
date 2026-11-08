@@ -8,7 +8,7 @@ import type { Component } from 'svelte';
 export interface ToolUiEntry {
 	icon: Component;
 	label: string;
-	source: ToolSource.SERVER | ToolSource.BROWSER;
+	source: ToolSource.SERVER | ToolSource.BROWSER | ToolSource.RDNA;
 }
 
 export interface ToolEntry {
