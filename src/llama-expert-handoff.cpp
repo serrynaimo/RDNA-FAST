@@ -538,7 +538,8 @@ struct llama_expert_handoff::impl {
         // largest expert, or bytes) by the experts of its layers
         {
             // the context reserves its compute buffers before the cache, so this is only the slack for what comes
-            // later (an MTP draft context's buffers, the backend's temporary pool)
+            // later (the backend's temporary pool); common adds a draft or MTP context's memory to it, measured before
+            // the main context is made ([TAG_EH_DRAFT_RESERVE])
             const size_t reserve = (size_t) (params.vram_reserve_mib >= 0 ? params.vram_reserve_mib : 1024)*1024*1024;
             const bool explicit_size = params.n_slots >= 0 || params.budget_bytes > 0;
             const size_t total_budget = params.n_slots >= 0 ? (size_t) params.n_slots*max_blob : params.budget_bytes;

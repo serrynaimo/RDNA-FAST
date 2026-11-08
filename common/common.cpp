@@ -1307,6 +1307,41 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
 }
 
+// [TAG_EH_DRAFT_RESERVE] the device memory a draft (MTP, DFlash, EAGLE3, ...) context will take (the most on any one
+// device), measured without allocating; 0 without one. The expert handoff sizes its automatic VRAM cache when the main
+// context is made, before the server loads the draft: Flash-Next's MTP draft (2.2 GB) then spilled 2.41 GB of the
+// GPU's memory into system RAM (2026-11-08, prod)
+static size_t common_draft_device_bytes(const common_params & params, const llama_model_params & mparams,
+        const llama_context_params & cparams) {
+    const bool has_draft = params.speculative.has_dft();
+    const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    if (!has_draft && !spec_mtp) {
+        return 0;
+    }
+    // the draft's params as common_speculative_init_result makes them
+    common_params params_dft = common_base_params_to_speculative(params);
+    auto mparams_dft = common_model_params_to_llama(params_dft);
+    auto cparams_dft = common_context_params_to_llama(params_dft);
+    if (spec_mtp) {
+        cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    }
+    cparams_dft.n_rs_seq = 0;
+    const common_fit_extra_model draft = {
+        /*.path_model   =*/ params_dft.model.path.c_str(),
+        /*.mparams      =*/ &mparams_dft,
+        /*.cparams      =*/ &cparams_dft,
+        /*.shares_model =*/ !has_draft, // an MTP context without a draft model runs on the main model's weights
+    };
+    try {
+        return common_fit_measure_draft(params.model.path.c_str(), &mparams, &cparams, &draft,
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+    } catch (const std::exception & e) {
+        COM_WRN("could not measure the draft's memory (%s); the expert cache leaves only its usual reserve\n", e.what());
+        return 0;
+    }
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
@@ -1322,6 +1357,18 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     common_fit_apply(params, mparams, cparams);
+
+    // [TAG_EH_DRAFT_RESERVE] the expert cache leaves the draft's memory free on top of its reserve (1024 MiB unless
+    // --vram-reserve-mib says otherwise, as in llama-expert-handoff.cpp)
+    if (!model_only && (params.expert_cache != 0 || params.moe_cache_size > 0)) {
+        const size_t draft = common_draft_device_bytes(params, mparams, cparams);
+        if (draft > 0) {
+            const int32_t base = cparams.vram_reserve_mib >= 0 ? cparams.vram_reserve_mib : 1024;
+            cparams.vram_reserve_mib = base + (int32_t) ((draft + (1 << 20) - 1) >> 20);
+            COM_WRN("the draft context needs %.0f MiB of VRAM: the expert cache leaves %d MiB free\n",
+                draft/1048576.0, cparams.vram_reserve_mib);
+        }
+    }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {

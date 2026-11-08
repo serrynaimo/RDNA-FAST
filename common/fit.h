@@ -82,6 +82,18 @@ std::vector<common_memory_breakdown_row> common_fit_measure(
                            uint32_t * n_ctx,
                      ggml_log_level   log_level);
 
+// [TAG_EH_DRAFT_RESERVE] the device memory a draft or MTP context takes beside its target (the most on any one device:
+// the draft's own weights unless it shares the model, its KV cache and compute buffers), measured without allocating.
+// The draft context is made against a target context as the server does: MTP heads in files of their own, DFlash,
+// EAGLE3 and Gemma 4 assistant drafts use the target's token embeddings or output and cannot be measured alone. The
+// target context is made without the expert handoff. Throws on failure
+size_t common_fit_measure_draft(
+                         const char * path_model,
+           const llama_model_params * mparams,
+         const llama_context_params * cparams,
+       const common_fit_extra_model * draft,
+                     ggml_log_level   log_level);
+
 struct common_params;
 
 // measure min and max without allocating, params may be modified as with --fit; throws on failure

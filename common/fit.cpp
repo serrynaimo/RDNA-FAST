@@ -199,6 +199,64 @@ std::vector<common_memory_breakdown_row> common_fit_measure(
     return common_memory_breakdown_rows(ctx.get());
 }
 
+size_t common_fit_measure_draft(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        const common_fit_extra_model * draft,
+        ggml_log_level log_level) {
+    common_fit_log_scope log_scope(log_level);
+
+    // the target, without allocating and without the expert handoff (its cache would size itself to the free VRAM)
+    llama_model_params mparams_tgt = *mparams;
+    mparams_tgt.no_alloc  = true;
+    mparams_tgt.load_mode = LLAMA_LOAD_MODE_NONE;
+    mparams_tgt.progress_callback = nullptr; // not the server's load progress
+    llama_model_ptr model_tgt(llama_model_load_from_file(path_model, mparams_tgt));
+    if (!model_tgt) {
+        throw std::runtime_error("failed to load the model");
+    }
+    llama_context_params cparams_tgt = *cparams;
+    cparams_tgt.expert_cache   = 0;
+    cparams_tgt.moe_cache_size = 0;
+    llama_context_ptr ctx_tgt(llama_init_from_model(model_tgt.get(), cparams_tgt));
+    if (!ctx_tgt) {
+        throw std::runtime_error("failed to create the model's context");
+    }
+
+    // the draft: a model of its own, or the target's for an MTP context
+    llama_model_ptr model_dft_own;
+    llama_model * model_dft = model_tgt.get();
+    if (!draft->shares_model) {
+        llama_model_params mparams_dft = *draft->mparams;
+        mparams_dft.no_alloc  = true;
+        mparams_dft.load_mode = LLAMA_LOAD_MODE_NONE;
+        mparams_dft.progress_callback = nullptr;
+        model_dft_own.reset(llama_model_load_from_file(draft->path_model, mparams_dft));
+        if (!model_dft_own) {
+            throw std::runtime_error("failed to load the draft model");
+        }
+        model_dft = model_dft_own.get();
+    }
+
+    // as the server makes it: against the target context, as many tokens per sequence
+    llama_context_params cparams_dft = *draft->cparams;
+    cparams_dft.n_ctx     = llama_n_ctx(ctx_tgt.get());
+    cparams_dft.ctx_other = ctx_tgt.get();
+    llama_context_ptr ctx_dft(llama_init_from_model(model_dft, cparams_dft));
+    if (!ctx_dft) {
+        throw std::runtime_error("failed to create the draft context");
+    }
+
+    size_t bytes = 0;
+    for (const auto & row : common_memory_breakdown_rows(ctx_dft.get())) {
+        if (row.kind == common_memory_breakdown_row::DEVICE) {
+            bytes = std::max(bytes, (draft->shares_model ? 0 : row.model) + row.context + row.compute);
+        }
+    }
+    return bytes;
+}
+
 common_memory_reports common_measure_memory(common_params & params) {
     const ggml_log_level log_level = params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR;
     const char * path_model = params.model.path.c_str();

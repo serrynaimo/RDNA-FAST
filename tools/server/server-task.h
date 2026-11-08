@@ -851,6 +851,16 @@ struct server_prompt_cache {
     // directory's entries only when its identity matches exactly.
     std::string disk_identity;
 
+    // [TAG_CACHE_ALL_MODELS] the abandoned run directories of other identities (other models, or this model with
+    // other settings), oldest first: kept for their model, and counted against the limit, which covers the whole
+    // cache directory. When room is needed they go first, the oldest first, before any entry of this run's model.
+    struct foreign_dir {
+        std::string path;
+        size_t      bytes = 0;
+    };
+    std::vector<foreign_dir> disk_foreign;
+    size_t disk_foreign_bytes = 0;
+
 #if defined(_WIN32)
     // Held open with deny-all sharing for the life of the run: the Windows
     // counterpart of the POSIX flock() advisory lock, so a later startup can tell a
@@ -991,6 +1001,9 @@ private:
        std::vector<uint8_t> * state_spec);
 
     bool erase_disk_state(std::list<server_prompt_disk_state>::iterator it, bool eviction, const char * reason);
+
+    // removes the oldest run directory of another identity; false when none is left
+    bool evict_foreign_dir(const char * reason);
 
     void disable_disk_saves(const char * reason, const std::string & path);
 
