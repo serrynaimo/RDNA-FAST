@@ -180,7 +180,7 @@ if [ ! -z ${GG_BUILD_OPENVINO} ]; then
     CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_OPENVINO=ON"
 
     # TODO: fix failing tests on OpenVINO backend
-    CTEST_EXTRA="-E test-llama-archs|^test-recurrent-state-|test-save-load-state"
+    CTEST_EXTRA="-E test-llama-archs|test-llama-context"
 fi
 
 ## helpers
@@ -281,25 +281,6 @@ function gg_run_test_llama_archs_tensor_split {
         GGML_METAL_DEVICES=2 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
         GGML_METAL_DEVICES=3 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
         GGML_METAL_DEVICES=4 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
-    fi
-
-    set +e
-}
-
-# test_llama_archs_models
-
-function gg_run_test_llama_archs_models {
-    cd ${SRC}
-
-    set -e
-
-    # TODO: fix and re-enable `test-llama-archs` on OpenVINO
-    # TODO: the `test-llama-archs` currently does not build on Windows, so we check if the binary exists
-    if [ -z ${GG_BUILD_OPENVINO} ] && [ -f ./build-ci-release/bin/test-llama-archs ]; then
-        rm -rf build-ci-models && mkdir -p build-ci-models
-
-        # generate the dummy models used by the model-dependent tests
-        ./build-ci-release/bin/test-llama-archs -o build-ci-models 2>&1
     fi
 
     set +e
@@ -447,10 +428,10 @@ function gg_run_qwen3_0_6b {
 
     (time ./bin/llama-imatrix --model ${model_f16} -f ${wiki_test} -ngl 99 -c 1024 -b 512 --chunks 2 ) 2>&1 | tee -a $OUT/${ci}-imatrix.log
 
-    (time ./bin/test-save-load-state --model ${model_q4_0} -ngl 10 -c 1024 -fa off --no-op-offload) 2>&1 | tee -a $OUT/${ci}-save-load-state.log
-    (time ./bin/test-save-load-state --model ${model_q4_0} -ngl 10 -c 1024 -fa on  --no-op-offload) 2>&1 | tee -a $OUT/${ci}-save-load-state.log
-    (time ./bin/test-save-load-state --model ${model_q4_0} -ngl 99 -c 1024 -fa off                ) 2>&1 | tee -a $OUT/${ci}-save-load-state.log
-    (time ./bin/test-save-load-state --model ${model_q4_0} -ngl 99 -c 1024 -fa on                 ) 2>&1 | tee -a $OUT/${ci}-save-load-state.log
+    (time ./bin/test-llama-context --model ${model_q4_0} -ngl 10 -c 1024 -fa off --no-op-offload) 2>&1 | tee -a $OUT/${ci}-test-llama-context.log
+    (time ./bin/test-llama-context --model ${model_q4_0} -ngl 10 -c 1024 -fa on  --no-op-offload) 2>&1 | tee -a $OUT/${ci}-test-llama-context.log
+    (time ./bin/test-llama-context --model ${model_q4_0} -ngl 99 -c 1024 -fa off                ) 2>&1 | tee -a $OUT/${ci}-test-llama-context.log
+    (time ./bin/test-llama-context --model ${model_q4_0} -ngl 99 -c 1024 -fa on                 ) 2>&1 | tee -a $OUT/${ci}-test-llama-context.log
 
     function check_ppl {
         qnt="$1"
@@ -700,7 +681,6 @@ test $ret -eq 0 && gg_run ctest_release
 
 test $ret -eq 0 && gg_run test_backend_ops
 
-test $ret -eq 0 && gg_run test_llama_archs_models
 test $ret -eq 0 && gg_run test_llama_archs_tensor_split
 
 if [ -z ${GG_BUILD_LOW_PERF} ]; then

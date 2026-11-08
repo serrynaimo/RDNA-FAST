@@ -191,6 +191,7 @@ public:
     llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, uint32_t n_seq_cap = 0);
 
     // sequence-set-wise split - each ubatch contains a single sequence-set
+    // TODO: extend to support multiple _full_ sequences in the ubatch
     llama_ubatch split_seq(uint32_t n_ubatch);
 
     // a helper method for creating a well-defined ubatch of tokens

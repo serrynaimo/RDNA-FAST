@@ -168,6 +168,8 @@ jobs:
           echo "RC_EXE=$($rc.FullName -replace '\\', '/')" >> $env:GITHUB_ENV
           echo "$bin" >> $env:GITHUB_PATH
           echo "C:\TheRock\build\.venv\Scripts" >> $env:GITHUB_PATH
+          # lld-link calls mt.exe to embed the app manifest (cmake/win-app.cmake): it sits beside rc.exe
+          echo "$($rc.DirectoryName)" >> $env:GITHUB_PATH
       - name: Build
         shell: pwsh
         run: |

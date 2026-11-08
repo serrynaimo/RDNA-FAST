@@ -970,8 +970,8 @@ const common_chat_msg message_user_parts{
     /* .content = */ "",
     /* .content_parts = */
     {
-     { "text", "Hey" },
-     { "text", "there" },
+     { "text", "Hey", "" },
+     { "text", "there", "" },
      },
     /* .tool_calls = */
     {                 },
@@ -3280,9 +3280,9 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 common_chat_msg message_parts;
                 message_parts.role          = "user";
                 message_parts.content_parts = {
-                    { /* .type = */ "text", /* .text = */ "First part.\n\n" },
-                    { /* .type = */ "media_marker", /* .text = */ "<__media__>" },
-                    { /* .type = */ "text", /* .text = */ "Second part.\n\n" },
+                    { /* .type = */ "text", /* .text = */ "First part.\n\n", /* .name = */ "" },
+                    { /* .type = */ "media_marker", /* .text = */ "<__media__>", /* .name = */ "" },
+                    { /* .type = */ "text", /* .text = */ "Second part.\n\n", /* .name = */ "" },
                 };
 
                 common_chat_templates_inputs inputs;
@@ -5470,6 +5470,85 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         test_lfm2_parser(tmpl, detailed_debug);
     }
 
+    {
+        auto tst = peg_tester("models/templates/LFM3.jinja", detailed_debug);
+
+        tst.test("Hello, world!\nWhat's up?")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(message_assist)
+            .run();
+
+        tst.test("I'm\nthinking</think>Hello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(message_assist_thoughts)
+            .run();
+
+        tst.test(
+               "<tool_call>\n"
+               "<function=special_function>\n"
+               "<parameter=arg1>\n1\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+
+        tst.test(
+               "I'm\nthinking</think>"
+               "<tool_call>\n"
+               "<function=special_function>\n"
+               "<parameter=arg1>\n1\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect(message_assist_call_thoughts)
+            .run();
+
+        // a deferred tool is left out of <tools>, a tool_reference renders it, and its schema types the call
+        const auto deferred_tools = common_chat_tools_parse_oaicompat(json::parse(R"([
+            {"type": "function", "function": {"name": "tool_search", "description": "Search for tools",
+             "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}}},
+            {"type": "function", "function": {"name": "buy", "description": "Buy an item", "defer_loading": true,
+             "parameters": {"type": "object", "properties": {"id": {"type": "string"}, "qty": {"type": "integer"}}}}}
+        ])"));
+        {
+            auto tmpls = read_templates("models/templates/LFM3.jinja");
+            common_chat_templates_inputs inputs;
+            inputs.messages = common_chat_msgs_parse_oaicompat(json::parse(R"([
+                {"role": "user", "content": "Buy the blue one"},
+                {"role": "assistant", "tool_calls": [{"id": "c0", "type": "function",
+                 "function": {"name": "tool_search", "arguments": "{\"query\": \"buy\"}"}}]},
+                {"role": "tool", "tool_call_id": "c0", "name": "tool_search", "content": [{"type": "tool_reference", "name": "buy"}]}
+            ])"));
+            inputs.tools                 = deferred_tools;
+            inputs.add_generation_prompt = true;
+            const auto prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
+            assert_contains(prompt, "<tool_response>\n<additional_tools>\n{\"name\": \"buy\"");
+            assert_equals(true, prompt.find("\"name\": \"buy\"") > prompt.find("</tools>"));
+            assert_not_contains(prompt, "defer_loading");
+            assert_not_contains(prompt, "tool_reference");
+        }
+
+        tst.test(
+               "<tool_call>\n"
+               "<function=buy>\n"
+               "<parameter=id>\nblue\n</parameter>\n"
+               "<parameter=qty>\n2\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools(deferred_tools)
+            .expect_tool_calls({ { "buy", R"({"id": "blue", "qty": 2})", {} } })
+            .run();
+    }
+
     // Thinking cases only apply to LFM2.5-8B-A1B, the one LFM2 template that emits <think>
     {
         auto tst = peg_tester("models/templates/LFM2.5-8B-A1B.jinja", detailed_debug);
@@ -6663,12 +6742,60 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
+    // Muse Spark format tests
+    {
+        auto tst = peg_tester("models/templates/muse-spark.jinja", detailed_debug);
+
+        const std::string call_markup =
+            "<atem:function_calls>\n"
+            "<atem:invoke name=\"special_function\">\n"
+            "<atem:parameter name=\"arg1\">1</atem:parameter>\n"
+            "</atem:invoke>\n"
+            "</atem:function_calls>";
+
+        // A plain answer behaves as it does for Muse Glimmer
+        tst.test(" to=user<|message|>Hello, world!\nWhat's up?<|eot|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(message_assist)
+            .run();
+
+        // A commentary message is user facing content, not reasoning
+        tst.test(" to=commentary<|message|>Hello, world!\nWhat's up?<|eom|>"
+                 "<|start|>assistant to=user<|message|>Done!<|eot|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_content("Hello, world!\nWhat's up?Done!")
+            .run();
+
+        // Commentary announces the work, then the tool call follows in the same generation
+        tst.test(" to=commentary<|message|>Let me look that up.<|eom|>"
+                 "<|start|>assistant to=special_function<|message|>" +
+                 call_markup)
+            .tools({ special_function_tool })
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(message_with_content_and_tool_call("Let me look that up.", "special_function",
+                                                       "{\"arg1\":1}"))
+            .run();
+
+        // Reasoning still reaches the reasoning channel with commentary in the picture
+        tst.test(" to=self<|message|>Thinking.<|eom|>"
+                 "<|start|>assistant to=commentary<|message|>Working on it.<|eom|>"
+                 "<|start|>assistant to=user<|message|>Hello!<|eot|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("Thinking.")
+            .expect_content("Working on it.Hello!")
+            .run();
+    }
+
     // GPT-OSS format tests
     {
         auto tst = peg_tester("models/templates/openai-gpt-oss-120b.jinja", detailed_debug);
 
         // Basic content only - final channel
         tst.test("<|channel|>final<|message|>Hello, world!\nWhat's up?").expect(message_assist).run();
+
+        // Final channel with a constraint type, with and without <|constrain|> (#31520)
+        tst.test("<|channel|>final code<|message|>Hello, world!\nWhat's up?").expect(message_assist).run();
+        tst.test("<|channel|>final <|constrain|>json<|message|>Hello, world!\nWhat's up?").expect(message_assist).run();
 
         // Basic content only - commentary channel
         tst.test("<|channel|>commentary<|message|>Hello, world!\nWhat's up?").expect(message_assist).run();

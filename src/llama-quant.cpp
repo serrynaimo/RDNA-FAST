@@ -32,9 +32,11 @@ enum class tensor_category {
     ATTENTION_QKV,
     ATTENTION_KV_B,
     ATTENTION_OUTPUT,
+    ATTENTION_GATE,
     FFN_UP,
     FFN_GATE,
     FFN_DOWN,
+    FFN_LATENT,
     OUTPUT,
     OTHER
 };
@@ -178,6 +180,12 @@ static tensor_category tensor_get_category(const std::string & tensor_name) {
     }
     if (tensor_name.find("ffn_gate") != std::string::npos) {
         return tensor_category::FFN_GATE;
+    }
+    if (tensor_name.find("ffn_latent") != std::string::npos) {
+        return tensor_category::FFN_LATENT;
+    }
+    if (tensor_name.find("attn_gate.weight") != std::string::npos) {
+        return tensor_category::ATTENTION_GATE;
     }
     if (tensor_name.find("ffn_down") != std::string::npos) {
         return tensor_category::FFN_DOWN;
@@ -359,6 +367,13 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // these are not too big so keep them as it is
     quantize &= name.find("per_layer_model_proj") == std::string::npos;
 
+    // limite: very small gates and dense connection mixers
+    if (arch == LLM_ARCH_LIMITE) {
+        quantize &= name.find("attn_gate.weight")    == std::string::npos;
+        quantize &= name.find("attn_ve_gate.weight") == std::string::npos;
+        quantize &= name.find("mudd_")               == std::string::npos;
+    }
+
     // do not quantize positional embeddings and token types (BERT)
     quantize &= name != LLM_TN(arch)(LLM_TENSOR_POS_EMBD,    "weight");
     quantize &= name != LLM_TN(arch)(LLM_TENSOR_TOKEN_TYPES, "weight");
@@ -368,9 +383,27 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find("ssm_conv1d") == std::string::npos;
     quantize &= name.find("shortconv.conv.weight") == std::string::npos;
 
+    // do not quantize LFM3-VL's depthwise conv kernels, CONV_2D_DW takes F32 kernels
+    quantize &= name.find("conv2d_spatial.weight") == std::string::npos;
+
+    // do not quantize LFM3-Audio's encoder convs, depthwise convs and the codec FSQ
+    quantize &= name.rfind("a.conv1d.", 0) != 0;
+    quantize &= name.find("conv_dw") == std::string::npos;
+    quantize &= name.rfind("a.gen.wav.quant.", 0) != 0;
+
     // do not quantize MiniMax's indexer projection weights, they are tiny
     quantize &= name.find("indexer.k_proj.weight") == std::string::npos;
     quantize &= name.find("indexer.q_proj.weight") == std::string::npos;
+
+    // metis16: small control tensors that steer every layer; the stream and hc_ tables (ne[0] = 4) would fall back to F16
+    if (arch == LLM_ARCH_METIS16) {
+        quantize &= name.rfind("depth_mem_", 0) == std::string::npos;
+        quantize &= name.rfind("cont_", 0)      == std::string::npos;
+        quantize &= name.find("stream_embd")    == std::string::npos;
+        quantize &= name.find("attn_pass_lora") == std::string::npos;
+        quantize &= name.find("ffn_exp_embd")   == std::string::npos;
+        quantize &= name.find("hc_")            == std::string::npos;
+    }
 
     // glm5-next
     if (arch == LLM_ARCH_GLM5_NEXT) {
@@ -388,6 +421,12 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
         quantize &= name.find("attn_kv_a_mqa.weight")    == std::string::npos;
         quantize &= name.find("attn_k_b.weight")         == std::string::npos;
         quantize &= name.find("attn_v_b.weight")         == std::string::npos;
+    }
+
+    // xing4_0: do not quantize the MHC hyper-connection gate matrices
+    // (the 1D hc_*_base / hc_*_scale tensors are already excluded by the n_dims < 2 rule)
+    if (arch == LLM_ARCH_XING4_0) {
+        quantize &= name.find("hc_") == std::string::npos;
     }
 
     // the decision head of vllm-decision2 is small and computed in F32
@@ -680,6 +719,19 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                 break;
             default:
                 return GGML_TYPE_Q8_0;
+        }
+    }
+
+    // bumping to q8_0 is preferred since these tensors are not really big
+    // TODO: nemotron 3 super shares ffn_latent and afmoe, bailingmoe3, dots3note, hy-v4, kimi-k3 and laguna share attn_gate.
+    //       Widening the guard is likely a win there too, but it changes their files, so it wants a perplexity comparison per architecture first.
+    if (arch == LLM_ARCH_MUSE_SPARK &&
+        (category == tensor_category::FFN_LATENT || category == tensor_category::ATTENTION_GATE)) {
+        auto bits_per_weight = [](ggml_type t) {
+            return 8.0 * ggml_type_size(t) / ggml_blck_size(t);
+        };
+        if (ggml_is_quantized(new_type) && bits_per_weight(new_type) < bits_per_weight(GGML_TYPE_Q8_0)) {
+            new_type = GGML_TYPE_Q8_0;
         }
     }
 

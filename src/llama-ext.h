@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <map>
+#include <vector>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -102,6 +103,13 @@ LLAMA_API uint32_t llama_kv_lanes_merge_max(const struct llama_context * ctx);
 // false gives every sequence its own pass again, true restores the default. No effect elsewhere.
 LLAMA_API void llama_kv_lanes_set_merge(struct llama_context * ctx, bool enable);
 
+// the backend buffers that a state write of this memory would touch - empty caches report none
+LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
+
+// Turn the KV cache attention rotation on or off for the contexts created from this model.
+// Useful for testing purposes.
+LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
@@ -172,3 +180,6 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
 
 // realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
 LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
+
+// each sequence is paired with an unconditional one at n_seq_max / 2 + seq_id, in a unified KV cache
+LLAMA_API bool llama_model_classifier_free_guidance(const struct llama_model * model);

@@ -345,6 +345,8 @@ struct common_params_speculative_draft {
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
+    int32_t n_ubatch = 0; // physical batch size of the draft context (0 - use the target's n_ubatch)
+
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
@@ -802,6 +804,7 @@ struct common_params {
 
     // TTS params
     std::string tts_lang = "";
+    std::string tts_voice = "";
     std::string tts_speaker_file = "";
 
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
@@ -935,12 +938,8 @@ bool glob_match(const std::string & pattern, const std::string & str);
 //
 
 #ifdef _WIN32
-std::wstring utf8_to_wstring(const std::string & str);
-std::string  wstring_to_utf8(const std::wstring & str);
+std::string wstring_to_utf8(const std::wstring & str);
 #endif
-
-// returns the path as a UTF-8 string, preserving its separators
-std::string fs_path_to_utf8(const std::filesystem::path & path);
 
 //
 // Environment utils
@@ -957,9 +956,6 @@ size_t common_process_resident_bytes();
 
 // the OS this process runs on, e.g. "Windows 11 (build 26300)", "Ubuntu 24.04.1 LTS", "macOS 15.1"
 std::string common_host_os();
-
-// reads a path from the environment, an unset variable gives an empty path
-std::filesystem::path common_get_path_from_env(const std::string & name);
 
 //
 // Filesystem utils
@@ -1016,6 +1012,9 @@ enum common_decision_type {
     COMMON_DECISION_TYPE_LFM2_D1_OMNI, // same as laya, other prompt layout
     COMMON_DECISION_TYPE_GRANITE_SWITCH, // same as openjev, run by the decision aLoRA of granite switch
     COMMON_DECISION_TYPE_H2O_LIGHTNING, // same as openjev, the labels are read after an answer prefill
+    COMMON_DECISION_TYPE_MINICPM_OCR_JEV, // one score per class, the pooled embeddings output of the last token
+    COMMON_DECISION_TYPE_LFM3_D1,       // same as lfm2-d1, non-causal, label codes A..Z then AA, AB..
+    COMMON_DECISION_TYPE_LFM3_D1_OMNI,  // same as lfm3-d1
     COMMON_DECISION_TYPE_UNKNOWN, // a decision model of a type that is not supported
 };
 

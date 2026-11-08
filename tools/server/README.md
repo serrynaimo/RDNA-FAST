@@ -269,6 +269,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-draft-n-cpu-moe, --spec-draft-ncmoe, -ncmoed, --n-cpu-moe-draft N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE) |
 | `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
 | `--spec-draft-n-min N` | minimum number of draft tokens to use for speculative decoding (default: 0)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN) |
+| `--spec-draft-n-ubatch N` | physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: 0 - same as --n-ubatch)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_UBATCH) |
 | `--spec-synth-len L` | target mean synthetic acceptance length, including the target token (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_LEN) |
 | `--spec-synth-rates P0,P1,...` | comma-separated unconditional per-position synthetic acceptance probabilities (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_RATES) |
 | `--spec-draft-p-split, --draft-p-split P` | speculative decoding split probability (default: 0.10)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT) |
@@ -862,7 +863,9 @@ Returns raw audio bytes (`audio/wav` by default) rather than JSON. For more info
 
 `lang`: Language code for the utterance (model-dependent, e.g. `en`, `zh`). Optional.
 
-`speaker_ref_b64`: Base64-encoded reference audio to clone the speaker's voice. Optional. Alternatively, upload the reference audio as a `speaker_ref` file field via `multipart/form-data` (see example below) - if both are provided, the uploaded file takes precedence.
+`voice`: Voice for the utterance, one of the `voices` listed by `GET /props` (model-dependent, e.g. `female` or `male` for LFM3-Audio). Optional: a model with predefined voices speaks with the first of them when neither `voice` nor `speaker_ref` is given. It rejects any other name, and a predefined voice cannot be combined with `speaker_ref`.
+
+`speaker_ref_b64`: Base64-encoded reference audio to clone the speaker's voice. Optional. Alternatively, upload the reference audio as a `speaker_ref` file field via `multipart/form-data` (see example below) - if both are provided, the uploaded file takes precedence. Rejected when the model has no voice encoder (e.g. Pocket TTS without voice cloning).
 
 `top_k`, `top_p`: Sampling params for the acoustic code predictor. Optional, model-dependent defaults apply.
 
@@ -1020,6 +1023,7 @@ By default, it is read-only. To make POST request to change global properties, y
 
 - `default_generation_settings` - the default generation settings for the `/completion` endpoint, which has the same fields as the `generation_settings` response object from the `/completion` endpoint.
 - `total_slots` - the total number of slots for process requests (defined by `--parallel` option)
+- `voices` - the predefined voices of an audio generation model, to pass as `voice` to `/tts`. Only present when the model has some (e.g. LFM3-Audio, Pocket TTS without voice cloning)
 - `model_path` - the path to model file (same with `-m` argument)
 - `chat_template` - the model's original Jinja2 prompt template
 - `chat_template_caps` - capabilities of the chat template (see `common/jinja/caps.h` for more info), `reasoning_effort_levels` lists the `reasoning_effort` values the template renders distinctly, from lowest to highest
@@ -1468,6 +1472,7 @@ For multimodal input (typed content, `messages[i].content[j]`):
 - If `type == "input_video"`:
     - Either `input_video.data` or `input_video.url` can be specified, can be a remote URL, raw base64 or path to local file
     - Accepts formats supported by `ffmpeg`
+    - Models that hear their video (LFM3-Omni) also get its soundtrack, the audio of each group of frames follows them
 - Note: for local file, make sure to set `--media-path`. File path must be prefixed by `file://`
 
 *Examples:*
@@ -1590,6 +1595,10 @@ Returns a JSON object with a boolean `success` field, and an optional `message` 
 
 Transcribes streamed audio, for models with a streaming audio encoder. Compatible with OAI `/v1/realtime` schema.
 
+Models that write the text while they listen use this endpoint: Voxtral Realtime, and live ASR models, which carry the prompt of their transcription in a chat template named `asr` (e.g. the LFM3-Audio live ASR checkpoints, the text of every 0.96 s of audio follows it). A live ASR model restarts its context at a pause after 15 s and always after 30 s, the transcript then goes on in a new line. A commit completes the audio with silence, so that its text comes out.
+
+Live ASR models can also hold a conversation, so they transcribe live only in sessions opened with `/v1/realtime?intent=transcription`, as OpenAI transcription sessions are; other sessions are a [realtime conversation](#realtime-conversation).
+
 Audio must be PCM16, mono, at the model sample rate. The sample rate is returned in `session.created` as `audio.input.format.rate`. Each `input_audio_buffer.append` carries a base64-encoded chunk of PCM16 samples.
 
 *Client events:*
@@ -1610,6 +1619,41 @@ Closing the websocket also ends the input.
 - `error`: `error.message` describes the problem
 
 Note that words held back by the model's delay at the time of a commit are attributed to the next item.
+
+#### Realtime conversation
+
+Models that answer after the audio, like LFM3-Audio and LFM3-Omni, hold a conversation on the same endpoint (with an `asr` template, unless the session is opened with `?intent=transcription`). The audio is prefilled as it arrives, so the response starts right after the last chunk. Audio input is PCM16 mono at the model sample rate (`audio.input.format.rate` of `session.created`), audio output is PCM16 mono at `audio.output.format.rate`.
+
+`session.type` selects the session, it can be changed with `session.update` before the first audio or message:
+
+- `realtime` (default): a conversation, every response stays in context for the next turns
+- `transcription`: each committed audio buffer is transcribed on its own, `audio.input.transcription.language` picks the language
+
+*Client events:*
+
+- `session.update`: `type`, `instructions` (the system prompt, before the first audio or message), `output_modalities`, `max_output_tokens` (an integer or `"inf"`, the default), `tools` (functions with `name`, `description` and `parameters`, before the first audio or message) and `tool_choice` (`"auto"`, the default, `"none"` or `"required"`)
+- `input_audio_buffer.append`: `audio` holds base64 PCM16 samples
+- `input_audio_buffer.commit`: ends the audio of the user turn, in a transcription session the transcript follows
+- `conversation.item.create`: a user message with `input_text` content, or a `function_call_output` with the `call_id` and `output` of a tool call of the last response
+- `response.create`: ends the user turn and generates the response, `response.output_modalities`, `response.max_output_tokens` and `response.tool_choice` override the session
+- `response.cancel`: stops the response being generated
+
+LFM3-Omni is not trained to reason, run it with `--reasoning off` so that its turns open with an empty think block.
+
+`output_modalities` picks the mode of the responses: left out, the model switches between text and audio on its own; `["text"]` keeps the response in text, `["audio"]` makes it speech and `["text", "audio"]` interleaves text with the speech.
+
+*Server events:*
+
+- `session.created` and `session.updated`: carry the `session` object
+- `input_audio_buffer.committed`, `conversation.item.added`, `conversation.item.done`: the user item
+- `response.created`, `response.output_item.added`, `response.content_part.added`, then `response.output_text.delta` and `response.output_audio.delta` (base64 PCM16) as they are generated, then the `.done` events and `response.done`
+- `response.output_item.added` with a `function_call` item, `response.function_call_arguments.delta` and `.done`: a tool call of the response, its arguments are a JSON string
+- `conversation.item.input_audio_transcription.delta` and `.completed`: in a transcription session
+- `error`: `error.message` describes the problem
+
+Tools go into the system prompt with the chat template, and the tool calls are parsed as in `/v1/chat/completions`. The client runs the calls of a response, sends their results as `function_call_output` items, then asks for the next response.
+
+See [examples/realtime_client.py](../../examples/realtime_client.py) for a client with the `openai` library.
 
 ### POST `/v1/responses`: OpenAI-compatible Responses API
 
@@ -1851,13 +1895,17 @@ Follows the [TypeSafe API](https://docs.typesafe.ai/api), streaming is not suppo
 
 The questions of a request are answered independently, an answer does not depend on the other questions. The exception is clef: it reads all the questions in one prompt and decides them jointly.
 
-The number of options of a `choice` question is limited by the model, for example: 52 for openjev, 255 for granite-switch, laya, clef, pplx-decider, vllm-decision2, vllm-d3, lfm2-d1, lfm2-d1-omni and h2o-lightning. For laya, long questions and options are truncated to the token budget the model was trained with.
+The number of options of a `choice` question is limited by the model, for example: 52 for openjev, 255 for granite-switch, laya, clef, pplx-decider, vllm-decision2, vllm-d3, lfm2-d1, lfm2-d1-omni and h2o-lightning, 2 for openbmb-minicpm-ocr-jev. For laya, long questions and options are truncated to the token budget the model was trained with.
 
 For laya, clef, vllm-d3 and lfm2-d1-omni, the whole prompt is evaluated in one batch: it must fit in `--ubatch-size`. An lfm2-d1-omni prompt is cut to 16384 tokens. For vllm-decision2, the options of a question and the end of the prompt must fit in one batch. An h2o-lightning state longer than 32000 tokens keeps its first and last 16000 tokens. A server that runs clef only serves this endpoint, text generation is not available. A decision model that is also a text model, such as granite-switch, serves both and reports `["text", "decisions"]`.
 
+openbmb-minicpm-ocr-jev answers one fixed question: is an OCR text, rendered as an image, consistent with the original image? `state` is the OCR text, as a string, special tokens written in it are escaped. `files` (or `images`) has exactly 2 images: the original, then the rendered one, both are required. The request has one question and no `instructions`: the task is part of the prompt of the model, so a request that sends one is rejected. It is either a `choice` with the `criteria` `{"0": null, "1": null}`, where `1` means consistent, or a `noul` without `criteria`, which returns the probability of `1`. The model has no LM head, so text generation is not available.
+
+Its prompt carries two images, so it is much longer than a text-only one: size the context with `-c` and the batch with `--batch-size`/`--ubatch-size` accordingly. The prompt of a request is evaluated in batches like a normal causal model, the class scores are read from the pooled output of its last token.
+
 *Image input:*
 
-Image input needs a model that supports it (for example: openjev, clef, pplx-decider, vllm-d3, lfm2-d1, lfm2-d1-omni, h2o-lightning) and its multimodal projector, see `--mmproj`.
+Image input needs a model that supports it (for example: openjev, clef, pplx-decider, vllm-d3, lfm2-d1, lfm2-d1-omni, h2o-lightning, openbmb-minicpm-ocr-jev) and its multimodal projector, see `--mmproj`.
 
 Images can be given in two ways, and both can be used in the same request:
 

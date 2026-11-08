@@ -391,7 +391,7 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
         }
 
-        ggml_cuda_syncwarp();
+        ggml_cuda_syncwarp(); // Needed for KQ synchronization.
 
 #if ROCMFPX_FA_Q5V_UNROLL_ON
 #pragma unroll V_k0_unroll
@@ -452,6 +452,8 @@ static __global__ void flash_attn_ext_vec(
             }
 #endif // V_DOT2_F32_F16_AVAILABLE
         }
+
+        ggml_cuda_syncwarp(); // Needed for KQ synchronization.
     }
 
     if (sinks && blockIdx.y == 0) {

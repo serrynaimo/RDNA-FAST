@@ -118,6 +118,7 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
     X(FA_Q5_0,         fa_q5_0)        \
     X(FA_Q5_1,         fa_q5_1)        \
     X(FA_Q8_0,         fa_q8_0)        \
+    X(FA_TENSOR,       fa_tensor)      \
     X(FA_VEC_F16,      fa_vec_f16)     \
     X(FA_VEC_F32,      fa_vec_f32)     \
     X(FA_VEC_Q4_0,     fa_vec_q4_0)    \
@@ -1679,9 +1680,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_CUMSUM:
         case GGML_OP_MEAN:
         case GGML_OP_SOFT_MAX:
-        case GGML_OP_GROUP_NORM:
         case GGML_OP_L2_NORM:
             return has_simdgroup_reduction && ggml_is_contiguous_rows(op->src[0]);
+        case GGML_OP_GROUP_NORM:
+            return has_simdgroup_reduction &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_COUNT_EQUAL:
             return has_simdgroup_reduction &&
                 op->src[0]->type == GGML_TYPE_I32 &&
@@ -1834,6 +1839,15 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous_rows(op->src[1]) &&
                 ggml_is_contiguous_rows(op->src[2]) &&
                 (op->src[3] == NULL || ggml_is_contiguous_rows(op->src[3]));
+        case GGML_OP_TOP_K_MASK:
+            return (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
+                op->src[0]->type == op->type &&
+                op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+                op->nb[0] == ggml_type_size(op->type) &&
+                op->src[1]->type == GGML_TYPE_I32 &&
+                (op->src[2] == NULL || op->src[2]->type == GGML_TYPE_F32) &&
+                (op->src[3] == NULL || op->src[3]->type == GGML_TYPE_I32) &&
+                (op->src[4] == NULL || op->src[4]->type == GGML_TYPE_I32);
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
         case GGML_OP_SSM_CONV:

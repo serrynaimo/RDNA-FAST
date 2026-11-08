@@ -1,3 +1,4 @@
+import { DEFAULT_AGENTIC_CONFIG } from './agentic.constants';
 import { CLI_FLAGS } from './cli-flags.constants';
 import { DEFAULT_MCP_CONFIG } from './mcp.constants';
 import { SETTINGS_KEYS } from './settings-keys.constants';
@@ -230,8 +231,15 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				type: SettingsFieldType.CHECKBOX
 			},
 			{
+				defaultValue: true,
+				help: 'Expand tool call details while the call is being generated and executed, and collapse them again once its result is in. Mirrors "Show thought in progress". Tool calls you expand or collapse by hand keep your choice.',
+				key: SETTINGS_KEYS.SHOW_TOOL_CALL_IN_PROGRESS,
+				label: 'Show tool call in progress',
+				type: SettingsFieldType.CHECKBOX
+			},
+			{
 				defaultValue: false,
-				help: 'Automatically expand tool call details while executing and keep them expanded after completion.',
+				help: 'Keep tool call details expanded after completion. Takes precedence over "Show tool call in progress", which only covers the in-flight phases.',
 				key: SETTINGS_KEYS.ALWAYS_SHOW_TOOL_CALL_CONTENT,
 				label: 'Always show tool call content',
 				type: SettingsFieldType.CHECKBOX
@@ -360,7 +368,7 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 		icon: ListRestart,
 		settings: [
 			{
-				defaultValue: 10,
+				defaultValue: DEFAULT_AGENTIC_CONFIG.maxTurns,
 				help: 'Maximum number of tool execution cycles before stopping (prevents infinite loops).',
 				isPositiveInteger: true,
 				key: SETTINGS_KEYS.AGENTIC_MAX_TURNS,

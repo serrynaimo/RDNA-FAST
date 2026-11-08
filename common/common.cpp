@@ -26,6 +26,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <random>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -218,6 +219,23 @@ int32_t common_cpu_get_num_math() {
                 return result;
             }
         }
+    }
+#elif defined(__riscv) && defined(__linux__)
+    std::ifstream cpuinfo("/proc/cpuinfo");
+    std::string line;
+    int32_t n_a100 = 0;
+    while (std::getline(cpuinfo, line)) {
+        std::istringstream fields(line);
+        std::string key;
+        std::string separator;
+        uint64_t marchid;
+        if (fields >> key >> separator >> std::hex >> marchid &&
+            key == "marchid" && separator == ":" && marchid == UINT64_C(0x8000000041000002)) {
+            ++n_a100;
+        }
+    }
+    if (n_a100 > 0) {
+        return n_a100;
     }
 #elif defined(__powerpc64__) || defined(__powerpc__)
     int32_t smt_factor = 1;
@@ -878,27 +896,7 @@ bool fs_validate_filename(const std::string & filename, bool allow_subdirs) {
     return true;
 }
 
-#include <iostream>
-
-
 #ifdef _WIN32
-std::wstring utf8_to_wstring(const std::string & str) {
-    if (str.empty()) {
-        return std::wstring();
-    }
-
-    int size = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), NULL, 0);
-
-    if (size <= 0) {
-        return std::wstring();
-    }
-
-    std::wstring wstr(size, 0);
-    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), &wstr[0], size);
-
-    return wstr;
-}
-
 std::string wstring_to_utf8(const std::wstring & str) {
     if (str.empty()) {
         return std::string();
@@ -917,16 +915,14 @@ std::string wstring_to_utf8(const std::wstring & str) {
 }
 #endif
 
-// returns the path as a UTF-8 string, preserving its separators
-std::string fs_path_to_utf8(const std::filesystem::path & path) {
-    const auto value = path.u8string();
-    return std::string(value.begin(), value.end());
-}
-
 void fs_write_atomic(const std::filesystem::path & path, const std::string & data) {
+    // a random suffix gives every writer its own temporary file, across processes and containers
+    std::random_device rd;
+    const uint64_t id = ((uint64_t) rd() << 32) | rd();
+
     std::error_code ec;
     std::filesystem::path path_tmp = path;
-    path_tmp += ".tmp";
+    path_tmp += "." + std::to_string(id) + ".tmp";
 
     if (path.has_parent_path()) {
         std::filesystem::create_directories(path.parent_path(), ec);
@@ -942,7 +938,7 @@ void fs_write_atomic(const std::filesystem::path & path, const std::string & dat
 
     if (file.fail() || ec) {
         std::filesystem::remove(path_tmp, ec);
-        throw std::runtime_error("failed to write file: " + fs_path_to_utf8(path));
+        throw std::runtime_error("failed to write file: " + path.string());
     }
 }
 
@@ -1033,20 +1029,9 @@ std::string common_host_os() {
 #endif
 }
 
-std::filesystem::path common_get_path_from_env(const std::string & name) {
-#if defined(_WIN32)
-    const std::wstring wname = utf8_to_wstring(name);
-    const wchar_t * wvalue = _wgetenv(wname.c_str());
-    return wvalue ? std::filesystem::path(wvalue) : std::filesystem::path();
-#else
-    const char * value = std::getenv(name.c_str());
-    return value ? std::filesystem::path(value) : std::filesystem::path();
-#endif
-}
-
 #if !defined(_WIN32)
 static std::filesystem::path get_home_directory() {
-    std::filesystem::path home = common_get_path_from_env("HOME");
+    std::filesystem::path home = common_get_env("HOME");
     if (!home.empty()) {
         return home;
     }
@@ -1059,19 +1044,19 @@ static std::filesystem::path get_home_directory() {
 #endif
 
 std::filesystem::path fs_get_cache_directory() {
-    std::filesystem::path cache_directory = common_get_path_from_env("LLAMA_CACHE");
+    std::filesystem::path cache_directory = common_get_env("LLAMA_CACHE");
     if (!cache_directory.empty()) {
         return cache_directory;
     }
 #if defined(_WIN32)
-    cache_directory = common_get_path_from_env("LOCALAPPDATA");
+    cache_directory = common_get_env("LOCALAPPDATA");
     if (cache_directory.empty()) {
         throw std::runtime_error("Failed to find %LOCALAPPDATA% directory");
     }
 #elif defined(__APPLE__)
     cache_directory = get_home_directory() / "Library/Caches";
 #else
-    cache_directory = common_get_path_from_env("XDG_CACHE_HOME");
+    cache_directory = common_get_env("XDG_CACHE_HOME");
     if (cache_directory.empty()) {
         cache_directory = get_home_directory() / ".cache";
     }
@@ -1082,12 +1067,12 @@ std::filesystem::path fs_get_cache_directory() {
 std::filesystem::path fs_get_config_directory() {
     std::filesystem::path config_directory;
 #if defined(_WIN32)
-    config_directory = common_get_path_from_env("APPDATA");
+    config_directory = common_get_env("APPDATA");
     if (config_directory.empty()) {
         throw std::runtime_error("Failed to find %APPDATA% directory");
     }
 #else
-    config_directory = common_get_path_from_env("XDG_CONFIG_HOME");
+    config_directory = common_get_env("XDG_CONFIG_HOME");
     if (config_directory.empty()) {
         config_directory = get_home_directory() / ".config";
     }
@@ -1101,9 +1086,9 @@ std::filesystem::path fs_get_cache_file(const std::string & filename) {
     std::error_code ec;
     common_create_directories(cache_directory, ec);
     if (ec) {
-        throw std::runtime_error("failed to create cache directory: " + fs_path_to_utf8(cache_directory));
+        throw std::runtime_error("failed to create cache directory: " + cache_directory.string());
     }
-    return cache_directory / std::filesystem::u8path(filename);
+    return cache_directory / filename;
 }
 
 //
@@ -1248,6 +1233,9 @@ static const std::map<common_decision_type, std::string> COMMON_DECISION_TYPE_NA
     { COMMON_DECISION_TYPE_LFM2_D1_OMNI,   "lfm2-d1-omni"  },
     { COMMON_DECISION_TYPE_GRANITE_SWITCH, "granite-switch"},
     { COMMON_DECISION_TYPE_H2O_LIGHTNING,  "h2o-lightning" },
+    { COMMON_DECISION_TYPE_MINICPM_OCR_JEV, "openbmb-minicpm-ocr-jev" },
+    { COMMON_DECISION_TYPE_LFM3_D1,        "lfm3-d1"       },
+    { COMMON_DECISION_TYPE_LFM3_D1_OMNI,   "lfm3-d1-omni"  },
     // for future models, ALWAYS add org name prefix to avoid name collisions, e.g. "orgname-modelname"
 };
 
@@ -1430,17 +1418,27 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // these decision models return a score for each token via the embeddings output
     // TODO: maybe improve this in the future
     const auto decision_type = common_get_decision_type(model);
+    // minicpm-ocr-jev reads its class scores from the pooled output, the pooling type is the one of the GGUF
     if (decision_type == COMMON_DECISION_TYPE_LAYA || decision_type == COMMON_DECISION_TYPE_KEV || decision_type == COMMON_DECISION_TYPE_CLEF ||
-        decision_type == COMMON_DECISION_TYPE_LFM2_D1_OMNI || decision_type == COMMON_DECISION_TYPE_VLLM_DECISION2) {
+        decision_type == COMMON_DECISION_TYPE_LFM2_D1_OMNI || decision_type == COMMON_DECISION_TYPE_VLLM_DECISION2 ||
+        decision_type == COMMON_DECISION_TYPE_MINICPM_OCR_JEV) {
+        const auto pooling_type = decision_type == COMMON_DECISION_TYPE_MINICPM_OCR_JEV ? LLAMA_POOLING_TYPE_UNSPECIFIED : LLAMA_POOLING_TYPE_NONE;
+
         params.embedding    = true;
-        params.pooling_type = LLAMA_POOLING_TYPE_NONE;
+        params.pooling_type = pooling_type;
 
         cparams.embeddings            = true;
-        cparams.pooling_type          = LLAMA_POOLING_TYPE_NONE;
+        cparams.pooling_type          = pooling_type;
         cparams.n_outputs_max         = cparams.n_batch;
         cparams.n_outputs_max_per_seq = 1;
 
         LOG_INF("%s", "decision model reads the embeddings output, enabling embedding mode\n");
+    }
+
+    if (llama_model_classifier_free_guidance(model)) {
+        params.kv_unified   = true;
+        cparams.kv_unified  = true;
+        cparams.n_seq_max  *= 2;
     }
 
     // embeddings need the whole batch in one ubatch, so n_batch must not be larger than n_ubatch
