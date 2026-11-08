@@ -829,7 +829,7 @@ static void check_saved_preset_value(const common_arg & opt, const std::string &
                 r.whole ? "a whole number" : "a number", value.c_str()));
         }
         if (v < r.lo || v > r.hi) {
-            throw std::invalid_argument(string_format("option '%s' must be between %g and %g, got %s", given.c_str(),
+            throw std::invalid_argument(string_format("option '%s' must be between %.15g and %.15g, got %s", given.c_str(),
                 r.lo, r.hi, value.c_str()));
         }
         return;

@@ -25,13 +25,24 @@ other 20 GB fit in the RAM this machine leaves free, and the rest is read from t
 
 | | Default | With MTP drafting |
 | --- | ---: | ---: |
-| Decode, first answer after a load | 24.0 t/s | 22.6 t/s |
-| Decode, short answers | 26.6-26.9 t/s | **29.6-31.1 t/s** |
-| Decode, copying a 1,200-token text | 41.7 t/s | **53.4 t/s** |
-| Decode, after a 4k-token prompt | 24.5 t/s | 26.6 t/s |
-| 700-token prompt | 4.5 s | 4.2 s |
-| 3.8k-token prompt | **328 t/s** | 263 t/s |
-| 15k-token prompt | **378 t/s** | 316 t/s |
+| Decode, first answer after a load | 26.9 t/s | 26.8 t/s |
+| Decode, short answers | **28.5-31.2 t/s** | 27.1-28.7 t/s |
+| Decode, copying a 1,200-token text | **44.3 t/s** | 42.1 t/s |
+| Decode, after a 4k-token prompt | 20.1 t/s | 20.5 t/s |
+| 700-token prompt | 6.4 s | 7.1 s |
+| 3.8k-token prompt | 181 t/s | 200 t/s |
+| 15k-token prompt | **281 t/s** | 232 t/s |
+
+The same model in an agent session: the two-agent session of the [README's speed test](../README.md#speed) (an
+orchestrator that grows from 4k to 41k tokens, a 10k-token worker), with MTP drafting, the better of two sessions:
+
+| | |
+| --- | ---: |
+| Cold 4k-token prompt | 276 t/s |
+| 4.3k new tokens at 17k depth | 274 t/s |
+| 4.0k new tokens at 41k depth | 236 t/s |
+| Decode at 4k / 17k / 41k depth | 29.3 / 30.9 / 28.3 t/s |
+| Code edit that copies the prompt | 45.8 t/s |
 
 **Qwen3.6-35B-A3B UD-Q4_K_S** (20 GB of weights, more than the card holds next to its context), greedy, 2026-11-06:
 
@@ -77,11 +88,11 @@ VRAM, Gemma 4 with half its experts on the CPU has a KL divergence of about 0.08
   20 GB card has about 20 GB of experts outside VRAM, so it runs best with 40 GB of RAM or more.
 - **Save a profile for your work.** Without one, the cache starts with an even share of every layer's experts and the
   first answers are slower until it has learned. See [Profiles](#profiles).
-- **Use MTP drafting where the model has it, not n-gram drafting.** MTP made Flash-Next's answers 9-28% faster for
-  16-20% slower long prompts (see Results), with `-md mtp-Qwen3.8-Flash-Next-Q4_0.gguf --spec-type draft-mtp
-  --spec-draft-n-max 3 --spec-draft-p-min 0.5`. N-gram drafting (`--spec-type ngram-*`) halved the speed of copied text:
-  every draft it checks costs the CPU more than it saves. For work that is mostly reading long documents, leave
-  drafting off.
+- **Drafting: MTP or none, not n-gram.** The MTP draft (`-md mtp-Qwen3.8-Flash-Next-Q4_0.gguf --spec-type draft-mtp
+  --spec-draft-n-max 3 --spec-draft-p-min 0.5`) takes VRAM that the expert cache then lacks: on the 20 GB card it
+  comes out about even on answers and slower on long prompts (see Results). On a card with VRAM to spare it pays off.
+  N-gram drafting (`--spec-type ngram-*`) halved the speed of copied text: every draft it checks costs the CPU more
+  than it saves.
 - **Keep the default batch size.** `-ub 4096` makes the compute buffers larger, which leaves fewer experts in VRAM: on
   the 20 GB card prompts and answers both got slower.
 - **Workers.** Lower `--pool-workers` only if other CPU-heavy programs share the machine.
