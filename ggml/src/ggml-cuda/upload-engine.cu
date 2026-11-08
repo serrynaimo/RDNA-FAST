@@ -27,9 +27,13 @@
 
 // the copy threads wait for DMAs on these events: sleeping, not spinning on the cores that copy
 #if defined(GGML_USE_HIP)
-#define UE_EVENT_SLEEP hipEventBlockingSync
+#define UE_EVENT_SLEEP   hipEventBlockingSync
+#define UE_EVENT_CREATE  hipEventCreate
+#define UE_EVENT_ELAPSED hipEventElapsedTime
 #else
-#define UE_EVENT_SLEEP cudaEventBlockingSync
+#define UE_EVENT_SLEEP   cudaEventBlockingSync
+#define UE_EVENT_CREATE  cudaEventCreate
+#define UE_EVENT_ELAPSED cudaEventElapsedTime
 #endif
 
 namespace {
@@ -147,7 +151,48 @@ struct ggml_upload_engine {
     std::thread              issuer;
 
     std::atomic<uint64_t> st_pieces{0}, st_dma{0}, st_bytes{0}, st_gathers{0}, st_copy{0}, st_wait_ring{0},
-                          st_wait_copy{0}, st_wait_gather{0}, st_dropped{0}, st_issue_call{0}, st_gather_call{0};
+                          st_wait_copy{0}, st_wait_gather{0}, st_dropped{0}, st_issue_call{0}, st_gather_call{0},
+                          st_dev_wait{0}, st_dev_gather{0}, st_dev_between{0};
+
+    // ROCMFPX_EH_UPLOAD_TIMING=1: timing events around each gather part on the compute stream (before its DMA wait,
+    // after it, after the kernel), read back at reset() (the graph's thread, once per graph)
+    bool timing = false;
+    struct tmark { cudaEvent_t a, b, c; };
+    std::vector<tmark> marks;       // this graph's, in order
+    std::vector<cudaEvent_t> tfree; // timing events to reuse
+    cudaEvent_t tev() {
+        cudaEvent_t e = nullptr;
+        if (!tfree.empty()) {
+            e = tfree.back();
+            tfree.pop_back();
+        } else {
+            CUDA_CHECK(UE_EVENT_CREATE(&e));
+        }
+        return e;
+    }
+    void read_marks() {
+        if (marks.empty()) {
+            return;
+        }
+        CUDA_CHECK(cudaEventSynchronize(marks.back().c));
+        for (size_t k = 0; k < marks.size(); ++k) {
+            float ms = 0.0f;
+            CUDA_CHECK(UE_EVENT_ELAPSED(&ms, marks[k].a, marks[k].b));
+            st_dev_wait.fetch_add((uint64_t) (ms*1e6), std::memory_order_relaxed);
+            CUDA_CHECK(UE_EVENT_ELAPSED(&ms, marks[k].b, marks[k].c));
+            st_dev_gather.fetch_add((uint64_t) (ms*1e6), std::memory_order_relaxed);
+            if (k + 1 < marks.size()) {
+                CUDA_CHECK(UE_EVENT_ELAPSED(&ms, marks[k].c, marks[k + 1].a));
+                st_dev_between.fetch_add((uint64_t) (ms*1e6), std::memory_order_relaxed);
+            }
+        }
+        for (const tmark & m : marks) {
+            tfree.push_back(m.a);
+            tfree.push_back(m.b);
+            tfree.push_back(m.c);
+        }
+        marks.clear();
+    }
 
     piece & P(int64_t i) { return pieces[(size_t) (i - p_base)]; }
     job   & J(int64_t j) { return jobs[(size_t) (j - j_base)]; }
@@ -188,6 +233,7 @@ struct ggml_upload_engine {
         if (tab == nullptr) {
             return false;
         }
+        timing = getenv("ROCMFPX_EH_UPLOAD_TIMING") != nullptr && atoi(getenv("ROCMFPX_EH_UPLOAD_TIMING")) != 0;
         for (int i = 0; i < p.n_threads; ++i) {
             threads.emplace_back([this] { copy_main(); });
         }
@@ -214,6 +260,8 @@ struct ggml_upload_engine {
         (void) cudaDeviceSynchronize(); // the gathers' reads of the ring and the tables
         for (cudaEvent_t e : job_ev)  { (void) cudaEventDestroy(e); }
         for (cudaEvent_t e : free_ev) { (void) cudaEventDestroy(e); }
+        for (cudaEvent_t e : tfree)   { (void) cudaEventDestroy(e); }
+        for (const tmark & m : marks) { (void) cudaEventDestroy(m.a); (void) cudaEventDestroy(m.b); (void) cudaEventDestroy(m.c); }
         for (const done & d : dones)  { if (d.ev) { (void) cudaEventDestroy(d.ev); } }
         for (uint8_t * b : stage) { (void) cudaFreeHost(b); }
         if (ring)    { (void) cudaFree(ring); }
@@ -440,6 +488,11 @@ struct ggml_upload_engine {
                 }
                 i1++;
             }
+            tmark tm = {};
+            if (timing) {
+                tm = { tev(), tev(), tev() };
+                CUDA_CHECK(cudaEventRecord(tm.a, cs));
+            }
             // its pieces' DMAs: the last one's event covers the others (one stream)
             if (pmax >= 0) {
                 const int64_t jl = P(pmax).job;
@@ -455,6 +508,9 @@ struct ggml_upload_engine {
                 const int64_t tc = ue_now_ns();
                 CUDA_CHECK(cudaStreamWaitEvent(cs, job_ev[(size_t) (jl % n_job_ev)], 0));
                 st_gather_call.fetch_add((uint64_t) (ue_now_ns() - tc), std::memory_order_relaxed);
+            }
+            if (timing) {
+                CUDA_CHECK(cudaEventRecord(tm.b, cs));
             }
             // the table: its slots must not be read by a gather still in flight
             const int64_t nt = i1 - i0;
@@ -495,6 +551,10 @@ struct ggml_upload_engine {
                 CUDA_CHECK(cudaGetLastError());
                 st_gathers.fetch_add(1, std::memory_order_relaxed);
             }
+            if (timing) {
+                CUDA_CHECK(cudaEventRecord(tm.c, cs));
+                marks.push_back(tm);
+            }
             // what this part frees: its pieces and every piece pushed before them
             if (pmax >= 0) {
                 p_consumed = std::max(p_consumed, pmax + 1);
@@ -526,6 +586,7 @@ struct ggml_upload_engine {
 
     void reset() {
         std::unique_lock<std::mutex> lk(mtx);
+        read_marks();
         const int64_t n_pieces = p_base + (int64_t) pieces.size();
         if (n_pieces > p_consumed) {
             st_dropped.fetch_add((uint64_t) (n_pieces - p_consumed), std::memory_order_relaxed);
@@ -608,4 +669,7 @@ void ggml_backend_cuda_upload_engine_get_stats(ggml_upload_engine_t eng, ggml_up
     st->dropped        = eng->st_dropped.load();
     st->issue_call_ns  = eng->st_issue_call.load();
     st->gather_call_ns = eng->st_gather_call.load();
+    st->dev_wait_ns    = eng->st_dev_wait.load();
+    st->dev_gather_ns  = eng->st_dev_gather.load();
+    st->dev_between_ns = eng->st_dev_between.load();
 }

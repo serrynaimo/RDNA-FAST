@@ -135,6 +135,11 @@ struct ggml_upload_engine_stats {
     uint64_t dropped;         // pieces pushed and never gathered
     uint64_t issue_call_ns;   // the issuer's time inside the runtime's calls (stream wait, DMA, event record)
     uint64_t gather_call_ns;  // the gathers' time inside the runtime's calls (stream waits, kernel, event records)
+    // ROCMFPX_EH_UPLOAD_TIMING=1, device time on the compute stream: waiting for the gathers' DMAs, in the gather
+    // kernels, and from one gather's end to the next one's start (the graph's own work)
+    uint64_t dev_wait_ns;
+    uint64_t dev_gather_ns;
+    uint64_t dev_between_ns;
 };
 
 typedef ggml_upload_engine_t (*ggml_upload_engine_new_t)      (void * backend, const struct ggml_upload_engine_params * params);

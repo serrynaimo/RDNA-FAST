@@ -1721,7 +1721,13 @@ struct llama_expert_handoff::impl {
                         us.copy_ns += s.copy_ns; us.wait_ring_ns += s.wait_ring_ns; us.wait_copy_ns += s.wait_copy_ns;
                         us.wait_gather_ns += s.wait_gather_ns; us.dropped += s.dropped;
                         us.issue_call_ns += s.issue_call_ns; us.gather_call_ns += s.gather_call_ns;
+                        us.dev_wait_ns += s.dev_wait_ns; us.dev_gather_ns += s.dev_gather_ns; us.dev_between_ns += s.dev_between_ns;
                     }
+                }
+                if (us.dev_gather_ns > up_last.dev_gather_ns) { // ROCMFPX_EH_UPLOAD_TIMING=1
+                    LLAMA_LOG_WARN("%s: uploads on the device: %.2f s waiting for DMAs, %.2f s in gathers, %.2f s between gathers\n",
+                        __func__, (us.dev_wait_ns - up_last.dev_wait_ns)/1e9, (us.dev_gather_ns - up_last.dev_gather_ns)/1e9,
+                        (us.dev_between_ns - up_last.dev_between_ns)/1e9);
                 }
                 if (us.bytes > up_last.bytes) {
                     LLAMA_LOG_WARN("%s: uploads: %" PRIu64 " graphs, %.2f GB in %" PRIu64 " DMAs (%" PRIu64 " experts), %" PRIu64

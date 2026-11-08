@@ -24,6 +24,16 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32) // [TAG_EH_POOL2] the workers' affinity
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
 #define EH_PAUSE() _mm_pause()
@@ -175,97 +185,115 @@ void ggml_compute_forward_expert_handoff(const ggml_compute_params * params, ggm
 
 namespace {
 
-struct eh_barrier {
-    std::atomic<int> count{0};
-    std::atomic<int> gen{0};
-    int n = 1;
-    const std::atomic<bool> * stop = nullptr; // a stopping pool leaves its barriers
-
-    void wait() {
-        const int g = gen.load(std::memory_order_acquire);
-        if (count.fetch_add(1, std::memory_order_acq_rel) == n - 1) {
-            count.store(0, std::memory_order_relaxed);
-            gen.store(g + 1, std::memory_order_release);
-        } else {
-            while (gen.load(std::memory_order_acquire) == g) {
-                if (stop && stop->load(std::memory_order_relaxed)) {
-                    return;
-                }
-                EH_PAUSE();
-            }
-        }
-    }
-};
-
 // [TAG_EH_MULTI_DOT] one weight row against the rows of several tokens (the tokens of a batch that miss the same
-// expert): the generic path calls vec_dot per token; Q2_0 with AVX-512 VBMI/VNNI unpacks each weight block once for
-// all of them (an MTP verify window or a short prompt, where the host computed each token's dot from scratch)
+// expert): each row is read once for all of them
 constexpr int eh_multi_max = 8;
 
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
-#define EH_Q2_0_MULTI 1
-// the same steps as ggml_vec_dot_q2_0_q8_0's AVX-512 block (arch/x86/quants.c), with the unpacked weights reused
-template <int NY>
-void eh_q2_0_dot_n(int n, const uint8_t * vx, const uint8_t * const * vy, float * s) {
-    static const uint8_t lane_bytes[64] = {
-         0,  1,  1,  1,  1,  1,  1,  1,   2,  3,  3,  3,  3,  3,  3,  3,
-         4,  5,  5,  5,  5,  5,  5,  5,   6,  7,  7,  7,  7,  7,  7,  7,
-         8,  9,  9,  9,  9,  9,  9,  9,  10, 11, 11, 11, 11, 11, 11, 11,
-        12, 13, 13, 13, 13, 13, 13, 13,  14, 15, 15, 15, 15, 15, 15, 15,
-    };
-    const block_q2_0 * x = (const block_q2_0 *) vx;
-    const int nb = n / QK2_0;
-    const __m512i idx   = _mm512_loadu_si512((const void *) lane_bytes);
-    const __m512i ctl   = _mm512_set1_epi64(0x0E0C0A0806040200LL);
-    const __m512i three = _mm512_set1_epi8(3);
-    const __m512i ones  = _mm512_set1_epi8(1);
-    const __m512i zero  = _mm512_setzero_si512();
-    __m512 acc[NY];
-    for (int k = 0; k < NY; ++k) {
-        acc[k] = _mm512_setzero_ps();
-    }
-    for (int i = 0; i < nb; ++i) {
-        const __m512i q  = _mm512_permutexvar_epi8(idx, _mm512_castsi128_si512(_mm_loadu_si128((const __m128i *) x[i].qs)));
-        const __m512i v  = _mm512_and_si512(_mm512_multishift_epi64_epi8(ctl, q), three);
-        const float   dx = GGML_CPU_FP16_TO_FP32(x[i].d);
-        for (int k = 0; k < NY; ++k) {
-            const block_q8_0 * y = (const block_q8_0 *) vy[k] + 2*i;
-            const __m512i yy = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) y[0].qs)),
-                                                  _mm256_loadu_si256((const __m256i *) y[1].qs), 1);
-            const __m512i p  = _mm512_sub_epi32(_mm512_dpbusd_epi32(zero, v, yy), _mm512_dpbusd_epi32(zero, ones, yy));
-            const __m512  d  = _mm512_mask_blend_ps((__mmask16) 0xFF00, _mm512_set1_ps(dx*GGML_CPU_FP16_TO_FP32(y[0].d)),
-                                                                        _mm512_set1_ps(dx*GGML_CPU_FP16_TO_FP32(y[1].d)));
-            acc[k] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(p), d, acc[k]);
-        }
-    }
-    for (int k = 0; k < NY; ++k) {
-        s[k] = _mm512_reduce_add_ps(acc[k]);
-    }
-}
-#endif
-
-// s[k] = row . ys[k] for k < ny (ny <= eh_multi_max), the row of type t, the ys of its vec_dot type
-void eh_dot_n(ggml_type t, const ggml_type_traits_cpu * tr, int n, const uint8_t * row, const uint8_t * const * ys, int ny, float * s) {
-#if defined(EH_Q2_0_MULTI)
-    if (t == GGML_TYPE_Q2_0 && tr->vec_dot_type == GGML_TYPE_Q8_0 && ny > 1) {
-        switch (ny) {
-            case 2: eh_q2_0_dot_n<2>(n, row, ys, s); return;
-            case 3: eh_q2_0_dot_n<3>(n, row, ys, s); return;
-            case 4: eh_q2_0_dot_n<4>(n, row, ys, s); return;
-            case 5: eh_q2_0_dot_n<5>(n, row, ys, s); return;
-            case 6: eh_q2_0_dot_n<6>(n, row, ys, s); return;
-            case 7: eh_q2_0_dot_n<7>(n, row, ys, s); return;
-            case 8: eh_q2_0_dot_n<8>(n, row, ys, s); return;
-            default: break;
-        }
-    }
-#else
-    GGML_UNUSED(t);
-#endif
+// s[k] = row . ys[k] for k < ny: the generic path, one vec_dot per token (the ys of the row type's vec_dot type)
+void eh_dot_n(const ggml_type_traits_cpu * tr, int n, const uint8_t * row, const uint8_t * const * ys, int ny, float * s) {
     for (int k = 0; k < ny; ++k) {
         tr->vec_dot(n, s + k, 0, row, 0, ys[k], 0, 1);
     }
 }
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+#define EH_Q2_FAST 1
+// [TAG_EH_Q2_ACT] Q2_0 rows against int8 activations (AVX-512 VBMI/VNNI). An activation is int8 in chunks of 32 with
+// an f32 scale d per chunk, 64-byte aligned, plus hx = d * (sum of the chunk's int8): a Q2_0 weight is (code - 1) * dw,
+// so row . x = sum over blocks of dw * (d * sum(code * q) - hx), and the hx part is one FMA per eight blocks. Per
+// 64-weight block that is one unpack (shared by all tokens), then per token one VNNI dot, one convert, one permute of
+// the block's two scale products and one FMA into a float accumulator reduced once per row. ggml's Q2_0 x Q8_0 dot
+// does two dots, scalar fp16 conversions and a blend per block, and reduces per call.
+struct eh_act {
+    const int8_t * q;     // n values, 64-byte aligned
+    const float  * d16;   // per 64 values: the two chunk scales, each in 8 lanes
+    const float  * hx16;  // per 64 values: the two chunks' hx/8, each in 8 lanes (the lanes of a chunk add up to hx)
+};
+
+// x (n values, n % 64 == 0) into q, d16, hx16 (n/64*16 floats each)
+void eh_act_quant(const float * x, int n, int8_t * q, float * d16, float * hx16) {
+    for (int k = 0; k < n/32; ++k) {
+        const __m512 x0 = _mm512_loadu_ps(x + 32*k);
+        const __m512 x1 = _mm512_loadu_ps(x + 32*k + 16);
+        const float amax = _mm512_reduce_max_ps(_mm512_max_ps(_mm512_abs_ps(x0), _mm512_abs_ps(x1)));
+        const __m512 inv = _mm512_set1_ps(amax > 0.0f ? 127.0f/amax : 0.0f);
+        const __m512i v0 = _mm512_cvtps_epi32(_mm512_mul_ps(x0, inv));
+        const __m512i v1 = _mm512_cvtps_epi32(_mm512_mul_ps(x1, inv));
+        _mm_storeu_si128((__m128i *) (q + 32*k),      _mm512_cvtsepi32_epi8(v0));
+        _mm_storeu_si128((__m128i *) (q + 32*k + 16), _mm512_cvtsepi32_epi8(v1));
+        const float d  = amax/127.0f;
+        const float hx = d*(float) _mm512_reduce_add_epi32(_mm512_add_epi32(v0, v1));
+        // chunk k is half k % 2 of block k / 2: lanes 8*(k % 2) .. + 7
+        for (int l = 0; l < 8; ++l) {
+            d16 [16*(k/2) + 8*(k % 2) + l] = d;
+            hx16[16*(k/2) + 8*(k % 2) + l] = hx*0.125f;
+        }
+    }
+}
+
+// out[t] = row . a[t] for NT tokens; row: nb blocks of { f16 d; 16 bytes of 2-bit codes } (block_q2_0). Per block the
+// weight scale is read once and the codes unpacked once; per token, lane by lane, (code . q) * d - hx/8, times the weight
+// scale, into the token's accumulator. One or two tokens alone would chain every block's FMA on the last (4 cycles
+// each): U blocks go to U accumulators. (A vector of eight blocks' scales built through small stack stores stalled: 79
+// ns per row of 2560 against ggml's 63; per-token broadcasts of the two chunk scales: 176 ns for four tokens.)
+template <int NT>
+void eh_q2_rows(const uint8_t * row, int nb, const eh_act * a, float * out) {
+    static_assert(sizeof(block_q2_0) == 18, "block_q2_0 layout");
+    constexpr int U = NT == 1 ? 4 : NT == 2 ? 2 : 1;
+    __m512 acc[U][NT];
+    for (int u = 0; u < U; ++u) {
+        for (int t = 0; t < NT; ++t) {
+            acc[u][t] = _mm512_setzero_ps();
+        }
+    }
+    const __m512i ctl   = _mm512_set1_epi64(0x0E0C0A0806040200LL);
+    const __m512i three = _mm512_set1_epi8(3);
+    const __m512i zero  = _mm512_setzero_si512();
+    auto block = [&](int b, int u) {
+        const uint8_t * blk = row + (size_t) b*18;
+        uint16_t h;
+        memcpy(&h, blk, 2);
+        const __m512 dw = _mm512_set1_ps(_cvtsh_ss(h));
+        // 16 code bytes as 8 u16 of 8 codes each -> 64 bytes, one code each
+        const __m512i w = _mm512_and_si512(_mm512_multishift_epi64_epi8(ctl,
+            _mm512_cvtepu16_epi64(_mm_loadu_si128((const __m128i *) (blk + 2)))), three);
+        for (int t = 0; t < NT; ++t) {
+            const __m512i dot = _mm512_dpbusd_epi32(zero, w, _mm512_load_si512((const void *) (a[t].q + (size_t) b*64)));
+            const __m512 v = _mm512_fmsub_ps(_mm512_cvtepi32_ps(dot), _mm512_loadu_ps(a[t].d16 + 16*b), _mm512_loadu_ps(a[t].hx16 + 16*b));
+            acc[u][t] = _mm512_fmadd_ps(dw, v, acc[u][t]);
+        }
+    };
+    int b = 0;
+    for (; b + U <= nb; b += U) {
+        for (int u = 0; u < U; ++u) {
+            block(b + u, u);
+        }
+    }
+    for (; b < nb; ++b) {
+        block(b, 0);
+    }
+    for (int t = 0; t < NT; ++t) {
+        __m512 s = acc[0][t];
+        for (int u = 1; u < U; ++u) {
+            s = _mm512_add_ps(s, acc[u][t]);
+        }
+        out[t] = _mm512_reduce_add_ps(s);
+    }
+}
+
+void eh_q2_dot(const uint8_t * row, int nb, const eh_act * a, int nt, float * out) {
+    switch (nt) {
+        case 1: eh_q2_rows<1>(row, nb, a, out); break;
+        case 2: eh_q2_rows<2>(row, nb, a, out); break;
+        case 3: eh_q2_rows<3>(row, nb, a, out); break;
+        case 4: eh_q2_rows<4>(row, nb, a, out); break;
+        case 5: eh_q2_rows<5>(row, nb, a, out); break;
+        case 6: eh_q2_rows<6>(row, nb, a, out); break;
+        case 7: eh_q2_rows<7>(row, nb, a, out); break;
+        default: eh_q2_rows<8>(row, nb, a, out); break;
+    }
+}
+#endif
 
 struct eh_layer {
     bool    set = false;
@@ -289,8 +317,70 @@ struct eh_miss {
     float   w;      // routing weight
 };
 
+// a byte buffer with a 64-byte aligned start, grown as needed
+struct eh_abuf {
+    std::vector<uint8_t> v;
+    uint8_t * p = nullptr;
+    size_t cap = 0;
+    uint8_t * get(size_t n) {
+        if (n > cap) {
+            v.assign(n + 64, 0);
+            p = (uint8_t *) (((uintptr_t) v.data() + 63) & ~(uintptr_t) 63);
+            cap = n;
+        }
+        return p;
+    }
+};
+
+// [TAG_EH_POOL2] the first logical processor of each physical core of processor group 0, in order (Windows; empty
+// elsewhere, where the workers are not pinned)
+std::vector<int> eh_core_lps() {
+    std::vector<int> res;
+#if defined(_WIN32)
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    if (len == 0) {
+        return res;
+    }
+    std::vector<uint8_t> buf(len);
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len)) {
+        return res;
+    }
+    for (DWORD off = 0; off < len; ) {
+        const auto * info = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *) (buf.data() + off);
+        if (info->Relationship == RelationProcessorCore && info->Processor.GroupCount >= 1 &&
+            info->Processor.GroupMask[0].Group == 0 && info->Processor.GroupMask[0].Mask != 0) {
+            res.push_back(__builtin_ctzll((unsigned long long) info->Processor.GroupMask[0].Mask));
+        }
+        off += info->Size;
+    }
+    std::sort(res.begin(), res.end());
+#endif
+    return res;
+}
+
+void eh_pin_thread(int lp) {
+#if defined(_WIN32)
+    SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << lp);
+#else
+    GGML_UNUSED(lp);
+#endif
+}
+
 } // namespace
 
+// [TAG_EH_POOL2] The pool. Worker 0 alone polls the mailbox; it reads a send, prepares the job and runs it in phases. A phase is published by a
+// generation bump; every worker (worker 0 too) claims its tasks (about three per worker, ranges of rows or columns)
+// with a CAS on one word holding the generation, the task count and the next task, and worker 0 waits for the phase's
+// count of finished tasks before the next one. Phases: the inputs into the dot type (inline for a few tokens), gate
+// and up rows with the activation applied in the same task, the activation into the down dot type (inline for a few
+// misses), the down rows by output columns over all missed experts (each task writes its columns of y). The other
+// workers spin on a cached word of their own, never on the mailbox (mapped into the device), and a worker that sleeps
+// or is late only leaves its tasks to the others: no barrier waits for all of them (the pool wake races of 2026-11-07
+// were barriers that waited for a sleeping worker). Before: 4 barriers per layer and every worker polled the mailbox;
+// host time per layer was ~2-3x the standalone benchmark in the server (Flash-Next, 2026-11-08). Workers are pinned
+// one per physical core from core 1 on (ROCMFPX_EH_PIN=0: not pinned): core 0's first logical processor takes the
+// GPU's interrupts on Windows, and the other logical processor of each core is left to the rest of the process.
 struct ggml_expert_handoff_host {
     uint8_t * mb = nullptr;
     ggml_expert_handoff_dims dims = {};
@@ -300,17 +390,16 @@ struct ggml_expert_handoff_host {
 
     int n_workers = 1;
     std::vector<std::thread> threads;
-    eh_barrier barrier;
+    std::vector<int> pin_lp;                // [worker]: its logical processor, -1 if not pinned
 
     std::atomic<bool> stop{false};
     std::atomic<int64_t> spin_until{0};
     std::mutex mtx;
     std::condition_variable cv;
     uint64_t wake_gen = 0; // under mtx
-    // [TAG_EH_POOL_WAKE] the workers asleep in wait_work (worker 0 polls instead), and when the pool last answered
-    std::atomic<int>     n_asleep{0};
-    std::atomic<int64_t> t_active{0};
+    std::atomic<int> n_asleep{0};
     static constexpr int64_t active_ns = 1000*1000*1000; // in use: answered within the last second
+    std::atomic<int64_t> t_active{0};
 
     // spin this long after the last work or wake; the context also calls idle() once a graph's results are in, so the
     // spinning threads do not take the CPU from whatever runs between graphs (an MTP draft's own CPU work)
@@ -326,34 +415,44 @@ struct ggml_expert_handoff_host {
     bool    sim_nohost   = false;
     int64_t de(int32_t e) const { return sim_resident > 0 ? e % sim_resident : e; }
 
-    // the job, prepared by worker 0 between barriers
+    // [TAG_EH_POOL2] the phases
+    enum { PH_XQ = 0, PH_GU = 1, PH_HQ = 2, PH_DN = 3 };
+    alignas(64) std::atomic<uint64_t> claim{0};   // generation (24 bits) << 40 | tasks (20) << 20 | next task (20)
+    alignas(64) std::atomic<uint32_t> gen{0};     // the generation of the last published phase
+    alignas(64) std::atomic<int32_t>  n_done{0};  // tasks of the current phase finished
+    alignas(64) int     phase    = 0;
+    int64_t             ph_units = 0;             // rows, columns, tokens or misses, split into the tasks' ranges
+    int                 ph_tasks = 0;
+
+    // the job, prepared by worker 0
     uint32_t seq = 0;
     const eh_layer * job_layer = nullptr;
     int32_t n_tokens = 0;
+    bool fast_gu = false, fast_dn = false;       // [TAG_EH_Q2_ACT] the Q2_0 path for gate/up, for down
     std::vector<eh_miss> misses;
     std::vector<int32_t> miss_tokens;      // the tokens with misses
+    std::vector<int32_t> tok_slot;         // [n_tokens]: the token's index in miss_tokens, -1 without misses
     std::vector<int32_t> uniq;             // the missed experts, each once
     std::vector<int32_t> uniq_begin;       // per missed expert: its first entry in by_expert, then the end
     std::vector<int32_t> by_expert;        // miss indices grouped by expert (a batch's tokens share an expert's reads)
-    std::vector<int32_t> uniq_of;          // [n_expert] scratch: index in uniq or -1
-    std::vector<uint8_t> xq;               // [max_tokens] rows of the gate/up vec_dot type
+    std::vector<int32_t> uniq_of;          // [n_expert] scratch: index in uniq or -1 (reset after each job)
+    std::vector<int32_t> cnt, fill;        // scratch of prepare()
+    std::vector<uint8_t> xq;               // generic: [max_tokens] rows of the gate/up vec_dot type
     size_t xq_row = 0;
-    std::vector<float>   gu;               // [n_miss][2*n_ff] gate then up outputs
-    std::vector<uint8_t> hq;               // [n_miss] rows of the down vec_dot type
+    eh_abuf xa_q;                          // Q2_0 path: [n_tokens][n_embd] int8, and per 64 values d16 and hx16
+    std::vector<float> xa_d, xa_hx;        //   ([n_tokens][n_embd/4] each)
+    std::vector<float> hf;                 // [n_miss][n_ff] the activations, f32
+    std::vector<uint8_t> hq;               // generic: [n_miss] rows of the down vec_dot type
     size_t hq_row = 0;
-    std::vector<float>   hf;               // [n_workers][n_ff] f32 scratch for the activation
-    // [TAG_EH_LOCAL_SUM] [n_tokens][max_embd] the sum of the host's experts, in ordinary memory: the mailbox is mapped
-    // into the device (hipHostMallocCoherent), which Windows gives the CPU uncached, so adding each expert's output to
-    // it column by column read it back from RAM uncached every time (Flash-Next Q2_0, 2026-11-08: ~185 us per missed
-    // expert in the server against ~35 us in --bench); each worker copies its columns over once at the end
-    std::vector<float>   ysum;
+    eh_abuf ha_q;                          // Q2_0 path: [n_miss][n_ff] int8, d16, hx16 ([n_miss][n_ff/4] each)
+    std::vector<float> ha_d, ha_hx;
+    std::vector<std::vector<float>> acc;   // [worker] the down task's sums: [miss token][column]
 
     // stats
     std::atomic<uint64_t> st_layers{0};
     std::atomic<uint64_t> st_routed{0};
     std::atomic<uint64_t> st_host{0};
     std::atomic<uint64_t> st_busy_ns{0};
-    int64_t t_seen = 0;
     // [TAG_EH_TIMEOUT_DIAG] worker 0 writes these; get_stats may read a job's fields torn, which only blurs a diagnostic
     std::atomic<uint64_t> st_multi{0};
     std::atomic<uint64_t> st_busy_multi{0};
@@ -368,13 +467,11 @@ struct ggml_expert_handoff_host {
     std::atomic<uint64_t> st_gather{0};      // [TAG_EH_LOCAL_SUM]
     std::atomic<uint64_t> st_gap{0};
     std::atomic<uint64_t> st_n_gap{0};
-    std::atomic<int64_t>  t_first{0};        // when a worker first saw the job's send
     int64_t t_prev_end = 0;                  // worker 0: when the last answer was stored
     std::atomic<uint64_t> st_read_copy{0};   // [TAG_EH_RESIDENT]
     std::atomic<uint64_t> st_read_tensor{0};
     int32_t job_il = -1;
-    int64_t t_step[4] = {};      // worker 0: the end of each step of the job in run()
-    int64_t t_prep    = 0;       // worker 0: the end of prepare() [TAG_EH_LOCAL_SUM]
+    int64_t t_seen = 0;
 
     void wake() {
         spin_until.store(eh_now_ns() + linger_ns, std::memory_order_release);
@@ -385,69 +482,125 @@ struct ggml_expert_handoff_host {
         cv.notify_all();
     }
 
-    // keep the pool spinning until at least t
-    void extend_spin(int64_t t) {
-        int64_t cur = spin_until.load(std::memory_order_relaxed);
-        while (cur < t && !spin_until.compare_exchange_weak(cur, t, std::memory_order_release, std::memory_order_relaxed)) {
-        }
-    }
-
-    // wait for a new send; false if the pool stops. After a quiet spell the workers sleep, but worker 0 keeps looking
-    // at the mailbox every millisecond and wakes them: a send can come long after the wake (the first kernels of a
-    // cold device load for hundreds of milliseconds), and the device cannot wake a sleeping pool itself.
-    // [TAG_EH_POOL_WAKE] A worker can also fall asleep while worker 0 still spins: a job that ends after the spin window
-    // (a cold one, or one that follows a layer the device uploaded instead) lets the others pass the job's last barrier
-    // with the window run out, before worker 0 extends it. Worker 0 then took the next send while spinning, without
-    // waking anyone, and waited at the barrier for workers nothing woke until the context's next graph: every later
-    // layer of that graph gave up after the join's timeout (2026-11-07, Flash-Next in prod: every batch of more than one
-    // token). So the worker that finds a send wakes the sleepers (worker()), the workers extend the window before that
-    // barrier, and a sleeper of a pool in use waits a millisecond at most before it looks at the mailbox itself.
-    bool wait_work(int iw, uint32_t seen, uint64_t & my_gen, uint32_t & s) {
-        for (;;) {
+    // worker 0: wait for a new send; false if the pool stops. Past the spin window it looks every millisecond (a
+    // send can come long after the wake: the first kernels of a cold device load for hundreds of milliseconds)
+    bool wait_send(uint32_t seen, uint32_t & s, uint64_t & my_wake) {
+        for (uint32_t k = 0;; ++k) {
             s = eh_load(&hdr->seq_send);
             if (s != seen) {
-                int64_t z = 0;
-                t_first.compare_exchange_strong(z, eh_now_ns(), std::memory_order_relaxed);
                 return true;
             }
             if (stop.load(std::memory_order_acquire)) {
                 return false;
             }
-            if (eh_now_ns() > spin_until.load(std::memory_order_acquire)) {
-                if (iw == 0) {
-                    {
-                        std::unique_lock<std::mutex> lk(mtx);
-                        cv.wait_for(lk, std::chrono::milliseconds(1), [&] { return stop.load() || wake_gen != my_gen; });
-                        my_gen = wake_gen;
-                    }
-                    if (eh_load(&hdr->seq_send) != seen) {
-                        wake();
-                        std::lock_guard<std::mutex> lk(mtx);
-                        my_gen = wake_gen;
-                    }
-                } else {
-                    // registered before it looks at the mailbox again, so a worker that finds a send after this look
-                    // also sees it asleep and wakes it
-                    n_asleep.fetch_add(1, std::memory_order_seq_cst);
-                    {
-                        std::unique_lock<std::mutex> lk(mtx);
-                        auto ready = [&] {
-                            return stop.load() || wake_gen != my_gen || eh_load(&hdr->seq_send) != seen;
-                        };
-                        if (eh_now_ns() - t_active.load(std::memory_order_relaxed) < active_ns) {
-                            cv.wait_for(lk, std::chrono::milliseconds(1), ready);
-                        } else {
-                            cv.wait(lk, ready);
-                        }
-                        my_gen = wake_gen;
-                    }
-                    n_asleep.fetch_sub(1, std::memory_order_seq_cst);
-                }
+            if ((k & 255) == 0 && eh_now_ns() > spin_until.load(std::memory_order_acquire)) {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv.wait_for(lk, std::chrono::milliseconds(1), [&] { return stop.load() || wake_gen != my_wake; });
+                my_wake = wake_gen;
                 continue;
             }
-            for (int i = 0; i < 64; ++i) {
-                EH_PAUSE();
+            EH_PAUSE();
+        }
+    }
+
+    // workers 1..: wait for a phase newer than seen; false if the pool stops. Past the spin window they sleep until
+    // worker 0 publishes (it wakes the sleepers) or a wake; a pool in use sleeps a millisecond at most
+    bool wait_gen(uint32_t seen, uint32_t & g, uint64_t & my_wake) {
+        for (uint32_t k = 0;; ++k) {
+            g = gen.load(std::memory_order_acquire);
+            if (g != seen) {
+                return true;
             }
+            if (stop.load(std::memory_order_acquire)) {
+                return false;
+            }
+            if ((k & 255) == 0 && eh_now_ns() > spin_until.load(std::memory_order_acquire)) {
+                n_asleep.fetch_add(1, std::memory_order_seq_cst);
+                {
+                    std::unique_lock<std::mutex> lk(mtx);
+                    auto ready = [&] { return stop.load() || wake_gen != my_wake || gen.load(std::memory_order_seq_cst) != seen; };
+                    if (eh_now_ns() - t_active.load(std::memory_order_relaxed) < active_ns) {
+                        cv.wait_for(lk, std::chrono::milliseconds(1), ready);
+                    } else {
+                        cv.wait(lk, ready);
+                    }
+                    my_wake = wake_gen;
+                }
+                n_asleep.fetch_sub(1, std::memory_order_seq_cst);
+                continue;
+            }
+            EH_PAUSE();
+        }
+    }
+
+    // worker 0: a phase of `units` for the workers, in about three tasks per worker
+    uint32_t publish(int ph, int64_t units) {
+        ph_tasks = (int) std::max<int64_t>(1, std::min<int64_t>(units, 3*(int64_t) n_workers));
+        phase    = ph;
+        ph_units = units;
+        n_done.store(0, std::memory_order_relaxed);
+        const uint32_t g = gen.load(std::memory_order_relaxed) + 1;
+        claim.store(((uint64_t) (g & 0xFFFFFF) << 40) | ((uint64_t) ph_tasks << 20), std::memory_order_release);
+        gen.store(g, std::memory_order_seq_cst);
+        if (n_asleep.load(std::memory_order_seq_cst) > 0) {
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                wake_gen++;
+            }
+            cv.notify_all();
+        }
+        return g;
+    }
+
+    bool claim_task(uint32_t g, int & i, int & n) {
+        uint64_t v = claim.load(std::memory_order_acquire);
+        for (;;) {
+            if ((uint32_t) (v >> 40) != (g & 0xFFFFFF)) {
+                return false;
+            }
+            n = (int) ((v >> 20) & 0xFFFFF);
+            i = (int) (v & 0xFFFFF);
+            if (i >= n) {
+                return false;
+            }
+            if (claim.compare_exchange_weak(v, v + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                return true;
+            }
+        }
+    }
+
+    void run_tasks(int iw, uint32_t g) {
+        int i = 0, n = 0;
+        while (claim_task(g, i, n)) {
+            const int64_t u0 = ph_units*i/n;
+            const int64_t u1 = ph_units*(i + 1)/n;
+            switch (phase) {
+                case PH_XQ: task_xq(u0, u1); break;
+                case PH_GU: task_gu(u0, u1); break;
+                case PH_HQ: task_hq(u0, u1); break;
+                case PH_DN: task_dn(iw, u0, u1); break;
+                default: break;
+            }
+            n_done.fetch_add(1, std::memory_order_release);
+        }
+    }
+
+    // worker 0: a phase, done by all; small ones inline
+    void run_phase(int ph, int64_t units, int64_t inline_max) {
+        if (units <= inline_max) {
+            phase    = ph;
+            ph_units = units;
+            switch (ph) {
+                case PH_XQ: task_xq(0, units); break;
+                case PH_HQ: task_hq(0, units); break;
+                default: GGML_ABORT("fatal error");
+            }
+            return;
+        }
+        const uint32_t g = publish(ph, units);
+        run_tasks(0, g);
+        while (n_done.load(std::memory_order_acquire) < ph_tasks) {
+            EH_PAUSE();
         }
     }
 
@@ -469,8 +622,6 @@ struct ggml_expert_handoff_host {
         misses.clear();
         miss_tokens.clear();
         uniq.clear();
-        uniq_begin.clear();
-        by_expert.clear();
         if (job_layer == nullptr || hdr->n_embd != job_layer->n_embd || n_tokens > dims.max_tokens || n_used > dims.max_used) {
             if (job_layer == nullptr) {
                 GGML_LOG_ERROR("%s: no experts registered for layer %d, answering zero\n", __func__, il);
@@ -486,6 +637,7 @@ struct ggml_expert_handoff_host {
         const float   * w     = (const float   *) (mb + ggml_expert_handoff_off_weights(dims));
         eh_layer & L = layers[il];
 
+        tok_slot.assign(n_tokens, -1);
         const int32_t n_count = L.l.n_used > 0 ? std::min(n_used, L.l.n_used) : n_used;
         for (int32_t t = 0; t < n_tokens; ++t) {
             bool any = false;
@@ -501,13 +653,16 @@ struct ggml_expert_handoff_host {
                 }
             }
             if (any) {
+                tok_slot[t] = (int32_t) miss_tokens.size();
                 miss_tokens.push_back(t);
             }
         }
 
         // the misses by expert: each expert's rows are read once for all the tokens that miss it
-        uniq_of.assign(L.n_expert, -1);
-        std::vector<int32_t> cnt;
+        if ((int64_t) uniq_of.size() != L.n_expert) {
+            uniq_of.assign(L.n_expert, -1);
+        }
+        cnt.clear();
         for (const eh_miss & ms : misses) {
             if (uniq_of[ms.e] < 0) {
                 uniq_of[ms.e] = (int32_t) uniq.size();
@@ -521,11 +676,12 @@ struct ggml_expert_handoff_host {
             uniq_begin[u + 1] = uniq_begin[u] + cnt[u];
         }
         by_expert.assign(misses.size(), 0);
-        {
-            std::vector<int32_t> fill(uniq_begin.begin(), uniq_begin.end() - 1);
-            for (size_t m = 0; m < misses.size(); ++m) {
-                by_expert[fill[uniq_of[misses[m].e]]++] = (int32_t) m;
-            }
+        fill.assign(uniq_begin.begin(), uniq_begin.end() - 1);
+        for (size_t m = 0; m < misses.size(); ++m) {
+            by_expert[fill[uniq_of[misses[m].e]]++] = (int32_t) m;
+        }
+        for (const int32_t e : uniq) {
+            uniq_of[e] = -1;
         }
 
         // [TAG_EH_RESIDENT] where the distinct missed experts are read from
@@ -545,22 +701,37 @@ struct ggml_expert_handoff_host {
 
         // scratch
         const eh_layer & J = *job_layer;
-        xq_row = ggml_row_size(J.vt_gu, J.n_embd);
-        hq_row = ggml_row_size(J.vt_down, J.n_ff);
-        if (xq.size() < (size_t) n_tokens*xq_row) {
-            xq.resize((size_t) n_tokens*xq_row);
+#if defined(EH_Q2_FAST)
+        fast_gu = J.type_gu   == GGML_TYPE_Q2_0 && J.n_embd % 64 == 0;
+        fast_dn = J.type_down == GGML_TYPE_Q2_0 && J.n_ff   % 64 == 0;
+#endif
+        const size_t n_miss = misses.size();
+        if (fast_gu) {
+            xa_q.get((size_t) n_tokens*J.n_embd);
+            if (xa_d.size() < (size_t) n_tokens*J.n_embd/4) {
+                xa_d.resize((size_t) n_tokens*J.n_embd/4);
+                xa_hx.resize((size_t) n_tokens*J.n_embd/4);
+            }
+        } else {
+            xq_row = ggml_row_size(J.vt_gu, J.n_embd);
+            if (xq.size() < (size_t) n_tokens*xq_row) {
+                xq.resize((size_t) n_tokens*xq_row);
+            }
         }
-        if (gu.size() < misses.size()*J.gu_rows) {
-            gu.resize(misses.size()*J.gu_rows);
+        if (hf.size() < n_miss*J.n_ff) {
+            hf.resize(n_miss*J.n_ff);
         }
-        if (hq.size() < misses.size()*hq_row) {
-            hq.resize(misses.size()*hq_row);
-        }
-        if (hf.size() < (size_t) n_workers*J.n_ff) {
-            hf.resize((size_t) n_workers*J.n_ff);
-        }
-        if (ysum.size() < (size_t) n_tokens*dims.max_embd) {
-            ysum.resize((size_t) n_tokens*dims.max_embd);
+        if (fast_dn) {
+            ha_q.get(n_miss*J.n_ff);
+            if (ha_d.size() < n_miss*J.n_ff/4) {
+                ha_d.resize(n_miss*J.n_ff/4);
+                ha_hx.resize(n_miss*J.n_ff/4);
+            }
+        } else {
+            hq_row = ggml_row_size(J.vt_down, J.n_ff);
+            if (hq.size() < n_miss*hq_row) {
+                hq.resize(n_miss*hq_row);
+            }
         }
     }
 
@@ -604,258 +775,296 @@ struct ggml_expert_handoff_host {
         return b ? b[e*J.n_ff + r % J.n_ff] : 0.0f;
     }
 
-    // the activation of one expert: gu holds gate then up (or up alone), h gets n_ff values
-    static void activate(const eh_layer & J, const float * gu, float * h) {
-        const int64_t n_ff = J.n_ff;
+    // the activation of one element: g (gate) and u (up), or u alone without a gate
+    static float act1(const eh_layer & J, float g, float u) {
         const ggml_expert_handoff_layer & l = J.l;
         auto silu    = [](float v) { return v/(1.0f + expf(-v)); };
         auto gelu    = [](float v) { return 0.5f*v*(1.0f + tanhf(0.7978845608028654f*v*(1.0f + 0.044715f*v*v))); };
         auto sigmoid = [](float v) { return 1.0f/(1.0f + expf(-v)); };
         if (!J.has_gate) {
-            for (int64_t i = 0; i < n_ff; ++i) {
-                const float u = gu[i];
-                switch (l.act) {
-                    case GGML_EXPERT_HANDOFF_ACT_UP_SILU:     h[i] = silu(u); break;
-                    case GGML_EXPERT_HANDOFF_ACT_UP_GELU:     h[i] = gelu(u); break;
-                    case GGML_EXPERT_HANDOFF_ACT_UP_RELU:     h[i] = std::max(u, 0.0f); break;
-                    case GGML_EXPERT_HANDOFF_ACT_UP_RELU_SQR: { const float r = std::max(u, 0.0f); h[i] = r*r; } break;
-                    default: h[i] = 0.0f; break;
-                }
-            }
-            return;
-        }
-        const float * g = gu;
-        const float * u = gu + n_ff;
-        for (int64_t i = 0; i < n_ff; ++i) {
             switch (l.act) {
-                case GGML_EXPERT_HANDOFF_ACT_SILU: h[i] = silu(g[i])*u[i]; break;
-                case GGML_EXPERT_HANDOFF_ACT_GELU: h[i] = gelu(g[i])*u[i]; break;
-                case GGML_EXPERT_HANDOFF_ACT_RELU: h[i] = std::max(g[i], 0.0f)*u[i]; break;
-                case GGML_EXPERT_HANDOFF_ACT_SWIGLU_OAI: {
-                    const float x = std::min(g[i], l.limit);
-                    const float y = std::clamp(u[i], -l.limit, l.limit);
-                    h[i] = x/(1.0f + expf(-l.alpha*x))*(y + 1.0f);
-                } break;
-                case GGML_EXPERT_HANDOFF_ACT_SILU_CLAMP:
-                    h[i] = silu(std::min(g[i], l.limit))*std::clamp(u[i], -l.limit, l.limit);
-                    break;
-                case GGML_EXPERT_HANDOFF_ACT_SILU_LIMIT:
-                    h[i] = std::min(silu(g[i]), l.limit)*std::clamp(u[i], -l.limit, l.limit);
-                    break;
-                case GGML_EXPERT_HANDOFF_ACT_SITU: {
-                    const float a = l.beta*tanhf(g[i]/l.beta)*sigmoid(g[i]);
-                    h[i] = a*(l.lb > 0.0f ? l.lb*tanhf(u[i]/l.lb) : u[i]);
-                } break;
-                default: h[i] = 0.0f; break;
+                case GGML_EXPERT_HANDOFF_ACT_UP_SILU:     return silu(u);
+                case GGML_EXPERT_HANDOFF_ACT_UP_GELU:     return gelu(u);
+                case GGML_EXPERT_HANDOFF_ACT_UP_RELU:     return std::max(u, 0.0f);
+                case GGML_EXPERT_HANDOFF_ACT_UP_RELU_SQR: { const float r = std::max(u, 0.0f); return r*r; }
+                default: return 0.0f;
+            }
+        }
+        switch (l.act) {
+            case GGML_EXPERT_HANDOFF_ACT_SILU: return silu(g)*u;
+            case GGML_EXPERT_HANDOFF_ACT_GELU: return gelu(g)*u;
+            case GGML_EXPERT_HANDOFF_ACT_RELU: return std::max(g, 0.0f)*u;
+            case GGML_EXPERT_HANDOFF_ACT_SWIGLU_OAI: {
+                const float x = std::min(g, l.limit);
+                const float y = std::clamp(u, -l.limit, l.limit);
+                return x/(1.0f + expf(-l.alpha*x))*(y + 1.0f);
+            }
+            case GGML_EXPERT_HANDOFF_ACT_SILU_CLAMP:
+                return silu(std::min(g, l.limit))*std::clamp(u, -l.limit, l.limit);
+            case GGML_EXPERT_HANDOFF_ACT_SILU_LIMIT:
+                return std::min(silu(g), l.limit)*std::clamp(u, -l.limit, l.limit);
+            case GGML_EXPERT_HANDOFF_ACT_SITU: {
+                const float a = l.beta*tanhf(g/l.beta)*sigmoid(g);
+                return a*(l.lb > 0.0f ? l.lb*tanhf(u/l.lb) : u);
+            }
+            default: return 0.0f;
+        }
+    }
+
+    // inputs [i0, i1) of miss_tokens into the gate/up dot type
+    void task_xq(int64_t i0, int64_t i1) {
+        const eh_layer & J = *job_layer;
+        const float * x = (const float *) (mb + ggml_expert_handoff_off_x(dims));
+        for (int64_t i = i0; i < i1; ++i) {
+            const int32_t t = miss_tokens[i];
+            const float * xt = x + (int64_t) t*dims.max_embd;
+#if defined(EH_Q2_FAST)
+            if (fast_gu) {
+                eh_act_quant(xt, (int) J.n_embd, (int8_t *) xa_q.p + (size_t) t*J.n_embd,
+                    xa_d.data() + (size_t) t*J.n_embd/4, xa_hx.data() + (size_t) t*J.n_embd/4);
+                continue;
+            }
+#endif
+            uint8_t * dst = xq.data() + t*xq_row;
+            if (J.vt_gu == GGML_TYPE_F32) {
+                memcpy(dst, xt, J.n_embd*sizeof(float));
+            } else {
+                ggml_get_type_traits_cpu(J.vt_gu)->from_float(xt, dst, J.n_embd);
             }
         }
     }
 
-    void run(int iw) {
+    // gate/up units [u0, u1): unit = missed expert * n_ff + r; row r of the gate and of up, for every token that
+    // misses the expert, then the activation (with weight_before, the routing weight scales the input: it is linear
+    // up to here, so it scales the dot products)
+    void task_gu(int64_t q0, int64_t q1) {
         const eh_layer & J = *job_layer;
-        const auto * tr_gu   = ggml_get_type_traits_cpu(J.type_gu);
-        const auto * tr_down = ggml_get_type_traits_cpu(J.type_down);
-        const auto * tr_vgu  = ggml_get_type_traits_cpu(J.vt_gu);
-        const auto * tr_vdn  = ggml_get_type_traits_cpu(J.vt_down);
-        const float * x = (const float *) (mb + ggml_expert_handoff_off_x(dims));
-        float       * y = (float       *) (mb + ggml_expert_handoff_off_y(dims));
-        const int64_t n_embd = J.n_embd;
-        const int64_t n_ff   = J.n_ff;
-        const int64_t n_miss = (int64_t) misses.size();
-
-        // 1. the inputs of the tokens with misses, in the gate/up dot type
-        for (size_t i = iw; i < miss_tokens.size(); i += n_workers) {
-            const int32_t t = miss_tokens[i];
-            uint8_t * dst = xq.data() + t*xq_row;
-            if (J.vt_gu == GGML_TYPE_F32) {
-                memcpy(dst, x + (int64_t) t*dims.max_embd, n_embd*sizeof(float));
-            } else {
-                tr_vgu->from_float(x + (int64_t) t*dims.max_embd, dst, n_embd);
-            }
-        }
-        barrier.wait();
-        if (iw == 0) {
-            t_step[0] = eh_now_ns(); // [TAG_EH_TIMEOUT_DIAG]
-        }
-
-        // 2. gate and up rows of every missed expert, each row against all the tokens that miss it while it is in
-        //    the cache (with weight_before, the routing weight scales the input: it is linear up to here, so it
-        //    scales the dot products)
-        {
-            const int64_t rows  = J.gu_rows;
-            const int64_t total = (int64_t) uniq.size()*rows;
-            const int64_t i0 = total*iw/n_workers;
-            const int64_t i1 = total*(iw + 1)/n_workers;
-            for (int64_t i = i0; i < i1; ++i) {
-                const int64_t u = i / rows;
-                const int64_t r = i % rows;
-                const int32_t e = uniq[u];
-                const uint8_t * row = gu_row(J, e, r);
-                const float sc = gu_scale(J, e, r);
-                const float bi = gu_bias(J, e, r);
-                // [TAG_EH_MULTI_DOT] the tokens that miss this expert, up to eh_multi_max per call
-                for (int32_t k0 = uniq_begin[u]; k0 < uniq_begin[u + 1]; k0 += eh_multi_max) {
-                    const int nk = std::min<int>(eh_multi_max, uniq_begin[u + 1] - k0);
+        const int64_t n_ff = J.n_ff;
+        const auto * tr_gu = ggml_get_type_traits_cpu(J.type_gu);
+        for (int64_t q = q0; q < q1; ++q) {
+            const int64_t u = q / n_ff;
+            const int64_t r = q % n_ff;
+            const int32_t e = uniq[u];
+            const int64_t ru_i = J.has_gate ? n_ff + r : r;
+            const uint8_t * rg = J.has_gate ? gu_row(J, e, r) : nullptr;
+            const uint8_t * ru = gu_row(J, e, ru_i);
+            const float sg = J.has_gate ? gu_scale(J, e, r) : 0.0f;
+            const float bg = J.has_gate ? gu_bias(J, e, r)  : 0.0f;
+            const float su = gu_scale(J, e, ru_i);
+            const float bu = gu_bias(J, e, ru_i);
+            for (int32_t k0 = uniq_begin[u]; k0 < uniq_begin[u + 1]; k0 += eh_multi_max) {
+                const int nk = std::min<int>(eh_multi_max, uniq_begin[u + 1] - k0);
+                float g[eh_multi_max] = {}, up[eh_multi_max];
+#if defined(EH_Q2_FAST)
+                if (fast_gu) {
+                    eh_act a[eh_multi_max];
+                    for (int j = 0; j < nk; ++j) {
+                        const int32_t t = misses[by_expert[k0 + j]].t;
+                        a[j] = { (const int8_t *) xa_q.p + (size_t) t*J.n_embd, xa_d.data() + (size_t) t*J.n_embd/4,
+                                 xa_hx.data() + (size_t) t*J.n_embd/4 };
+                    }
+                    const int nb = (int) (J.n_embd/QK2_0);
+                    if (rg) {
+                        eh_q2_dot(rg, nb, a, nk, g);
+                    }
+                    eh_q2_dot(ru, nb, a, nk, up);
+                } else
+#endif
+                {
                     const uint8_t * ys[eh_multi_max];
-                    float s[eh_multi_max];
                     for (int j = 0; j < nk; ++j) {
                         ys[j] = xq.data() + misses[by_expert[k0 + j]].t*xq_row;
                     }
-                    eh_dot_n(J.type_gu, tr_gu, (int) n_embd, row, ys, nk, s);
-                    for (int j = 0; j < nk; ++j) {
-                        const int32_t m = by_expert[k0 + j];
-                        gu[m*rows + r] = s[j]*sc*(J.l.weight_before ? misses[m].w : 1.0f) + bi;
+                    if (rg) {
+                        eh_dot_n(tr_gu, (int) J.n_embd, rg, ys, nk, g);
                     }
+                    eh_dot_n(tr_gu, (int) J.n_embd, ru, ys, nk, up);
+                }
+                for (int j = 0; j < nk; ++j) {
+                    const int32_t m = by_expert[k0 + j];
+                    const float wb = J.l.weight_before ? misses[m].w : 1.0f;
+                    hf[(size_t) m*n_ff + r] = act1(J, g[j]*sg*wb + bg, up[j]*su*wb + bu);
                 }
             }
         }
-        barrier.wait();
-        if (iw == 0) {
-            t_step[1] = eh_now_ns(); // [TAG_EH_TIMEOUT_DIAG]
-        }
+    }
 
-        // 3. the activation, in the down dot type
-        {
-            float * h = hf.data() + (size_t) iw*n_ff;
-            for (int64_t m = iw; m < n_miss; m += n_workers) {
-                activate(J, gu.data() + m*J.gu_rows, h);
-                uint8_t * dst = hq.data() + m*hq_row;
-                if (J.vt_down == GGML_TYPE_F32) {
-                    memcpy(dst, h, n_ff*sizeof(float));
-                } else {
-                    tr_vdn->from_float(h, dst, n_ff);
+    // activations [m0, m1) into the down dot type
+    void task_hq(int64_t m0, int64_t m1) {
+        const eh_layer & J = *job_layer;
+        const int64_t n_ff = J.n_ff;
+        for (int64_t m = m0; m < m1; ++m) {
+            const float * h = hf.data() + (size_t) m*n_ff;
+#if defined(EH_Q2_FAST)
+            if (fast_dn) {
+                eh_act_quant(h, (int) n_ff, (int8_t *) ha_q.p + (size_t) m*n_ff, ha_d.data() + (size_t) m*n_ff/4,
+                    ha_hx.data() + (size_t) m*n_ff/4);
+                continue;
+            }
+#endif
+            uint8_t * dst = hq.data() + (size_t) m*hq_row;
+            if (J.vt_down == GGML_TYPE_F32) {
+                memcpy(dst, h, n_ff*sizeof(float));
+            } else {
+                ggml_get_type_traits_cpu(J.vt_down)->from_float(h, dst, n_ff);
+            }
+        }
+    }
+
+    // down columns [c0, c1) for every token: each missed expert's rows in the range, read once for all the tokens
+    // that miss it, summed per token here, then the columns of y (zeros for tokens without misses)
+    void task_dn(int iw, int64_t c0, int64_t c1) {
+        const eh_layer & J = *job_layer;
+        const ggml_tensor * dn = J.l.down;
+        const auto * tr_dn = ggml_get_type_traits_cpu(J.type_down);
+        const int64_t nc = c1 - c0;
+        const size_t  nt = miss_tokens.size();
+        std::vector<float> & s_ = acc[iw];
+        if (s_.size() < nt*nc) {
+            s_.resize(nt*nc);
+        }
+        std::fill(s_.begin(), s_.begin() + nt*nc, 0.0f);
+        for (size_t u = 0; u < uniq.size(); ++u) {
+            const int32_t e = uniq[u];
+            const uint8_t * base = expert_base(dn, J.l.down_src, e);
+            const float sc = J.l.down_scale ? J.l.down_scale[e] : 1.0f;
+            const float * bias = J.l.down_bias ? J.l.down_bias + (int64_t) e*J.n_embd : nullptr;
+            for (int32_t k0 = uniq_begin[u]; k0 < uniq_begin[u + 1]; k0 += eh_multi_max) {
+                const int nk = std::min<int>(eh_multi_max, uniq_begin[u + 1] - k0);
+#if defined(EH_Q2_FAST)
+                eh_act a[eh_multi_max];
+#endif
+                const uint8_t * ys[eh_multi_max];
+                float wm[eh_multi_max];
+                int32_t ts[eh_multi_max];
+                for (int j = 0; j < nk; ++j) {
+                    const int32_t m = by_expert[k0 + j];
+                    wm[j] = J.l.weight_before ? 1.0f : misses[m].w;
+                    ts[j] = tok_slot[misses[m].t];
+#if defined(EH_Q2_FAST)
+                    if (fast_dn) {
+                        a[j] = { (const int8_t *) ha_q.p + (size_t) m*J.n_ff, ha_d.data() + (size_t) m*J.n_ff/4,
+                                 ha_hx.data() + (size_t) m*J.n_ff/4 };
+                        continue;
+                    }
+#endif
+                    ys[j] = hq.data() + (size_t) m*hq_row;
                 }
-            }
-        }
-        barrier.wait();
-        if (iw == 0) {
-            t_step[2] = eh_now_ns(); // [TAG_EH_TIMEOUT_DIAG]
-        }
-
-        // 4. down rows: each worker owns a range of output columns for every token (tokens without misses get
-        //    zeros); each missed expert's rows in that range are read once for all the tokens that miss it. The
-        //    sums go to ysum, then into the mailbox in one pass [TAG_EH_LOCAL_SUM]
-        {
-            const ggml_tensor * dn = J.l.down;
-            const int64_t c0 = n_embd*iw/n_workers;
-            const int64_t c1 = n_embd*(iw + 1)/n_workers;
-            float * ys_ = ysum.data();
-            for (int32_t t = 0; t < n_tokens; ++t) {
-                memset(ys_ + (int64_t) t*dims.max_embd + c0, 0, (c1 - c0)*sizeof(float));
-            }
-            for (size_t u = 0; u < uniq.size(); ++u) {
-                const int32_t e = uniq[u];
-                const uint8_t * base = expert_base(dn, J.l.down_src, e);
-                const float sc = J.l.down_scale ? J.l.down_scale[e] : 1.0f;
-                const float * bias = J.l.down_bias ? J.l.down_bias + (int64_t) e*n_embd : nullptr;
                 for (int64_t c = c0; c < c1; ++c) {
                     const uint8_t * row = base + c*dn->nb[1];
-                    for (int32_t k0 = uniq_begin[u]; k0 < uniq_begin[u + 1]; k0 += eh_multi_max) {
-                        const int nk = std::min<int>(eh_multi_max, uniq_begin[u + 1] - k0);
-                        const uint8_t * ys[eh_multi_max];
-                        float s[eh_multi_max];
-                        for (int j = 0; j < nk; ++j) {
-                            ys[j] = hq.data() + by_expert[k0 + j]*hq_row;
-                        }
-                        eh_dot_n(J.type_down, tr_down, (int) n_ff, row, ys, nk, s);
-                        for (int j = 0; j < nk; ++j) {
-                            const eh_miss & ms = misses[by_expert[k0 + j]];
-                            const float v = s[j]*sc + (bias ? bias[c] : 0.0f);
-                            ys_[(int64_t) ms.t*dims.max_embd + c] += (J.l.weight_before ? 1.0f : ms.w)*v;
-                        }
+                    float s[eh_multi_max];
+#if defined(EH_Q2_FAST)
+                    if (fast_dn) {
+                        eh_q2_dot(row, (int) (J.n_ff/QK2_0), a, nk, s);
+                    } else
+#endif
+                    {
+                        eh_dot_n(tr_dn, (int) J.n_ff, row, ys, nk, s);
+                    }
+                    const float b = bias ? bias[c] : 0.0f;
+                    for (int j = 0; j < nk; ++j) {
+                        s_[(size_t) ts[j]*nc + (c - c0)] += wm[j]*(s[j]*sc + b);
                     }
                 }
             }
-            for (int32_t t = 0; t < n_tokens; ++t) {
-                memcpy(y + (int64_t) t*dims.max_embd + c0, ys_ + (int64_t) t*dims.max_embd + c0, (c1 - c0)*sizeof(float));
+        }
+        float * y = (float *) (mb + ggml_expert_handoff_off_y(dims));
+        for (int32_t t = 0; t < n_tokens; ++t) {
+            float * dst = y + (int64_t) t*dims.max_embd + c0;
+            const int32_t ts = tok_slot[t];
+            if (ts >= 0) {
+                memcpy(dst, s_.data() + (size_t) ts*nc, nc*sizeof(float));
+            } else {
+                memset(dst, 0, nc*sizeof(float));
             }
         }
     }
 
     void worker(int iw) {
-        // the sequence the pool was made at, not what this thread reads when it starts: a send may already be waiting
+        if (iw < (int) pin_lp.size() && pin_lp[iw] >= 0) {
+            eh_pin_thread(pin_lp[iw]);
+        }
+        uint64_t my_wake = 0;
+        if (iw > 0) {
+            uint32_t seen = gen.load(std::memory_order_acquire);
+            for (;;) {
+                uint32_t g = 0;
+                if (!wait_gen(seen, g, my_wake)) {
+                    return;
+                }
+                seen = g;
+                run_tasks(iw, g);
+            }
+        }
+
+        // worker 0: the sequence the pool was made at, not what this thread reads when it starts (a send may wait)
         uint32_t seen = seq_base;
-        uint64_t my_gen = 0;
         for (;;) {
             uint32_t s = 0;
-            if (!wait_work(iw, seen, my_gen, s)) {
+            if (!wait_send(seen, s, my_wake)) {
                 return;
             }
-            // [TAG_EH_POOL_WAKE] the barrier below needs every worker: wake those asleep
-            if (n_asleep.load(std::memory_order_seq_cst) > 0) {
-                wake();
-            }
-            // every worker saw a new send; worker 0 reads it, the others wait
-            barrier.wait();
-            if (stop.load(std::memory_order_acquire)) {
-                return;
-            }
-            if (iw == 0) {
-                prepare(eh_load(&hdr->seq_send));
-                t_prep = eh_now_ns(); // [TAG_EH_LOCAL_SUM]
-            }
-            barrier.wait();
-            if (job_layer != nullptr && !misses.empty() && !sim_nohost) {
-                run(iw);
-            } else if (iw == 0) {
+            prepare(s);
+            seen = seq;
+            const int64_t t_prep = eh_now_ns();
+            int64_t t_step[3] = { t_prep, t_prep, t_prep };
+            const bool ran = job_layer != nullptr && !misses.empty() && !sim_nohost;
+            if (ran) {
+                const eh_layer & J = *job_layer;
+                run_phase(PH_XQ, (int64_t) miss_tokens.size(), 4);
+                t_step[0] = eh_now_ns();
+                run_phase(PH_GU, (int64_t) uniq.size()*J.n_ff, 0);
+                t_step[1] = eh_now_ns();
+                run_phase(PH_HQ, (int64_t) misses.size(), 16);
+                t_step[2] = eh_now_ns();
+                run_phase(PH_DN, J.n_embd, 0);
+            } else {
                 float * y = (float *) (mb + ggml_expert_handoff_off_y(dims));
                 const int64_t n_embd = job_layer ? job_layer->n_embd : hdr->n_embd;
                 for (int32_t t = 0; t < n_tokens; ++t) {
                     memset(y + (int64_t) t*dims.max_embd, 0, n_embd*sizeof(float));
                 }
             }
-            // [TAG_EH_POOL_WAKE] the spin window counts from the end of this job for every worker, also one that took
-            // longer than the window (otherwise the others sleep past this barrier while worker 0 spins)
-            extend_spin(eh_now_ns() + linger_ns);
-            barrier.wait();
-            seen = seq;
-            if (iw == 0) {
-                // [TAG_EH_LOCAL_SUM] before the answer: no worker looks for the next send until the device has it
-                const int64_t tf = t_first.exchange(0, std::memory_order_relaxed);
-                if (tf > 0) {
-                    st_gather.fetch_add((uint64_t) std::max<int64_t>(0, t_seen - tf), std::memory_order_relaxed);
-                    const int64_t gap = tf - t_prev_end;
-                    if (t_prev_end > 0 && gap >= 0 && gap < 5*1000*1000) {
-                        st_gap.fetch_add((uint64_t) gap, std::memory_order_relaxed);
-                        st_n_gap.fetch_add(1, std::memory_order_relaxed);
-                    }
-                }
-                eh_store(&hdr->seq_done, seq);
-                t_prev_end = eh_now_ns();
-                const int64_t t_end = eh_now_ns();
-                t_active.store(t_end, std::memory_order_relaxed);
-                st_busy_ns.fetch_add((uint64_t) (t_end - t_seen), std::memory_order_relaxed);
-                // [TAG_EH_TIMEOUT_DIAG]
-                if (job_layer != nullptr && !misses.empty() && !sim_nohost) {
-                    // [TAG_EH_LOCAL_SUM]
-                    const int64_t ts[6] = { t_seen, t_prep, t_step[0], t_step[1], t_step[2], t_end };
-                    for (int k = 0; k < 5; ++k) {
-                        st_step[k].fetch_add((uint64_t) std::max<int64_t>(0, ts[k + 1] - ts[k]), std::memory_order_relaxed);
-                    }
-                }
-                if (n_tokens > 1) {
-                    st_multi.fetch_add(1, std::memory_order_relaxed);
-                    st_busy_multi.fetch_add((uint64_t) (t_end - t_seen), std::memory_order_relaxed);
-                }
-                if ((uint64_t) (t_end - t_seen) > st_max_ns.load(std::memory_order_relaxed)) {
-                    const bool ran = job_layer != nullptr && !misses.empty() && !sim_nohost;
-                    st_max_ns.store((uint64_t) (t_end - t_seen), std::memory_order_relaxed);
-                    st_max_layer.store(job_il, std::memory_order_relaxed);
-                    st_max_tokens.store(n_tokens, std::memory_order_relaxed);
-                    st_max_miss.store((int32_t) misses.size(), std::memory_order_relaxed);
-                    st_max_uniq.store((int32_t) uniq.size(), std::memory_order_relaxed);
-                    int64_t prev = t_seen;
-                    for (int k = 0; k < 4; ++k) {
-                        const int64_t t = k < 3 ? (ran ? t_step[k] : prev) : t_end;
-                        st_max_step[k].store((uint64_t) std::max<int64_t>(0, t - prev), std::memory_order_relaxed);
-                        prev = std::max(prev, t);
-                    }
-                }
-                spin_until.store(std::max(spin_until.load(std::memory_order_relaxed), eh_now_ns() + linger_ns), std::memory_order_release);
+            // the answer: every task's writes of y are in (n_done, acquire)
+            const int64_t gap = t_seen - t_prev_end;
+            if (t_prev_end > 0 && gap >= 0 && gap < 5*1000*1000) {
+                st_gap.fetch_add((uint64_t) gap, std::memory_order_relaxed);
+                st_n_gap.fetch_add(1, std::memory_order_relaxed);
             }
+            eh_store(&hdr->seq_done, seq);
+            const int64_t t_end = eh_now_ns();
+            t_prev_end = t_end;
+            t_active.store(t_end, std::memory_order_relaxed);
+            st_busy_ns.fetch_add((uint64_t) (t_end - t_seen), std::memory_order_relaxed);
+            if (ran) {
+                const int64_t ts[6] = { t_seen, t_prep, t_step[0], t_step[1], t_step[2], t_end };
+                for (int k = 0; k < 5; ++k) {
+                    st_step[k].fetch_add((uint64_t) std::max<int64_t>(0, ts[k + 1] - ts[k]), std::memory_order_relaxed);
+                }
+            }
+            if (n_tokens > 1) {
+                st_multi.fetch_add(1, std::memory_order_relaxed);
+                st_busy_multi.fetch_add((uint64_t) (t_end - t_seen), std::memory_order_relaxed);
+            }
+            if ((uint64_t) (t_end - t_seen) > st_max_ns.load(std::memory_order_relaxed)) {
+                st_max_ns.store((uint64_t) (t_end - t_seen), std::memory_order_relaxed);
+                st_max_layer.store(job_il, std::memory_order_relaxed);
+                st_max_tokens.store(n_tokens, std::memory_order_relaxed);
+                st_max_miss.store((int32_t) misses.size(), std::memory_order_relaxed);
+                st_max_uniq.store((int32_t) uniq.size(), std::memory_order_relaxed);
+                const int64_t tk[4] = { t_step[0], t_step[1], t_step[2], t_end };
+                int64_t prev = t_prep;
+                for (int k = 0; k < 4; ++k) {
+                    st_max_step[k].store((uint64_t) std::max<int64_t>(0, tk[k] - prev), std::memory_order_relaxed);
+                    prev = std::max(prev, tk[k]);
+                }
+            }
+            spin_until.store(std::max(spin_until.load(std::memory_order_relaxed), eh_now_ns() + linger_ns), std::memory_order_release);
         }
     }
 };
+
+
 
 ggml_expert_handoff_host_t ggml_expert_handoff_host_new(
         void * mailbox, int32_t max_tokens, int32_t max_embd, int32_t max_used, int32_t n_layer, int32_t n_workers) {
@@ -867,9 +1076,20 @@ ggml_expert_handoff_host_t ggml_expert_handoff_host_new(
     h->hdr  = (ggml_expert_handoff_header *) mailbox;
     h->dims = { max_tokens, max_embd, max_used };
     h->layers.resize(n_layer);
+    // [TAG_EH_POOL2] n_workers <= 0: one per physical core but the first (or per two logical processors less one)
+    const std::vector<int> lps = eh_core_lps();
+    if (n_workers <= 0) {
+        n_workers = lps.size() > 1 ? (int32_t) lps.size() - 1 : std::max(1, (int32_t) std::thread::hardware_concurrency()/2 - 1);
+    }
     h->n_workers = std::max(1, n_workers);
-    h->barrier.n = h->n_workers;
-    h->barrier.stop = &h->stop;
+    // pinned from core 1 on, one per core, as far as the cores go (ROCMFPX_EH_PIN=0: not pinned)
+    const char * pin_env = getenv("ROCMFPX_EH_PIN");
+    const bool pin = pin_env == nullptr || atoi(pin_env) != 0;
+    h->pin_lp.assign(h->n_workers, -1);
+    for (int i = 0; pin && i < h->n_workers && i + 1 < (int) lps.size(); ++i) {
+        h->pin_lp[i] = lps[i + 1];
+    }
+    h->acc.resize(h->n_workers);
 
     // a fresh mailbox: nothing sent, nothing answered
     h->seq_base = eh_load(&h->hdr->seq_send);
