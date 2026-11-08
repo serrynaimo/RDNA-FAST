@@ -32,6 +32,8 @@
 #include <random>
 #include <sstream>
 #include <cstring>
+#include <cctype>
+#include <ctime>
 
 #ifndef _WIN32
 extern char **environ;
@@ -418,6 +420,7 @@ server_models::server_models(
     }
 
     unfinished_downloads.load();
+    saved_presets.load(ctx_preset); // [TAG_MODEL_PRESET] before the list, which lays them over the models
     load_models();
     debug_fake_timing = !common_get_env("LLAMA_SERVER_DEBUG_FAKE_TIMING").empty();
 }
@@ -682,6 +685,303 @@ std::vector<server_unfinished_download> server_unfinished_downloads::get_all() {
     return downloads;
 }
 
+//
+// [TAG_MODEL_PRESET] saved model presets
+//
+
+// next to the model cache, like the unfinished downloads: a router run with another LLAMA_CACHE (a test)
+// never touches the presets of the real one
+static std::string saved_presets_path() {
+    return hf_cache::get_cache_path() + "/rdna-fast-presets.json";
+}
+
+// the env a saved preset may set: the knobs of ggml, this fork, llama.cpp and the ROCm runtime. Anything else
+// (PATH, TEMP, tokens) belongs to the machine, not to one model
+static const char * const saved_preset_env_prefixes[] = { "GGML_", "ROCMFPX_", "LLAMA_", "HIP_", "HSA_", "ROCBLAS_", "AMD_" };
+
+// why a llama-server option cannot be part of a saved preset, empty when it can. The router picks the model,
+// the address, the key and the alias of every child itself, and a few options only print something and exit
+static std::string saved_preset_reserved_reason(const common_arg & opt) {
+    static const char * const model_args[]   = { "--model", "--model-url", "--docker-repo", "--hf-token" };
+    static const char * const model_prefix[] = { "--hf-repo", "--hf-file" };
+    static const char * const router_args[]  = { "--host", "--port", "--api-key", "--api-key-file", "--alias",
+                                                 "--ssl-key-file", "--ssl-cert-file", "--connect", "--connect-code" };
+    static const char * const router_prefix[] = { "--models-", "--no-models-" };
+    static const char * const exit_args[]    = { "--help", "--version", "--cache-list", "--list-devices", "--completion-bash" };
+
+    std::vector<std::string> spellings;
+    for (const char * a : opt.args)     { spellings.emplace_back(a); }
+    for (const char * a : opt.args_neg) { spellings.emplace_back(a); }
+
+    auto any_is = [&](const auto & list) {
+        return std::any_of(spellings.begin(), spellings.end(), [&](const std::string & s) {
+            return std::any_of(std::begin(list), std::end(list), [&](const char * x) { return s == x; });
+        });
+    };
+    auto any_starts = [&](const auto & list) {
+        return std::any_of(spellings.begin(), spellings.end(), [&](const std::string & s) {
+            return std::any_of(std::begin(list), std::end(list), [&](const char * x) { return s.rfind(x, 0) == 0; });
+        });
+    };
+
+    if (any_is(model_args) || any_starts(model_prefix)) {
+        return "the router picks the model of each instance (a draft model goes by path, -md)";
+    }
+    if (any_is(router_args) || any_starts(router_prefix)) {
+        return "the router manages it for each instance";
+    }
+    if (any_is(exit_args)) {
+        return "the instance would exit before it serves";
+    }
+    return "";
+}
+
+// parse the args of a saved preset the way llama-server reads its command line, so a bad flag is refused when
+// it is saved rather than when the model next fails to load. Values are not checked beyond a whole number
+// for the options that take one: their handlers may load backends, read files or exit
+static common_preset parse_saved_preset_args(const common_preset_context & ctx, const std::vector<std::string> & args) {
+    std::map<std::string, const common_arg *> by_flag;
+    for (const auto & opt : ctx.ctx_params.options) {
+        if (opt.is_preset_only) {
+            continue; // INI-only keys (load-on-startup, stop-timeout), not command line options
+        }
+        for (const char * a : opt.args)     { by_flag[a] = &opt; }
+        for (const char * a : opt.args_neg) { by_flag[a] = &opt; }
+    }
+
+    common_preset preset;
+    for (size_t i = 0; i < args.size(); i++) {
+        const std::string & given = args[i];
+        std::string flag = given;
+        if (flag.rfind("--", 0) == 0) {
+            std::replace(flag.begin(), flag.end(), '_', '-'); // same as the command line: --n_gpu_layers works
+        }
+        auto it = by_flag.find(flag);
+        if (it == by_flag.end()) {
+            throw std::invalid_argument(string_format("unknown option '%s': not a llama-server option", given.c_str()));
+        }
+        const common_arg & opt = *it->second;
+        const std::string reason = saved_preset_reserved_reason(opt);
+        if (!reason.empty()) {
+            throw std::invalid_argument(string_format("option '%s' cannot be saved in a model preset: %s", given.c_str(), reason.c_str()));
+        }
+        if (opt.value_hint_2 != nullptr) {
+            throw std::invalid_argument(string_format("option '%s' takes two values, which a model preset cannot hold", given.c_str()));
+        }
+
+        std::string value;
+        if (opt.value_hint == nullptr) {
+            // a flag: "1", or "0" for its --no- form, as common_params_to_map stores it
+            const bool neg = std::any_of(opt.args_neg.begin(), opt.args_neg.end(), [&](const char * a) { return flag == a; });
+            value = neg ? "0" : "1";
+        } else {
+            if (i + 1 >= args.size()) {
+                throw std::invalid_argument(string_format("option '%s' needs a value", given.c_str()));
+            }
+            value = args[++i];
+            if (opt.handler_int) {
+                bool ok = false;
+                try {
+                    size_t pos = 0;
+                    (void) std::stoi(value, &pos);
+                    ok = pos == value.size();
+                } catch (const std::exception &) {
+                    ok = false;
+                }
+                if (!ok) {
+                    throw std::invalid_argument(string_format("option '%s' takes a whole number, got '%s'", given.c_str(), value.c_str()));
+                }
+            }
+        }
+        preset.options[opt] = value; // a repeated option: the last one wins, as on the command line
+    }
+    return preset;
+}
+
+// check the env of a saved preset: allowed prefixes, upper case names (Windows matches names without case, so
+// "LLAMA_ARG_model" would reach the child as LLAMA_ARG_MODEL), and no variable the router owns
+static void check_saved_preset_env(const common_preset_context & ctx, const std::map<std::string, std::string> & env) {
+    std::string prefixes;
+    for (const char * p : saved_preset_env_prefixes) {
+        prefixes += (prefixes.empty() ? "" : ", ") + std::string(p);
+    }
+    for (const auto & kv : env) {
+        const std::string & key   = kv.first;
+        const std::string & value = kv.second;
+        const bool prefixed = std::any_of(std::begin(saved_preset_env_prefixes), std::end(saved_preset_env_prefixes), [&](const char * p) {
+            return key.size() > strlen(p) && key.rfind(p, 0) == 0;
+        });
+        if (!prefixed) {
+            throw std::invalid_argument(string_format("env '%s' cannot be saved in a model preset: only names starting with %s are allowed",
+                key.c_str(), prefixes.c_str()));
+        }
+        const bool upper = std::all_of(key.begin(), key.end(), [](char c) {
+            return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+        });
+        if (!upper) {
+            throw std::invalid_argument(string_format("env '%s' is not a valid name: use upper case letters, digits and '_'", key.c_str()));
+        }
+        if (value.find('\0') != std::string::npos) {
+            throw std::invalid_argument(string_format("env '%s' has a NUL character in its value", key.c_str()));
+        }
+        if (key == SERVER_ENV_ROUTER_PORT || key == SERVER_ENV_CHILD_ROLE || key == "LLAMA_APP_CMD") {
+            throw std::invalid_argument(string_format("env '%s' cannot be saved in a model preset: the router sets it for each instance", key.c_str()));
+        }
+        if (key == "LLAMA_CACHE") {
+            throw std::invalid_argument("env 'LLAMA_CACHE' cannot be saved in a model preset: the router and its instances share one model cache");
+        }
+        // LLAMA_ARG_* and friends are options in env form, the same options are refused as in args
+        auto it = ctx.key_to_opt.find(key);
+        if (it != ctx.key_to_opt.end()) {
+            const std::string reason = saved_preset_reserved_reason(it->second);
+            if (!reason.empty()) {
+                throw std::invalid_argument(string_format("env '%s' cannot be saved in a model preset: it sets '%s', and %s",
+                    key.c_str(), it->second.args.back(), reason.c_str()));
+            }
+        }
+    }
+}
+
+static std::string iso_time_now() {
+    std::time_t t = std::time(nullptr);
+    std::tm tm = {};
+#ifdef _WIN32
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return buf;
+}
+
+void server_saved_presets::load(const common_preset_context & ctx) {
+    std::ifstream in(std::filesystem::u8path(saved_presets_path()));
+    if (!in) {
+        return;
+    }
+    std::string raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::lock_guard<std::mutex> lk(mutex);
+    json data;
+    try {
+        data = json::parse(raw);
+    } catch (const std::exception & e) {
+        LOG_WRN("failed to read saved model presets from %s: %s\n", saved_presets_path().c_str(), e.what());
+        return;
+    }
+    if (!data.is_object()) {
+        LOG_WRN("saved model presets in %s are not a JSON object, ignored\n", saved_presets_path().c_str());
+        return;
+    }
+    for (const auto & [model, entry] : data.items()) {
+        server_saved_preset p;
+        try {
+            p.args  = json_value(entry, "args", std::vector<std::string>());
+            p.saved = json_value(entry, "saved", std::string());
+            if (entry.contains("env") && entry.at("env").is_object()) {
+                for (const auto & [key, value] : entry.at("env").items()) {
+                    p.env[key] = value.get<std::string>();
+                }
+            }
+        } catch (const std::exception & e) {
+            LOG_WRN("saved model preset of '%s' is malformed, ignored: %s\n", model.c_str(), e.what());
+            continue;
+        }
+        // an option renamed or refused since the save: keep the entry so GET shows it, but do not apply it
+        try {
+            p.preset = parse_saved_preset_args(ctx, p.args);
+            check_saved_preset_env(ctx, p.env);
+        } catch (const std::exception & e) {
+            p.error  = e.what();
+            p.preset = {};
+            LOG_WRN("saved model preset of '%s' is not applied: %s\n", model.c_str(), e.what());
+        }
+        presets[model] = std::move(p);
+    }
+    LOG_INF("loaded %zu saved model preset(s) from %s\n", presets.size(), saved_presets_path().c_str());
+}
+
+void server_saved_presets::save() {
+    json data = json::object();
+    for (const auto & [model, p] : presets) {
+        data[model] = json {
+            {"args",  p.args},
+            {"env",   p.env},
+            {"saved", p.saved},
+        };
+    }
+    fs_write_atomic(std::filesystem::u8path(saved_presets_path()), data.dump(2));
+}
+
+void server_saved_presets::set(const std::string & model, const server_saved_preset & preset) {
+    std::lock_guard<std::mutex> lk(mutex);
+    std::optional<server_saved_preset> old;
+    if (auto it = presets.find(model); it != presets.end()) {
+        old = it->second;
+    }
+    presets[model] = preset;
+    try {
+        save();
+    } catch (...) {
+        // what is in memory must match the file, or a restart would undo a save the client saw succeed
+        if (old.has_value()) {
+            presets[model] = *old;
+        } else {
+            presets.erase(model);
+        }
+        throw;
+    }
+}
+
+bool server_saved_presets::remove(const std::string & model) {
+    std::lock_guard<std::mutex> lk(mutex);
+    auto it = presets.find(model);
+    if (it == presets.end()) {
+        return false;
+    }
+    server_saved_preset old = it->second;
+    presets.erase(it);
+    try {
+        save();
+    } catch (...) {
+        presets[model] = std::move(old);
+        throw;
+    }
+    return true;
+}
+
+std::optional<server_saved_preset> server_saved_presets::get(const std::string & model) {
+    std::lock_guard<std::mutex> lk(mutex);
+    auto it = presets.find(model);
+    if (it == presets.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+// update_args() injects HOST/PORT/ALIAS/LOG_COLORS, so strip them before comparing presets
+static std::map<common_arg, std::string> preset_options_for_compare(common_preset p) {
+    p.unset_option("LLAMA_ARG_HOST");
+    p.unset_option("LLAMA_ARG_PORT");
+    p.unset_option("LLAMA_ARG_ALIAS");
+    p.unset_option("LLAMA_ARG_LOG_COLORS");
+    return p.options;
+}
+
+// a child's env entry "NAME=value" is `key`; Windows matches env names without case
+static bool env_entry_is(const std::string & entry, const std::string & key) {
+    if (entry.size() <= key.size() || entry[key.size()] != '=') {
+        return false;
+    }
+#ifdef _WIN32
+    return std::equal(key.begin(), key.end(), entry.begin(), [](char a, char b) {
+        return std::toupper((unsigned char) a) == std::toupper((unsigned char) b);
+    });
+#else
+    return entry.compare(0, key.size(), key) == 0;
+#endif
+}
+
 std::vector<server_unfinished_download> server_models::unfinished_downloads_get() {
     return unfinished_downloads.get_all();
 }
@@ -862,14 +1162,6 @@ void server_models::load_models() {
             inst.meta.hidden = hidden_models.count(name) > 0;
         }
     };
-    // update_args() injects HOST/PORT/ALIAS/LOG_COLORS, so strip them before comparing presets
-    auto preset_options_for_compare = [](common_preset p) {
-        p.unset_option("LLAMA_ARG_HOST");
-        p.unset_option("LLAMA_ARG_PORT");
-        p.unset_option("LLAMA_ARG_ALIAS");
-        p.unset_option("LLAMA_ARG_LOG_COLORS");
-        return p.options;
-    };
 
     // Phase 2: acquire the lock once for all mapping mutations.
     // We temporarily release it only when calling functions that acquire it internally (unload)
@@ -883,7 +1175,7 @@ void server_models::load_models() {
         for (const auto & [name, preset] : final_presets) {
             server_model_meta meta{
                 /* source        */ get_source(name),
-                /* preset        */ preset,
+                /* preset        */ with_saved_preset(name, preset), // [TAG_MODEL_PRESET]
                 /* name          */ name,
                 /* aliases       */ {},
                 /* tags          */ {},
@@ -897,6 +1189,7 @@ void server_models::load_models() {
                 /* stop_timeout  */ DEFAULT_STOP_TIMEOUT,
                 // /* need_download */ false,
             };
+            meta.preset_base = preset; // [TAG_MODEL_PRESET]
             add_model(std::move(meta));
         }
         apply_stop_timeout();
@@ -935,7 +1228,7 @@ void server_models::load_models() {
             auto it = final_presets.find(name);
             if (it == final_presets.end()) {
                 to_unload.push_back(name); // removed from source
-            } else if (preset_options_for_compare(inst.meta.preset) != preset_options_for_compare(it->second)) {
+            } else if (preset_options_for_compare(inst.meta.preset) != preset_options_for_compare(with_saved_preset(name, it->second))) {
                 to_unload.push_back(name); // preset changed
             }
         }
@@ -974,15 +1267,25 @@ void server_models::load_models() {
 
         // update presets for non-running models still in source
         for (auto & [name, inst] : mapping) {
-            if (inst.meta.is_running()) continue;
             auto it = final_presets.find(name);
+            if (inst.meta.is_running()) {
+                // [TAG_MODEL_PRESET] its options are unchanged (else it was unloaded above), but a source option the
+                // saved preset overrides may have changed: a later DELETE /models/preset goes back to the new one
+                if (it != final_presets.end()) {
+                    inst.meta.preset_base = it->second;
+                }
+                continue;
+            }
             if (it == final_presets.end()) continue; // erased above
 
-            if (preset_options_for_compare(inst.meta.preset) != preset_options_for_compare(it->second)) {
+            // [TAG_MODEL_PRESET] the saved preset stays on top of the reloaded one
+            common_preset next = with_saved_preset(name, it->second);
+            if (preset_options_for_compare(inst.meta.preset) != preset_options_for_compare(next)) {
                 // different args, different memory: measure again
                 inst.meta.memory = {};
             }
-            inst.meta.preset = it->second;
+            inst.meta.preset      = std::move(next);
+            inst.meta.preset_base = it->second;
 
             // re-parse aliases, then validate against other models
             std::set<std::string> new_aliases;
@@ -1029,7 +1332,8 @@ void server_models::load_models() {
             if (mapping.find(name) == mapping.end()) {
                 server_model_meta meta{
                     /* source        */ get_source(name),
-                    /* preset        */ preset,
+                    // [TAG_MODEL_PRESET] a model whose download just finished gets the preset saved while it ran
+                    /* preset        */ with_saved_preset(name, preset),
                     /* name          */ name,
                     /* aliases       */ {},
                     /* tags          */ {},
@@ -1043,6 +1347,7 @@ void server_models::load_models() {
                     /* stop_timeout  */ DEFAULT_STOP_TIMEOUT,
                     // /* need_download */ false,
                 };
+                meta.preset_base = preset; // [TAG_MODEL_PRESET]
                 add_model(std::move(meta));
             }
         }
@@ -1257,6 +1562,9 @@ void server_models::load(const std::string & name, const load_options & opts) {
             }
             set_child_env(child_env, "LLAMA_ARG_MMPROJ_AUTO", mmproj ? "1" : "0");
             set_child_env(child_env, "LLAMA_ARG_SPEC_TYPE", spec_types.empty() ? "none" : spec_types);
+        } else if (!opts.custom_meta.has_value()) {
+            // [TAG_MODEL_PRESET] the instance runs with the env its saved preset asks for
+            add_saved_env(name, child_env);
         }
 
         SRV_INF("%s", "spawning server instance with args:\n");
@@ -1546,6 +1854,157 @@ bool server_models::remove(const std::string & name) {
     SRV_INF("removing model name=%s from cache (%s)\n", name.c_str(), ok ? "succeeded" : "nothing cached");
     notify_sse("model_remove", name, {});
     return true;
+}
+
+//
+// [TAG_MODEL_PRESET] saved model presets
+//
+
+common_preset server_models::with_saved_preset(const std::string & name, const common_preset & base) {
+    common_preset out = base;
+    auto saved = saved_presets.get(name);
+    if (saved.has_value() && saved->error.empty()) {
+        out.merge(saved->preset);
+    }
+    return out;
+}
+
+bool server_models::apply_saved_preset(std::unique_lock<std::mutex> & lk, const std::string & name, bool & changed) {
+    changed = false;
+    auto it = mapping.find(name);
+    if (it == mapping.end()) {
+        return false;
+    }
+    auto & meta = it->second.meta;
+    if (meta.status == SERVER_MODEL_STATUS_DOWNLOADING || meta.status == SERVER_MODEL_STATUS_DOWNLOADED) {
+        return false; // a download placeholder, replaced by the real entry when the list is rebuilt
+    }
+
+    common_preset next = with_saved_preset(name, meta.preset_base);
+    changed = preset_options_for_compare(meta.preset) != preset_options_for_compare(next);
+    meta.preset = std::move(next);
+
+    // --tags may come from the saved args
+    meta.tags.clear();
+    std::string tags_str;
+    if (meta.preset.get_option("LLAMA_ARG_TAGS", tags_str) && !tags_str.empty()) {
+        for (auto & tag : string_split<std::string>(tags_str, ',')) {
+            tag = string_strip(tag);
+            if (!tag.empty()) {
+                meta.tags.insert(tag);
+            }
+        }
+    }
+
+    // a running instance keeps the args it was started with until its next load(), which renders them anew;
+    // its memory record is what it really allocated, so it stays too
+    if (!meta.is_running()) {
+        if (changed) {
+            meta.memory = {}; // different args, different memory: measure again
+        }
+        meta.update_args(ctx_preset, bin_path);
+        if (changed) {
+            sched->measure_unmeasured(lk);
+        }
+    }
+    return true;
+}
+
+void server_models::add_saved_env(const std::string & name, std::vector<std::string> & env) {
+    auto saved = saved_presets.get(name);
+    if (!saved.has_value() || !saved->error.empty() || saved->env.empty()) {
+        return;
+    }
+    std::string names;
+    for (const auto & kv : saved->env) {
+        const std::string & key   = kv.first;
+        const std::string & value = kv.second;
+        env.erase(std::remove_if(env.begin(), env.end(), [&](const std::string & e) { return env_entry_is(e, key); }), env.end());
+        if (!value.empty()) {
+            env.push_back(key + "=" + value);
+        }
+        names += (names.empty() ? "" : ", ") + key + (value.empty() ? " (unset)" : "");
+    }
+    // names only, a value may be something the log should not hold
+    SRV_INF("instance name=%s gets env from its saved preset: %s\n", name.c_str(), names.c_str());
+}
+
+json server_models::preset_save(const std::string & name, const std::vector<std::string> & args,
+                                const std::map<std::string, std::string> & env, bool reload) {
+    server_saved_preset saved;
+    saved.args   = args;
+    saved.env    = env;
+    saved.saved  = iso_time_now();
+    saved.preset = parse_saved_preset_args(ctx_preset, args); // throws std::invalid_argument
+    check_saved_preset_env(ctx_preset, env);                   // throws std::invalid_argument
+
+    std::unique_lock<std::mutex> lk(mutex);
+    // a reload in progress would lay the old preset over the list after this one
+    cv.wait(lk, [this]() { return !is_reloading; });
+
+    saved_presets.set(name, saved);
+    SRV_INF("saved preset for model name=%s (%zu args, %zu env vars)\n", name.c_str(), args.size(), env.size());
+
+    bool changed = false;
+    if (!apply_saved_preset(lk, name, changed)) {
+        // still downloading, or not downloaded yet: the list rebuild after the download lays it over the model
+        return json {
+            {"applied", "when the model appears"},
+            {"command", nullptr},
+        };
+    }
+
+    const auto & meta = mapping[name].meta;
+    if (!reload || !meta.is_running()) {
+        // render a copy: a running instance keeps showing the args it was started with
+        server_model_meta next = meta;
+        next.update_args(ctx_preset, bin_path);
+        return json {
+            {"applied", "next load"},
+            {"command", next.args},
+        };
+    }
+
+    // restart the instance so it runs with the preset now; unload() and load() take the lock themselves
+    lk.unlock();
+    SRV_INF("restarting model name=%s with its saved preset\n", name.c_str());
+    unload(name);
+    wait(name, [](const server_model_meta & m) { return !m.is_running(); });
+    if (changed) {
+        // the record of the old instance does not fit the new args: measure again before the load
+        std::lock_guard<std::mutex> lk_mem(mutex);
+        auto it = mapping.find(name);
+        if (it != mapping.end() && !it->second.meta.is_running()) {
+            it->second.meta.memory = {};
+        }
+    }
+    load(name);
+
+    auto loaded = get_meta(name);
+    return json {
+        {"applied", "now"},
+        {"command", loaded.has_value() ? json(loaded->args) : json(nullptr)},
+    };
+}
+
+std::optional<server_saved_preset> server_models::preset_get(const std::string & name) {
+    return saved_presets.get(name);
+}
+
+std::optional<std::string> server_models::preset_remove(const std::string & name) {
+    std::unique_lock<std::mutex> lk(mutex);
+    cv.wait(lk, [this]() { return !is_reloading; });
+
+    if (!saved_presets.remove(name)) {
+        return std::nullopt;
+    }
+    SRV_INF("removed saved preset of model name=%s\n", name.c_str());
+
+    bool changed = false;
+    if (!apply_saved_preset(lk, name, changed)) {
+        return std::string("when the model appears");
+    }
+    return std::string("next load");
 }
 
 void server_models::wait(const std::string & name, std::function<bool(const server_model_meta &)> predicate) {
@@ -2221,6 +2680,18 @@ void server_models_routes::init_routes() {
                 model_info["context_length"] = meta.n_ctx_train;
             }
 
+            // [TAG_MODEL_PRESET] the recipe saved through POST /models/preset, for the UI to show
+            if (auto saved = models.preset_get(meta.name); saved.has_value()) {
+                json rdna_preset = {
+                    {"args", saved->args},
+                    {"env",  saved->env},
+                };
+                if (!saved->error.empty()) {
+                    rdna_preset["error"] = saved->error;
+                }
+                model_info["rdna_preset"] = rdna_preset;
+            }
+
             if (models.sched->memory_enabled()) {
                 model_info["memory"] = meta.memory.to_json();
             }
@@ -2406,6 +2877,119 @@ void server_models_routes::init_routes() {
         models.remove(name); // throws on error
 
         res_ok(res, {{"success", true}});
+        return res;
+    };
+
+    // [TAG_MODEL_PRESET] the model a preset request is about: an alias goes to its model, a name not listed yet
+    // (a download on its way) is kept as given
+    auto preset_model_name = [this](const std::string & name) {
+        if (name.empty()) {
+            throw std::invalid_argument("model must be a non-empty string");
+        }
+        auto meta = models.get_meta(name);
+        return meta.has_value() ? meta->name : name;
+    };
+
+    // [TAG_MODEL_PRESET] POST /models/preset {"model", "args": [...], "env": {...}, "reload": false}
+    this->post_router_models_preset = [this, preset_model_name](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json body = json::parse(req.body);
+        if (!body.is_object()) {
+            throw std::invalid_argument("the request body must be a JSON object");
+        }
+        const std::string name = preset_model_name(json_value(body, "model", std::string()));
+
+        std::vector<std::string> args;
+        if (body.contains("args") && !body.at("args").is_null()) {
+            const json & a = body.at("args");
+            if (!a.is_array()) {
+                throw std::invalid_argument("args must be an array of strings, e.g. [\"-c\", \"8192\"]");
+            }
+            for (const auto & v : a) {
+                if (!v.is_string()) {
+                    throw std::invalid_argument("args must be an array of strings, e.g. [\"-c\", \"8192\"]");
+                }
+                args.push_back(v.get<std::string>());
+            }
+        }
+
+        std::map<std::string, std::string> env;
+        if (body.contains("env") && !body.at("env").is_null()) {
+            const json & e = body.at("env");
+            if (!e.is_object()) {
+                throw std::invalid_argument("env must be an object of strings, e.g. {\"GGML_CUDA_NO_PINNED\": \"1\"}");
+            }
+            for (const auto & [key, value] : e.items()) {
+                if (!value.is_string()) {
+                    throw std::invalid_argument(string_format("env '%s' must be a string", key.c_str()));
+                }
+                env[key] = value.get<std::string>();
+            }
+        }
+
+        bool reload = false;
+        if (body.contains("reload") && !body.at("reload").is_null()) {
+            if (!body.at("reload").is_boolean()) {
+                throw std::invalid_argument("reload must be true or false");
+            }
+            reload = body.at("reload").get<bool>();
+        }
+
+        json out = models.preset_save(name, args, env, reload);
+        res_ok(res, {
+            {"success", true},
+            {"model",   name},
+            {"args",    args},
+            {"env",     env},
+            {"applied", out.at("applied")},
+            {"command", out.at("command")},
+        });
+        return res;
+    };
+
+    // [TAG_MODEL_PRESET] GET /models/preset?model=<id>
+    this->get_router_models_preset = [this, preset_model_name](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        const std::string name = preset_model_name(req.get_param("model"));
+        auto saved = models.preset_get(name);
+        if (!saved.has_value()) {
+            res_err(res, format_error_response(string_format("no preset is saved for model '%s'", name.c_str()), ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        json out = {
+            {"model", name},
+            {"args",  saved->args},
+            {"env",   saved->env},
+            {"saved", saved->saved},
+        };
+        if (!saved->error.empty()) {
+            out["error"] = saved->error; // read from the file but not applied
+        }
+        res_ok(res, out);
+        return res;
+    };
+
+    // [TAG_MODEL_PRESET] DELETE /models/preset?model=<id>, or the model in a JSON body
+    this->del_router_models_preset = [this, preset_model_name](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        std::string name = req.get_param("model");
+        if (name.empty() && !req.body.empty()) {
+            json body = json::parse(req.body);
+            if (body.is_object()) {
+                name = json_value(body, "model", std::string());
+            }
+        }
+        name = preset_model_name(name);
+        auto applied = models.preset_remove(name);
+        if (!applied.has_value()) {
+            res_err(res, format_error_response(string_format("no preset is saved for model '%s'", name.c_str()), ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        res_ok(res, {
+            {"success", true},
+            {"model",   name},
+            {"applied", *applied},
+        });
         return res;
     };
 

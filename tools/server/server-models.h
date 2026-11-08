@@ -92,6 +92,10 @@ struct server_model_meta {
     // only populated with --models-memory-margin, see server_models_sched
     server_model_memory_info memory = {};
 
+    // [TAG_MODEL_PRESET] the preset from the INI, the cache, the models dir and the router CLI, before the saved
+    // preset (POST /models/preset) is laid over it: a new or removed saved preset is applied on top of this
+    common_preset preset_base = {};
+
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;
     }
@@ -157,6 +161,40 @@ private:
     void delete_partials(const std::vector<common_download_partial> & parts);
 };
 
+// [TAG_MODEL_PRESET] a model's recipe saved through POST /models/preset: the flags and env vars it runs with.
+// It replaces any earlier saved preset of the model and wins over what the INI, the cache, the models dir
+// and the router CLI say for the same options
+struct server_saved_preset {
+    std::vector<std::string>           args;   // CLI form, as posted
+    std::map<std::string, std::string> env;    // an empty value keeps that variable from the child
+    std::string                        saved;  // ISO 8601 time of the save, UTC
+    common_preset                      preset; // the args parsed
+    std::string                        error;  // why a preset read from the file is not applied, empty when it is
+};
+
+// [TAG_MODEL_PRESET] the saved presets, in rdna-fast-presets.json next to the model cache, so they outlive the
+// router and reach a model that is still downloading when it is saved
+// these functions are thread-safe
+struct server_saved_presets {
+    // read the file an earlier run left; an entry that no longer parses is kept with its error, not applied
+    void load(const common_preset_context & ctx);
+
+    // save or replace the preset of a model and write the file; throws when the file cannot be written
+    void set(const std::string & model, const server_saved_preset & preset);
+
+    // forget the preset of a model and write the file; returns false when none is saved
+    bool remove(const std::string & model);
+
+    std::optional<server_saved_preset> get(const std::string & model);
+
+private:
+    std::mutex mutex;
+    std::map<std::string, server_saved_preset> presets;
+
+    // write the file back; callers hold the mutex
+    void save();
+};
+
 struct server_models_routes;
 struct server_monitor; // defined in server-models.cpp
 
@@ -184,6 +222,9 @@ private:
 
     // downloads that never finished, with the sidecar kinds they pull
     server_unfinished_downloads unfinished_downloads;
+
+    // [TAG_MODEL_PRESET] the presets saved through POST /models/preset, by model name
+    server_saved_presets saved_presets;
 
     // set to true while load_models() is executing a reload; load() will wait until clear
     bool is_reloading = false;
@@ -281,6 +322,18 @@ private:
     // notify SSE clients
     void notify_sse(const std::string & event, const std::string & model_id, const json & data = nullptr);
 
+    // [TAG_MODEL_PRESET] `base` with the saved preset of the model laid over it
+    common_preset with_saved_preset(const std::string & name, const common_preset & base);
+
+    // [TAG_MODEL_PRESET] put the saved preset (or its absence) into the meta of a listed model; returns false
+    // when the model is not listed yet or only as a download, the next list rebuild applies it then.
+    // `changed` tells whether the options differ from what the meta had
+    // not thread-safe, caller must hold mutex
+    bool apply_saved_preset(std::unique_lock<std::mutex> & lk, const std::string & name, bool & changed);
+
+    // [TAG_MODEL_PRESET] lay the saved env of a model over a child environment
+    void add_saved_env(const std::string & name, std::vector<std::string> & env);
+
 public:
     // conv_id -> model tracker for the resumable stream routes, owns its lock
     conv_model_tracker conv_models;
@@ -352,6 +405,19 @@ public:
     // note: only cache models can be removed; returns false if the model doesn't exist or is not a cache model
     bool remove(const std::string & name);
 
+    // [TAG_MODEL_PRESET] save the recipe of a model (thread-safe): the args are checked as llama-server options and
+    // the env names against the allowed prefixes, both throw std::invalid_argument. With reload, a running
+    // model is stopped and started again with it. Returns {"applied", "command"}, see POST /models/preset
+    json preset_save(const std::string & name, const std::vector<std::string> & args,
+                     const std::map<std::string, std::string> & env, bool reload);
+
+    // [TAG_MODEL_PRESET] the saved recipe of a model, if any (thread-safe)
+    std::optional<server_saved_preset> preset_get(const std::string & name);
+
+    // [TAG_MODEL_PRESET] drop the saved recipe of a model, its next load is back to its own preset (thread-safe)
+    // returns nullopt when none is saved, else when it applies ("next load" or "when the model appears")
+    std::optional<std::string> preset_remove(const std::string & name);
+
     // wait until the model instance is fully loaded (thread-safe)
     // note: predicate is called while holding the lock
     // return when the model no longer in "loading" state
@@ -420,6 +486,10 @@ struct server_models_routes {
     server_http_context::handler_t get_router_models_sse;
     server_http_context::handler_t post_router_models;
     server_http_context::handler_t del_router_models;
+    // [TAG_MODEL_PRESET] per-model presets: POST saves, GET reads, DELETE drops
+    server_http_context::handler_t post_router_models_preset;
+    server_http_context::handler_t get_router_models_preset;
+    server_http_context::handler_t del_router_models_preset;
 
     // router side handlers for the resumable streaming routes. each resolves the child that owns
     // a conversation through the conv_id -> model map, no probing or fan out

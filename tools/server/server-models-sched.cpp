@@ -422,6 +422,8 @@ void server_models_sched::measure_next() {
         std::vector<std::string> child_env = models.base_env;
         child_env.push_back(std::string(SERVER_ENV_ROUTER_PORT) + "=" + std::to_string(models.base_params.port));
         child_env.push_back(std::string(SERVER_ENV_CHILD_ROLE) + "=" + server_role_type_to_str(SERVER_ROLE_MEASURE));
+        // [TAG_MODEL_PRESET] same env as the instance: a GGML_/ROCMFPX_ knob may change what it allocates
+        models.add_saved_env(name, child_env);
 
         auto proc = std::make_shared<server_subproc>();
         if (!proc->sproc.create(child_args, subprocess_option_no_window, child_env)) {

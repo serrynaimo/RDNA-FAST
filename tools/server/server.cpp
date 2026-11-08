@@ -555,6 +555,10 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
     ctx_http.post("/models/unload",        ex_wrapper(loopback_only(models_routes->post_router_models_unload)));
     ctx_http.get ("/models/sse",           ex_wrapper(models_routes->get_router_models_sse));
     ctx_http.del ("/models",               ex_wrapper(loopback_only(models_routes->del_router_models)));
+    // [TAG_MODEL_PRESET] the flags and env vars a model runs with, saved by the UI's chat tool
+    ctx_http.post("/models/preset",        ex_wrapper(loopback_only(models_routes->post_router_models_preset)));
+    ctx_http.get ("/models/preset",        ex_wrapper(loopback_only(models_routes->get_router_models_preset)));
+    ctx_http.del ("/models/preset",        ex_wrapper(loopback_only(models_routes->del_router_models_preset)));
 
     // Jev-style classifier routes: proxied to the child named by the request's "model" (e.g. a CPU child with --classifier-head)
     ctx_http.post("/v1/classifier", ex_wrapper(models_routes->proxy_post_classifier));
