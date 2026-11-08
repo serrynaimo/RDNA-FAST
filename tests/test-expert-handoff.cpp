@@ -848,7 +848,7 @@ static int run_upload_engine_test() {
 
 // the speed: Flash-Next-sized expert pieces (450 KiB) from pageable host memory into VRAM, gathered 64 per graph
 // split as the scheduler would ask, against one plain pageable upload per piece (what the scheduler did before)
-static int run_upload_bench(size_t mib, const ggml_upload_engine_params & up) {
+static int run_upload_bench(size_t mib, const ggml_upload_engine_params & up, int n_mm) {
     ggml_backend_load_all();
     ggml_backend_t gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
     if (gpu == nullptr) { fprintf(stderr, "no GPU backend\n"); return 1; }
@@ -902,9 +902,59 @@ static int run_upload_bench(size_t mib, const ggml_upload_engine_params & up) {
         ggml_upload_engine_stats st = {};
         ue.stats(eng, &st);
         printf("  %.2f GB: plain %.2f s (%.2f GB/s), engine %.2f s (%.2f GB/s) in %llu DMAs; copies %.2f s, issuer waited "
-            "%.2f s for copies, %.2f s for ring; gathers waited %.2f s\n", host.size()/1e9, t_plain, host.size()/1e9/t_plain,
-            t_eng, host.size()/1e9/t_eng, (unsigned long long) st.n_dma, st.copy_ns/1e9, st.wait_copy_ns/1e9,
-            st.wait_ring_ns/1e9, st.wait_gather_ns/1e9);
+            "%.2f s for copies, %.2f s for ring; gathers waited %.2f s; runtime calls: issuer %.2f s, gathers %.2f s\n",
+            host.size()/1e9, t_plain, host.size()/1e9/t_plain, t_eng, host.size()/1e9/t_eng, (unsigned long long) st.n_dma,
+            st.copy_ns/1e9, st.wait_copy_ns/1e9, st.wait_ring_ns/1e9, st.wait_gather_ns/1e9, st.issue_call_ns/1e9,
+            st.gather_call_ns/1e9);
+
+        // with work on the stream between the gathers, as a prompt's layers have: do the copies overlap it?
+        if (n_mm > 0 && rep == 1) {
+            ggml_init_params cp = { (size_t) (n_mm + 4)*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+            ggml_context * cctx = ggml_init(cp);
+            ggml_tensor * a = ggml_new_tensor_2d(cctx, GGML_TYPE_F16, 4096, 4096);
+            ggml_tensor * b = ggml_new_tensor_2d(cctx, GGML_TYPE_F32, 4096, 512);
+            ggml_cgraph * gf = ggml_new_graph(cctx);
+            for (int k = 0; k < n_mm; ++k) {
+                ggml_build_forward_expand(gf, ggml_mul_mat(cctx, a, b));
+            }
+            ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu));
+            ggml_backend_buffer_t cbuf = ggml_backend_alloc_ctx_tensors(cctx, gpu);
+            ggml_gallocr_alloc_graph(ga, gf);
+            const size_t n_g = (n_pieces + per_gather - 1)/per_gather;
+            auto tc0 = std::chrono::steady_clock::now();
+            for (size_t g = 0; g < n_g; ++g) {
+                ggml_backend_graph_compute_async(gpu, gf);
+            }
+            ggml_backend_synchronize(gpu);
+            const double t_comp = std::chrono::duration<double>(std::chrono::steady_clock::now() - tc0).count();
+
+            ggml_upload_engine_t eng2 = ue.make(gpu, &up);
+            tc0 = std::chrono::steady_clock::now();
+            for (size_t i = 0; i < n_pieces; ++i) {
+                ids[i] = ue.push(eng2, host.data() + order[i]*piece, piece);
+            }
+            for (size_t g0 = 0; g0 < n_pieces; g0 += per_gather) {
+                cps.clear();
+                for (size_t i = g0; i < std::min(n_pieces, g0 + per_gather); ++i) {
+                    cps.push_back({ ids[i], nullptr, (i - g0)*piece, piece });
+                }
+                ue.gather(eng2, gpu, dst->data, cps.data(), (int) cps.size());
+                ggml_backend_graph_compute_async(gpu, gf);
+            }
+            ggml_backend_synchronize(gpu);
+            const double t_both = std::chrono::duration<double>(std::chrono::steady_clock::now() - tc0).count();
+            ue.reset(eng2);
+            ggml_upload_engine_stats s2 = {};
+            ue.stats(eng2, &s2);
+            printf("  with %d matmuls after each gather: copies alone %.2f s, compute alone %.2f s, both %.2f s "
+                "(overlapped: %.2f s, serial: %.2f s); runtime calls: issuer %.2f s, gathers %.2f s; issuer waited %.2f s "
+                "for ring\n", n_mm, t_eng, t_comp, t_both, std::max(t_eng, t_comp), t_eng + t_comp, s2.issue_call_ns/1e9,
+                s2.gather_call_ns/1e9, s2.wait_ring_ns/1e9);
+            ue.free(eng2);
+            ggml_gallocr_free(ga);
+            ggml_backend_buffer_free(cbuf);
+            ggml_free(cctx);
+        }
         ue.free(eng);
     }
     ggml_backend_buffer_free(buf);
@@ -994,7 +1044,8 @@ int main(int argc, char ** argv) {
                 up.n_stage     = atoi(argv[i + 4]);
                 up.n_threads   = atoi(argv[i + 5]);
             }
-            return run_upload_bench(mib, up);
+            const int n_mm = i + 6 < argc ? atoi(argv[i + 6]) : 0;
+            return run_upload_bench(mib, up, n_mm);
         }
         if (strcmp(argv[i], "--bench-gpu") == 0) {
             // the round trip on the device: 48 layers of send -> join in one graph, Flash-Next's expert shape, the

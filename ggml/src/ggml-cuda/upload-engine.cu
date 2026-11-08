@@ -97,6 +97,7 @@ struct ggml_upload_engine {
         uint64_t vend = 0;
         bool     closed = false;  // no more pieces: the copy threads may take it
         bool     copied = false;  // in its staging buffer
+        int64_t  left   = 0;      // pieces not yet copied, once admitted
     };
     // a gather's end: the ring before position v and the table before tpos are free once ev has completed
     struct done {
@@ -132,7 +133,8 @@ struct ggml_upload_engine {
     std::deque<job>         jobs;        // jobs[j - j_base]
     int64_t                 j_base = 0;
     int64_t                 n_jobs = 0;      // jobs made (the last may be open)
-    int64_t                 n_claimed = 0;   // taken by a copy thread
+    int64_t                 n_claimed = 0;   // admitted: its staging buffer is free, its pieces are in `work`
+    std::deque<int64_t>     work;            // pieces of admitted jobs not yet taken by a copy thread
     int64_t                 n_issued = 0;    // DMA queued
     int64_t                 claim_limit = INT64_MAX; // reset(): no claims at or past this
     uint64_t                vhead = 0;       // ring position of the next job
@@ -145,7 +147,7 @@ struct ggml_upload_engine {
     std::thread              issuer;
 
     std::atomic<uint64_t> st_pieces{0}, st_dma{0}, st_bytes{0}, st_gathers{0}, st_copy{0}, st_wait_ring{0},
-                          st_wait_copy{0}, st_wait_gather{0}, st_dropped{0};
+                          st_wait_copy{0}, st_wait_gather{0}, st_dropped{0}, st_issue_call{0}, st_gather_call{0};
 
     piece & P(int64_t i) { return pieces[(size_t) (i - p_base)]; }
     job   & J(int64_t j) { return jobs[(size_t) (j - j_base)]; }
@@ -266,39 +268,60 @@ struct ggml_upload_engine {
         return ip;
     }
 
-    // the copy threads: a closed job into its staging buffer, once the DMA that last read the buffer is done
+    // under mtx: the next job may get its staging buffer (closed, not past a reset, the buffer's last DMA queued)
+    bool can_admit() {
+        return n_claimed < n_jobs && n_claimed < claim_limit && J(n_claimed).closed &&
+               (n_claimed < p.n_stage || n_issued > n_claimed - p.n_stage);
+    }
+
+    // the copy threads take single pieces, so a job's pieces are copied by several threads at once: a piece read from
+    // the mapped file blocks its thread on page faults (the SSD), and with whole jobs per thread a few such pieces held
+    // up every buffer behind them (a first prompt after a load: ~0.5 GB/s per thread). A thread that finds no piece
+    // admits the next job: it waits for the DMA that last read the job's buffer, then queues the job's pieces.
     void copy_main() {
         ggml_cuda_set_device(device);
         std::unique_lock<std::mutex> lk(mtx);
         for (;;) {
-            cv.wait(lk, [&] {
-                return stop || (n_claimed < n_jobs && n_claimed < claim_limit && J(n_claimed).closed &&
-                                (n_claimed < p.n_stage || n_issued > n_claimed - p.n_stage));
-            });
+            cv.wait(lk, [&] { return stop || !work.empty() || can_admit(); });
             if (stop) {
                 return;
             }
+            if (!work.empty()) {
+                const int64_t ip = work.front();
+                work.pop_front();
+                const piece & pc = P(ip);
+                const int64_t j = pc.job;
+                uint8_t * dst = stage[(size_t) (j % p.n_stage)] + pc.job_off;
+                const uint8_t * src = pc.src;
+                const size_t bytes = pc.bytes;
+                lk.unlock();
+                const int64_t t0 = ue_now_ns();
+                memcpy(dst, src, bytes);
+                st_copy.fetch_add((uint64_t) (ue_now_ns() - t0), std::memory_order_relaxed);
+                lk.lock();
+                if (--J(j).left == 0) {
+                    J(j).copied = true;
+                    cv.notify_all();
+                }
+                continue;
+            }
             const int64_t j = n_claimed++;
-            const int s = (int) (j % p.n_stage);
             // the buffer's last DMA (job j - n_stage) was queued; its event is not recorded again before job j is
             // issued (n_job_ev >= n_stage)
             cudaEvent_t prev = j >= p.n_stage ? job_ev[(size_t) ((j - p.n_stage) % n_job_ev)] : nullptr;
-            struct cp { const uint8_t * src; size_t off; size_t bytes; };
-            std::vector<cp> cps;
-            for (int64_t i = J(j).p0; i < J(j).p1; ++i) {
-                cps.push_back({ P(i).src, P(i).job_off, P(i).bytes });
-            }
             lk.unlock();
             if (prev) {
                 CUDA_CHECK(cudaEventSynchronize(prev));
             }
-            const int64_t t0 = ue_now_ns();
-            for (const cp & c : cps) {
-                memcpy(stage[s] + c.off, c.src, c.bytes);
-            }
-            st_copy.fetch_add((uint64_t) (ue_now_ns() - t0), std::memory_order_relaxed);
             lk.lock();
-            J(j).copied = true;
+            job & jb = J(j);
+            jb.left = jb.p1 - jb.p0;
+            for (int64_t i = jb.p0; i < jb.p1; ++i) {
+                work.push_back(i);
+            }
+            if (jb.left == 0) {
+                jb.copied = true;
+            }
             cv.notify_all();
         }
     }
@@ -351,11 +374,13 @@ struct ggml_upload_engine {
             // outside the lock: under WDDM these calls take tens of microseconds each. The job stays (reset() waits
             // for it); if a gather recycles wait_ev meanwhile, the wait covers a later gather, which is only stricter
             lk.unlock();
+            const int64_t tc = ue_now_ns();
             if (wait_ev) {
                 CUDA_CHECK(cudaStreamWaitEvent(stream, wait_ev, 0));
             }
             CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream));
             CUDA_CHECK(cudaEventRecord(job_ev[(size_t) (j % n_job_ev)], stream));
+            st_issue_call.fetch_add((uint64_t) (ue_now_ns() - tc), std::memory_order_relaxed);
             lk.lock();
             n_issued = j + 1;
             st_pieces.fetch_add((uint64_t) np, std::memory_order_relaxed);
@@ -427,7 +452,9 @@ struct ggml_upload_engine {
                     return false;
                 }
                 st_wait_gather.fetch_add((uint64_t) (ue_now_ns() - t0), std::memory_order_relaxed);
+                const int64_t tc = ue_now_ns();
                 CUDA_CHECK(cudaStreamWaitEvent(cs, job_ev[(size_t) (jl % n_job_ev)], 0));
+                st_gather_call.fetch_add((uint64_t) (ue_now_ns() - tc), std::memory_order_relaxed);
             }
             // the table: its slots must not be read by a gather still in flight
             const int64_t nt = i1 - i0;
@@ -461,6 +488,7 @@ struct ggml_upload_engine {
                 max_bytes = std::max<uint64_t>(max_bytes, e.bytes);
             }
             tpos = t + nt;
+            const int64_t tc = ue_now_ns();
             if (nt > 0 && max_bytes > 0) {
                 const dim3 grid((unsigned) nt, (unsigned) ((max_bytes + ue_chunk - 1)/ue_chunk), 1);
                 k_ue_gather<<<grid, 256, 0, cs>>>(te);
@@ -481,6 +509,7 @@ struct ggml_upload_engine {
             CUDA_CHECK(cudaEventRecord(ev_cs, cs));
             CUDA_CHECK(cudaStreamWaitEvent(dstream, ev_cs, 0));
             CUDA_CHECK(cudaEventRecord(ev, dstream));
+            st_gather_call.fetch_add((uint64_t) (ue_now_ns() - tc), std::memory_order_relaxed);
             dones.push_back({ consumed_v(), tpos, ev });
             // keep the queue short: a record is implied by a later one once the issuer no longer needs to tell them apart
             while (dones.size() > 64) {
@@ -577,4 +606,6 @@ void ggml_backend_cuda_upload_engine_get_stats(ggml_upload_engine_t eng, ggml_up
     st->wait_copy_ns   = eng->st_wait_copy.load();
     st->wait_gather_ns = eng->st_wait_gather.load();
     st->dropped        = eng->st_dropped.load();
+    st->issue_call_ns  = eng->st_issue_call.load();
+    st->gather_call_ns = eng->st_gather_call.load();
 }

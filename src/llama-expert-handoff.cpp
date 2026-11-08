@@ -510,7 +510,10 @@ struct llama_expert_handoff::impl {
                 up.ring_bytes  = (size_t) eh_env_int("ROCMFPX_EH_RING_MIB", 128) << 20;
                 up.stage_bytes = (size_t) eh_env_int("ROCMFPX_EH_STAGE_MIB", 16) << 20;
                 up.n_stage     = (int) eh_env_int("ROCMFPX_EH_STAGES", 8);
-                up.n_threads   = (int) eh_env_int("ROCMFPX_EH_COPY_THREADS", 4);
+                // Flash-Next, 2026-11-08: 16 threads (copying single experts) read the experts outside the RAM copy
+                // from the SSD fast enough for a cold ~700-token prompt in 8.2 s (4 threads: 12.6 s); from RAM alone 4
+                // are ~4% faster (3.8k tokens 269 vs 257 t/s)
+                up.n_threads   = (int) eh_env_int("ROCMFPX_EH_COPY_THREADS", 16);
                 for (const group & g : groups) { // a staging buffer holds at least one expert of any tensor
                     for (const ggml_tensor * t : g.ref) {
                         up.stage_bytes = std::max(up.stage_bytes, eh_expert_stride(t));
@@ -1717,16 +1720,19 @@ struct llama_expert_handoff::impl {
                         us.n_pieces += s.n_pieces; us.n_dma += s.n_dma; us.bytes += s.bytes; us.n_gathers += s.n_gathers;
                         us.copy_ns += s.copy_ns; us.wait_ring_ns += s.wait_ring_ns; us.wait_copy_ns += s.wait_copy_ns;
                         us.wait_gather_ns += s.wait_gather_ns; us.dropped += s.dropped;
+                        us.issue_call_ns += s.issue_call_ns; us.gather_call_ns += s.gather_call_ns;
                     }
                 }
                 if (us.bytes > up_last.bytes) {
                     LLAMA_LOG_WARN("%s: uploads: %" PRIu64 " graphs, %.2f GB in %" PRIu64 " DMAs (%" PRIu64 " experts), %" PRIu64
                         " gathers; host copies %.1f s (all threads), the issuer waited %.1f s for copies and %.1f s for ring "
-                        "space, the graphs %.1f s for DMAs; %" PRIu64 " experts dropped, %" PRIu64 " uploads not planned\n",
+                        "space, the graphs %.1f s for DMAs; in runtime calls: issuer %.1f s, gathers %.1f s; %" PRIu64
+                        " experts dropped, %" PRIu64 " uploads not planned\n",
                         __func__, n_up_graphs - n_up_graphs_last, (us.bytes - up_last.bytes)/1e9, us.n_dma - up_last.n_dma,
                         us.n_pieces - up_last.n_pieces, us.n_gathers - up_last.n_gathers, (us.copy_ns - up_last.copy_ns)/1e9,
                         (us.wait_copy_ns - up_last.wait_copy_ns)/1e9, (us.wait_ring_ns - up_last.wait_ring_ns)/1e9,
-                        (us.wait_gather_ns - up_last.wait_gather_ns)/1e9, us.dropped - up_last.dropped, n_up_fallback);
+                        (us.wait_gather_ns - up_last.wait_gather_ns)/1e9, (us.issue_call_ns - up_last.issue_call_ns)/1e9,
+                        (us.gather_call_ns - up_last.gather_call_ns)/1e9, us.dropped - up_last.dropped, n_up_fallback);
                 }
                 up_last = us;
                 n_up_graphs_last = n_up_graphs;

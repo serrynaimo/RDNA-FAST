@@ -133,6 +133,8 @@ struct ggml_upload_engine_stats {
     uint64_t wait_copy_ns;    // the issuer waiting for host copies (the host memory is the bottleneck)
     uint64_t wait_gather_ns;  // gathers waiting on the host for their pieces' DMAs to be sent
     uint64_t dropped;         // pieces pushed and never gathered
+    uint64_t issue_call_ns;   // the issuer's time inside the runtime's calls (stream wait, DMA, event record)
+    uint64_t gather_call_ns;  // the gathers' time inside the runtime's calls (stream waits, kernel, event records)
 };
 
 typedef ggml_upload_engine_t (*ggml_upload_engine_new_t)      (void * backend, const struct ggml_upload_engine_params * params);
