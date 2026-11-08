@@ -335,8 +335,8 @@ Off unless `--cache-disk` is given. Everything else has a working default.
 
 | flag | default | meaning |
 |---|---|---|
-| `--cache-disk PATH` | off | cache directory. Put it on an NVMe. |
-| `--cache-disk-limit N` | 8192 | size limit in MiB; least recently used entries go first. A 16k-token entry is ~0.65 GB with one checkpoint, a 45k-token one ~1.8 GB with four. |
+| `--cache-disk PATH` | off | cache directory. Put it on an NVMe. Every model can use the same one: each keeps its own entries. |
+| `--cache-disk-limit N` | 8192 | size limit in MiB for the whole directory; least recently used entries go first, other models' before the running one's. A 16k-token entry is ~0.65 GB with one checkpoint, a 45k-token one ~1.8 GB with four. |
 | `--cache-disk-checkpoints N` | -1 (all) | checkpoints written with each entry, newest first. More let a prompt that diverges mid-history resume closer to the divergence. |
 | `--cache-disk-prefix-step N` | 4096 | spacing of the shared system-prompt entries; 0 disables them. |
 | `--cache-disk-min-tokens N` | 2048 | shorter prompts (keep-alive pings, title requests) are never written. |

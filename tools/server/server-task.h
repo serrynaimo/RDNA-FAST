@@ -851,14 +851,16 @@ struct server_prompt_cache {
     // directory's entries only when its identity matches exactly.
     std::string disk_identity;
 
-    // [TAG_CACHE_ALL_MODELS] the abandoned run directories of other identities (other models, or this model with
-    // other settings), oldest first: kept for their model, and counted against the limit, which covers the whole
-    // cache directory. When room is needed they go first, the oldest first, before any entry of this run's model.
-    struct foreign_dir {
-        std::string path;
-        size_t      bytes = 0;
+    // [TAG_CACHE_ALL_MODELS] the entries other identities (other models, or this model with other settings) left in
+    // their abandoned run directories, oldest first: kept for their model, and counted against the limit, which covers
+    // the whole cache directory. When room is needed they go first, one entry at a time, the oldest first, before any
+    // entry of this run's model; a directory goes with its last entry.
+    struct foreign_entry {
+        std::string              dir;   // its run directory
+        std::vector<std::string> files; // state-<id>-*: target, draft, spec, checkpoints (and a crash's temporaries)
+        size_t                   bytes = 0;
     };
-    std::vector<foreign_dir> disk_foreign;
+    std::vector<foreign_entry> disk_foreign;
     size_t disk_foreign_bytes = 0;
 
 #if defined(_WIN32)
@@ -1002,8 +1004,8 @@ private:
 
     bool erase_disk_state(std::list<server_prompt_disk_state>::iterator it, bool eviction, const char * reason);
 
-    // removes the oldest run directory of another identity; false when none is left
-    bool evict_foreign_dir(const char * reason);
+    // removes the oldest entry of another identity (its directory with its last one); false when none is left
+    bool evict_foreign_entry(const char * reason);
 
     void disable_disk_saves(const char * reason, const std::string & path);
 

@@ -61,7 +61,7 @@ VRAM, Gemma 4 with half its experts on the CPU has a KL divergence of about 0.08
 | --- | --- | --- |
 | `--expert-cache N\|auto` | off | Turns expert handoff on with a VRAM cache of `N` experts (in units of the model's largest expert), or `auto` for the free VRAM less `--vram-reserve-mib`. |
 | `--moe-cache-mib N` | off | The same with a cache of `N` MiB. |
-| `--vram-reserve-mib N` | 1024 | VRAM that `auto` leaves free beyond the compute buffers. |
+| `--vram-reserve-mib N` | 1024 | VRAM that `auto` leaves free beyond the compute buffers and a draft model (MTP, DFlash and the like), which are counted first. |
 | `--expert-profile FILE` | none | Starts the cache with the experts this file ranks most used ([Profiles](#profiles)). |
 | `--expert-profile-save FILE` | none | Writes the routing counts of this run (plus those of `--expert-profile`) to `FILE` every 30 s of use and at exit. |
 | `--ram-keep-gib N` | 4 | RAM left free for everything else. The experts the VRAM cache misses are copied into the rest, the most used first. |

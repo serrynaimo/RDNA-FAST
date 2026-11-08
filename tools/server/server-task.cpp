@@ -2170,10 +2170,10 @@ server_prompt_cache::server_prompt_cache(
     // ---- adopt entries from abandoned run directories (survive server restarts) ----
     // A run directory is abandoned when its lock is no longer held (POSIX: flock
     // succeeds; Windows: the deny-all .lock can be opened). Entries whose identity
-    // matches ours are MOVED into this run's directory and registered; the stale
-    // directories of other identities are kept for their model and counted against the
-    // limit ([TAG_CACHE_ALL_MODELS]): a prod that switches between models keeps every
-    // model's cache, and the first room needed takes them. Every adopted entry is still fully validated by
+    // matches ours are MOVED into this run's directory and registered; the entries in
+    // stale directories of other identities are kept for their model and counted against
+    // the limit ([TAG_CACHE_ALL_MODELS]): a prod that switches between models keeps every
+    // model's cache, and room is made from their oldest entries first. Every adopted entry is still fully validated by
     // load_disk() on first use (sizes, tokens, and llama's own state-file checks), so
     // a damaged file can at worst cost one rejected restore.
     struct adopted_t {
@@ -2184,10 +2184,11 @@ server_prompt_cache::server_prompt_cache(
     size_t n_stale_removed = 0;
     size_t n_adopt_bytes = 0;
     struct foreign_t {
-        foreign_dir        d;
-        fs::file_time_type mtime; // its newest file: when its model last used it
+        foreign_entry      e;
+        fs::file_time_type mtime = fs::file_time_type::min(); // its newest file: when its model last used it
     };
     std::vector<foreign_t> foreign;
+    size_t n_foreign_dirs = 0;
 
     std::error_code sc;
     for (const auto & entry : fs::directory_iterator(cache_root, sc)) {
@@ -2255,24 +2256,53 @@ server_prompt_cache::server_prompt_cache(
             continue;
         }
         if (!same_identity) {
-            // another model's (or settings') entries: kept, and counted against the limit
-            foreign_t fd;
-            fd.d.path = stale_path;
-            fd.mtime  = fs::file_time_type::min();
+            // another model's (or settings') entries: kept one by one, and counted against the limit. An entry is all
+            // the files of one state-<id>
+            std::vector<std::pair<std::string, foreign_t>> by_stem;
             std::error_code fec;
             for (const auto & f : fs::directory_iterator(entry.path(), fec)) {
                 if (fec) {
                     break;
                 }
                 std::error_code zec;
-                const auto sz = f.is_regular_file(zec) ? fs::file_size(f.path(), zec) : 0;
-                fd.d.bytes += zec ? 0 : (size_t) sz;
+                if (!f.is_regular_file(zec)) {
+                    continue;
+                }
+                const std::string fname = server_prompt_cache_disk_path_utf8(f.path().filename());
+                const size_t dash = fname.rfind("state-", 0) == 0 ? fname.find('-', 6) : std::string::npos;
+                if (dash == std::string::npos) {
+                    continue;
+                }
+                const std::string stem = fname.substr(0, dash);
+                auto it = std::find_if(by_stem.begin(), by_stem.end(), [&](const auto & p) { return p.first == stem; });
+                if (it == by_stem.end()) {
+                    by_stem.emplace_back(stem, foreign_t{});
+                    it = by_stem.end() - 1;
+                    it->second.e.dir = stale_path;
+                }
+                foreign_t & fe = it->second;
+                fe.e.files.push_back(server_prompt_cache_disk_path_utf8(f.path()));
+                const auto sz = fs::file_size(f.path(), zec);
+                fe.e.bytes += zec ? 0 : (size_t) sz;
                 const auto mt = fs::last_write_time(f.path(), zec);
-                if (!zec && mt > fd.mtime) {
-                    fd.mtime = mt;
+                if (!zec && mt > fe.mtime) {
+                    fe.mtime = mt;
                 }
             }
-            foreign.push_back(std::move(fd));
+            if (by_stem.empty()) {
+                std::error_code rm_ec;
+                const auto removed = fs::remove_all(entry.path(), rm_ec);
+                if (!rm_ec) {
+                    n_stale_removed++;
+                    SRV_INF("prompt cache disk stale cleanup: path=%s files=%zu reason=no-entries\n",
+                            stale_path.c_str(), (size_t) removed);
+                }
+                continue;
+            }
+            n_foreign_dirs++;
+            for (auto & p : by_stem) {
+                foreign.push_back(std::move(p.second));
+            }
             continue;
         }
 
@@ -2401,8 +2431,8 @@ server_prompt_cache::server_prompt_cache(
 
     std::sort(foreign.begin(), foreign.end(), [](const foreign_t & a, const foreign_t & b) { return a.mtime < b.mtime; });
     for (auto & f : foreign) {
-        disk_foreign_bytes += f.d.bytes;
-        disk_foreign.push_back(std::move(f.d));
+        disk_foreign_bytes += f.e.bytes;
+        disk_foreign.push_back(std::move(f.e));
     }
     if (!adopted.empty()) {
         std::sort(adopted.begin(), adopted.end(), [](const adopted_t & a, const adopted_t & b) { return a.mtime < b.mtime; });
@@ -2413,28 +2443,37 @@ server_prompt_cache::server_prompt_cache(
     }
     // respect the size limit, which covers the other models' entries too: those go first, then this model's oldest
     while (disk_limit_size > 0 && disk_size_total + disk_foreign_bytes > disk_limit_size) {
-        if (evict_foreign_dir("adopt-limit")) {
+        if (evict_foreign_entry("adopt-limit")) {
             continue;
         }
         if (disk_states.empty() || !erase_disk_state(disk_states.begin(), true, "adopt-limit")) {
             break;
         }
     }
-    SRV_INF("prompt cache disk adopted %zu entries (%zu bytes) from previous runs; kept %zu dirs of other models (%zu bytes); stale dirs removed: %zu\n",
-            adopted.size(), n_adopt_bytes, disk_foreign.size(), disk_foreign_bytes, n_stale_removed);
+    SRV_INF("prompt cache disk adopted %zu entries (%zu bytes) from previous runs; kept %zu entries of other models in %zu dirs (%zu bytes); stale dirs removed: %zu\n",
+            adopted.size(), n_adopt_bytes, disk_foreign.size(), n_foreign_dirs, disk_foreign_bytes, n_stale_removed);
 }
 
-bool server_prompt_cache::evict_foreign_dir(const char * reason) {
+bool server_prompt_cache::evict_foreign_entry(const char * reason) {
     if (disk_foreign.empty()) {
         return false;
     }
-    const foreign_dir d = disk_foreign.front();
+    const foreign_entry e = disk_foreign.front();
     disk_foreign.erase(disk_foreign.begin());
-    disk_foreign_bytes -= std::min(disk_foreign_bytes, d.bytes);
-    std::error_code ec;
-    fs::remove_all(fs::u8path(d.path), ec);
-    SRV_INF("prompt cache disk evicted another model's entries: reason=%s path=%s bytes=%zu%s\n",
-            reason, d.path.c_str(), d.bytes, ec ? " (not all files removed)" : "");
+    disk_foreign_bytes -= std::min(disk_foreign_bytes, e.bytes);
+    bool ok = true;
+    for (const auto & f : e.files) {
+        ok = server_prompt_cache_disk_remove_file(f) && ok;
+    }
+    // the directory goes with its last entry
+    const bool last = std::none_of(disk_foreign.begin(), disk_foreign.end(), [&](const foreign_entry & o) { return o.dir == e.dir; });
+    if (last) {
+        std::error_code ec;
+        fs::remove_all(fs::u8path(e.dir), ec);
+    }
+    SRV_INF("prompt cache disk evicted another model's entry: reason=%s dir=%s files=%zu bytes=%zu%s%s\n",
+            reason, e.dir.c_str(), e.files.size(), e.bytes, last ? " (its last: directory removed)" : "",
+            ok ? "" : " (not all files removed)");
     return true;
 }
 
@@ -2669,7 +2708,7 @@ bool server_prompt_cache::save_disk(
             return sec ? SIZE_MAX : (size_t) sp.available;
         };
         while (available() < predicted_total + keep_free) {
-            if (evict_foreign_dir("disk-space")) {
+            if (evict_foreign_entry("disk-space")) {
                 continue;
             }
             if (disk_states.empty() || !erase_disk_state(disk_states.begin(), true, "disk-space")) {
@@ -2931,7 +2970,7 @@ bool server_prompt_cache::save_disk(
     }
 
     while (reclaim_ok && disk_size_total + disk_foreign_bytes > disk_limit_size) {
-        if (evict_foreign_dir("lru-limit")) {
+        if (evict_foreign_entry("lru-limit")) {
             continue;
         }
         if (disk_states.begin() == new_entry) {
@@ -3280,7 +3319,7 @@ void server_prompt_cache::update_disk() {
     bool changed = false;
 
     while (disk_size_total + disk_foreign_bytes > disk_limit_size) {
-        if (evict_foreign_dir("lru-update-limit")) {
+        if (evict_foreign_entry("lru-update-limit")) {
             changed = true;
             continue;
         }

@@ -51,7 +51,7 @@ cache. [More](expert-handoff.md)
 |---|---|---|
 | `--expert-cache N\|auto` | off | turns expert handoff on with a VRAM cache of `N` experts (in units of the model's largest expert), or `auto` for the free VRAM less `--vram-reserve-mib` |
 | `--moe-cache-mib N` | off | the same with a cache of `N` MiB |
-| `--vram-reserve-mib N` | 1024 | VRAM that `auto` leaves free beyond the compute buffers, which are sized first |
+| `--vram-reserve-mib N` | 1024 | VRAM that `auto` leaves free beyond the compute buffers and a draft model (MTP, DFlash and the like), which are sized first |
 | `--pool-workers N` | one per physical core but one | CPU threads that compute the experts the cache misses |
 | `--adapt-every N` | 4 | every `N` decode steps, the most used experts outside the cache replace the least used ones in it; 0 keeps the cache as it started |
 | `--adapt-swaps N` | 96 | the most experts swapped per round |
