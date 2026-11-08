@@ -284,6 +284,8 @@ extern "C" {
     // if the user returns false the scheduler simply copies the entire weight
     // the callback is called only for input weights in host buffers
     // the callback is called after all non-weight inputs of the split have been copied
+    // ROCmFPX [TAG_EH_COPY_ENGINE]: it is called before the scheduler waits for the backend to finish reading the
+    // previous contents of `dst`: it must write `dst` on `backend`'s stream (ordered after those reads), or wait itself
     // `src` is the tensor in the previous split
     // `dst` is the copy of `src` in the split
     // `graph` is the compute graph of the split

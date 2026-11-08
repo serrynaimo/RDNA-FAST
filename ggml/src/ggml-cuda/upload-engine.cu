@@ -111,6 +111,11 @@ struct ggml_upload_engine {
     uint8_t *              ring = nullptr;
     std::vector<uint8_t *> stage;
     cudaStream_t           stream = nullptr;
+    // the gathers' done events are recorded here, after a wait on the compute stream: HIP rejects a wait on an event
+    // whose stream is capturing a graph at the time of the wait ("dependency created on uncaptured work in another
+    // stream", the issuer while ggml-cuda captured a prompt split), and this stream never captures
+    cudaStream_t           dstream = nullptr;
+    cudaEvent_t            ev_cs   = nullptr;  // the compute stream's point, for dstream to wait on
     static constexpr int   n_job_ev = 1024;
     std::vector<cudaEvent_t> job_ev;     // [job % n_job_ev]: the job's DMA is done
     std::vector<cudaEvent_t> free_ev;    // for the gathers' done records
@@ -171,6 +176,8 @@ struct ggml_upload_engine {
             stage.push_back((uint8_t *) b);
         }
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&dstream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev_cs, cudaEventDisableTiming));
         job_ev.resize(n_job_ev);
         for (cudaEvent_t & e : job_ev) {
             CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming | UE_EVENT_SLEEP));
@@ -207,8 +214,10 @@ struct ggml_upload_engine {
         for (cudaEvent_t e : free_ev) { (void) cudaEventDestroy(e); }
         for (const done & d : dones)  { if (d.ev) { (void) cudaEventDestroy(d.ev); } }
         for (uint8_t * b : stage) { (void) cudaFreeHost(b); }
-        if (ring)   { (void) cudaFree(ring); }
-        if (stream) { (void) cudaStreamDestroy(stream); }
+        if (ring)    { (void) cudaFree(ring); }
+        if (ev_cs)   { (void) cudaEventDestroy(ev_cs); }
+        if (stream)  { (void) cudaStreamDestroy(stream); }
+        if (dstream) { (void) cudaStreamDestroy(dstream); }
         if (tab)    { ggml_cuda_host_mapped_free(tab); }
     }
 
@@ -469,7 +478,9 @@ struct ggml_upload_engine {
             } else {
                 CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
             }
-            CUDA_CHECK(cudaEventRecord(ev, cs));
+            CUDA_CHECK(cudaEventRecord(ev_cs, cs));
+            CUDA_CHECK(cudaStreamWaitEvent(dstream, ev_cs, 0));
+            CUDA_CHECK(cudaEventRecord(ev, dstream));
             dones.push_back({ consumed_v(), tpos, ev });
             // keep the queue short: a record is implied by a later one once the issuer no longer needs to tell them apart
             while (dones.size() > 64) {

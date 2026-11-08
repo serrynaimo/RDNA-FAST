@@ -362,6 +362,9 @@ struct llama_expert_handoff::impl {
         bool                 queued = false;
         std::vector<int64_t> piece;                 // [e]: its piece in the engine, -1 if cached (or not queued)
     };
+    // the host experts by name: an allocated graph's MUL_MAT_IDs read the scheduler's copies, named
+    // "<backend>#<name>#<copy>" (ggml_backend_sched_split_graph)
+    std::unordered_map<std::string, const ggml_tensor *> by_name;
     mutable std::mutex             plan_mtx;
     mutable std::vector<plan_item> plan;
     mutable size_t                 plan_next  = 0;
@@ -521,8 +524,14 @@ struct llama_expert_handoff::impl {
                     if (engines[id] == nullptr) {
                         LLAMA_LOG_WARN("%s: %s: no upload engine; large batches upload their experts directly\n", __func__,
                             ggml_backend_dev_name(devices[id].dev));
+                    } else {
+                        LLAMA_LOG_WARN("%s: %s: upload engine: %.0f MiB ring, %d x %.0f MiB pinned staging, %d copy threads\n",
+                            __func__, ggml_backend_dev_name(devices[id].dev), up.ring_bytes/1048576.0, up.n_stage,
+                            up.stage_bytes/1048576.0, up.n_threads);
                     }
                 }
+            } else {
+                LLAMA_LOG_WARN("%s: the GPU backend has no upload engine\n", __func__);
             }
         }
 
@@ -616,6 +625,7 @@ struct llama_expert_handoff::impl {
                         ggml_view_2d(gctx, bank, bank->ne[0], g.n_slots + 1, bank->nb[1], 0);
                     ggml_format_name(cached, "expert_cache.%s", l.experts[ip]->name);
                     bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
+                    by_name[l.experts[ip]->name] = l.experts[ip]; // [TAG_EH_COPY_ENGINE]
                 }
                 l.slot_map = ggml_new_tensor_2d(gctx, GGML_TYPE_I32, 1, g.n_expert);
                 ggml_format_name(l.slot_map, "expert_cache.slot_map-%d", il);
@@ -1258,10 +1268,21 @@ struct llama_expert_handoff::impl {
         const int n = ggml_graph_n_nodes(gf);
         for (int i = 0; i < n; ++i) {
             const ggml_tensor * node = ggml_graph_node(gf, i);
-            if (node->op != GGML_OP_MUL_MAT_ID || !eh_is_host_weight(node->src[0])) {
+            if (node->op != GGML_OP_MUL_MAT_ID) {
                 continue;
             }
-            const auto it = bindings.find(node->src[0]);
+            // the host experts this node reads: the tensor itself (not yet split), or the one the scheduler copies
+            const ggml_tensor * w = node->src[0];
+            if (!eh_is_host_weight(w)) {
+                const char * a = strchr(w->name, '#');
+                const char * b = strrchr(w->name, '#');
+                const auto   f = a != nullptr && b > a ? by_name.find(std::string(a + 1, b)) : by_name.end();
+                if (f == by_name.end()) {
+                    continue; // the cache's banks, or a tensor of another kind
+                }
+                w = f->second;
+            }
+            const auto it = bindings.find(w);
             if (it == bindings.end()) {
                 continue;
             }
@@ -1271,7 +1292,7 @@ struct llama_expert_handoff::impl {
                 continue;
             }
             plan_item pi;
-            pi.w   = node->src[0];
+            pi.w   = w;
             pi.il  = it->second.il;
             pi.ip  = it->second.ip;
             pi.be  = be;
@@ -1279,10 +1300,14 @@ struct llama_expert_handoff::impl {
             plan.push_back(std::move(pi));
             // ids [n_used, n_tokens]: at 4 routings per expert, ~98% of the experts are routed to
             const ggml_tensor * ids = node->src[2];
-            plan_all = plan_all || ids->ne[0]*ids->ne[1] >= 4*node->src[0]->ne[2];
+            plan_all = plan_all || ids->ne[0]*ids->ne[1] >= 4*w->ne[2];
         }
         if (plan.empty()) {
             return;
+        }
+        if (n_up_graphs == 0) {
+            LLAMA_LOG_WARN("%s: the first graph through the upload engine: %zu expert tensors, %s\n", __func__, plan.size(),
+                plan_all ? "every uncached expert queued at once" : "each layer's routed experts");
         }
         plan_owner = sched;
         n_up_graphs++;

@@ -1974,16 +1974,20 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         return;
     }
 
+    // ROCmFPX [TAG_EH_COPY_ENGINE] the copy callback first: it writes the copy on the split backend's own stream, after
+    // whatever read it there before, so it needs none of the waits below. Without events (one GPU: n_copies 1) the wait
+    // was a full synchronize before every expert tensor of a prompt, which kept the host from queueing the next layer
+    // until the device had finished the last one (and the upload engine from running ahead)
+    if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
+        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+        return;
+    }
+
     // wait for the split backend to finish using the input before overwriting it
     if (!shared_copy && sched->events[split_backend_id][sched->cur_copy] != NULL) {
         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
     } else {
         ggml_backend_synchronize(split_backend);
-    }
-
-    if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
-        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
-        return;
     }
 
     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
