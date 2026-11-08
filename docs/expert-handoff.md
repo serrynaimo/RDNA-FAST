@@ -20,7 +20,8 @@ machine and model.
 RX 7900 XT 20 GB, Ryzen 9 7900 (12 cores), 32 GB DDR5, Windows 11, ROCm 10.1, through `llama-server`.
 
 **Qwen3.8-Flash-Next Q2_0** (Swift 1.5 Flash-Next, 66.5 GB): 36% of its experts fit in VRAM, about 14 GB of the
-other 20 GB fit in the RAM this machine leaves free, and the rest is read from the SSD. Sampling at temperature 1,
+other 20 GB fit in the RAM this machine leaves free, and the rest is read from the SSD
+([Streaming from the SSD](#streaming-from-the-ssd)). Sampling at temperature 1,
 2026-11-08:
 
 | | Default | With MTP drafting |
@@ -183,6 +184,38 @@ Scale a file first if its share of the mix should be smaller than its raw counts
   ones inside, and the RAM copy swaps in the experts the CPU keeps reading from the model file.
 - **Prompts.** Short prompts take the same path when the CPU is sooner. Longer ones stream every expert the VRAM cache
   misses to the GPU while earlier layers compute, from the RAM copy where it holds them.
+
+## Streaming from the SSD
+
+A model can be bigger than VRAM and RAM together: Flash-Next Q2_0 is 62 GB, run here on a 20 GB card with 32 GB of
+RAM. The experts live in three places, fastest first:
+
+1. **The VRAM cache:** the most used experts, chosen by the profile and then by the conversation.
+2. **The RAM copy:** the next most used ones, copied from the model file once at load (up to eight readers in
+   parallel, Flash-Next's 14.6 GiB in about 10 s) into RAM that is locked, so the system never pages it out.
+3. **The model file:** everything else stays memory-mapped. The system reads it from the SSD when the CPU or an upload
+   touches it and keeps it in its file cache while RAM allows.
+
+What streams from the SSD, and when:
+
+- **Answers.** The CPU computes an expert outside the RAM copy straight from the mapped file. Once read it usually
+  stays in the file cache, and the RAM copy swaps in the experts the CPU keeps going back to.
+- **Prompts.** Every batch of a long prompt sends the experts the VRAM cache misses to the GPU. Sixteen copy threads
+  read them from the RAM copy, or else from the file with many SSD reads in flight, into pinned buffers that go to the
+  GPU while earlier layers compute. A cold 700-token prompt on Flash-Next took 8.2 s this way, 12.6 s with four threads.
+- **Per-layer token embeddings.** Flash-Next's 28.8 GB table (`-ot per_layer_token_embd=CPU`) is never loaded. For each
+  batch the server reads ahead the rows of the whole prompt, then reads exactly those rows with parallel reads in file
+  order, each row once. Compared with letting the system fault the table in page by page, this took a 700-token prompt
+  from 7.0 to 4.5 s and a 3.8k-token prompt from 197 to 328 t/s. It turns on by itself for tables over 4 GiB.
+
+What helps:
+
+- **An NVMe SSD, uncompressed.** The file is read in many small pieces at once. NTFS compression on the model drive
+  capped reads at 143 MB/s on this machine.
+- **RAM.** Every expert in the RAM copy is one the SSD doesn't have to deliver. Memory-mapped experts the system has
+  pushed out of the process cost the CPU about 5x as long each (175 vs 35 µs on Flash-Next).
+- **Patience after a load.** The first requests read from the SSD until the file cache has the experts again; the
+  first answers on Flash-Next came at 12.5 t/s before reaching their usual speed.
 
 ## Limits
 
