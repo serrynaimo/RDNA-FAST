@@ -24,7 +24,7 @@ struct llama_expert_handoff_params {
     int32_t     n_slots          = -1; // expert slots in VRAM in units of the largest expert, -1 = fill the free VRAM
     size_t      budget_bytes     =  0; // instead of n_slots: the VRAM cache size in bytes (--moe-cache-mib)
     int32_t     vram_reserve_mib = -1; // VRAM the automatic size leaves free beyond the compute buffers, -1 = default
-    int32_t     n_workers        =  0; // host threads, 0 = one per 4 logical CPUs
+    int32_t     n_workers        =  0; // host threads, 0 = one per physical core but one
     uint32_t    max_tokens       = 32; // largest batch the layers can be split for (the mailbox's capacity); batches
                                        // above 32 tokens are split only where the host computes their misses sooner
                                        // than the device could upload the experts it does not hold
@@ -35,7 +35,7 @@ struct llama_expert_handoff_params {
     float       adapt_decay      = 0.7f; // the usage counts are multiplied by this after each round
     // [TAG_EH_RESIDENT] the resident RAM copy: the experts the VRAM cache misses, hottest first by the profile, copied
     // into locked host memory (the host pool and the prompt uploads read them there, not from the mapped file)
-    float       resident_budget_gib = 0.0f; // GiB, 0 = no copy, < 0 = what fits in the available RAM less ram_keep_gib
+    float       resident_budget_gib = -1.0f; // GiB, < 0 = what fits in the available RAM less ram_keep_gib, 0 = no copy
     float       ram_keep_gib        = 4.0f; // RAM left available
 };
 

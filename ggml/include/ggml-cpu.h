@@ -227,6 +227,7 @@ extern "C" {
         uint64_t gather_ns;
         uint64_t gap_ns;
         uint64_t n_gap;
+        int32_t  n_workers; // [TAG_EH_POOL2] the pool's threads
     };
 
     typedef struct ggml_expert_handoff_host * ggml_expert_handoff_host_t;

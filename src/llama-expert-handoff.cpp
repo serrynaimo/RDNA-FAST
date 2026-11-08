@@ -187,10 +187,6 @@ struct eh_upload_api {
     }
 };
 
-int64_t eh_env_int(const char * name, int64_t def) {
-    const char * v = getenv(name);
-    return v != nullptr && *v != '\0' ? std::strtoll(v, nullptr, 10) : def;
-}
 
 // the per-expert tensors of a layer, each cached in a bank: the weights (gate_up or gate and up, or up alone; down),
 // then their biases ([n, n_expert], F32), which the graph adds by slot so that a miss adds nothing
@@ -372,11 +368,6 @@ struct llama_expert_handoff::impl {
     mutable const void *           plan_owner = nullptr; // the scheduler whose graph the plan is for
     mutable std::vector<ggml_upload_copy> copies; // scratch
     mutable ggml_upload_engine_stats up_last = {};
-    // ROCMFPX_EH_UPLOAD_TRACE=1: per graph, the host's times from its start to the first and last upload and to the
-    // device's end of the graph (waited for here), and from the last graph's end
-    const bool tr_on = getenv("ROCMFPX_EH_UPLOAD_TRACE") != nullptr && atoi(getenv("ROCMFPX_EH_UPLOAD_TRACE")) != 0;
-    mutable int64_t tr_begin = 0, tr_first = 0, tr_last = 0, tr_prev_done = 0;
-    mutable ggml_backend_t tr_be = nullptr;
     mutable uint64_t n_up_graphs = 0, n_up_graphs_last = 0, n_up_fallback = 0;
 
     mutable std::mutex mtx;
@@ -504,21 +495,21 @@ struct llama_expert_handoff::impl {
 
         // [TAG_EH_COPY_ENGINE] before the cache takes the free VRAM (its ring) and before the RAM copy is locked (its
         // pinned buffers: on Windows the first pinned allocation after the lock stalls for a minute)
-        if (!model.hparams.no_alloc && eh_env_int("ROCMFPX_EH_COPY_ENGINE", 1) != 0) {
+        if (!model.hparams.no_alloc) {
             ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(devices[0].dev);
             engines.assign(devices.size(), nullptr);
             if (uapi.load(reg)) {
                 ggml_upload_engine_params up = {};
                 // test-expert-handoff --upload-bench, RX 7900 XT under Windows, 450 KiB pieces from pageable RAM:
                 // 2/4/8/16/32 MiB per DMA moved 7.0/10.4/13.5/15.4/16.0 GB/s (each DMA costs ~0.2 ms here), plain
-                // pageable uploads of the pieces 2.8 GB/s
-                up.ring_bytes  = (size_t) eh_env_int("ROCMFPX_EH_RING_MIB", 128) << 20;
-                up.stage_bytes = (size_t) eh_env_int("ROCMFPX_EH_STAGE_MIB", 16) << 20;
-                up.n_stage     = (int) eh_env_int("ROCMFPX_EH_STAGES", 8);
+                // pageable uploads of the pieces 2.8 GB/s. A 512 MiB ring measured the same as 128 (Flash-Next prompts).
+                up.ring_bytes  = (size_t) 128 << 20;
+                up.stage_bytes = (size_t) 16 << 20;
+                up.n_stage     = 8;
                 // Flash-Next, 2026-11-08: 16 threads (copying single experts) read the experts outside the RAM copy
                 // from the SSD fast enough for a cold ~700-token prompt in 8.2 s (4 threads: 12.6 s); from RAM alone 4
                 // are ~4% faster (3.8k tokens 269 vs 257 t/s)
-                up.n_threads   = (int) eh_env_int("ROCMFPX_EH_COPY_THREADS", 16);
+                up.n_threads   = 16;
                 for (const group & g : groups) { // a staging buffer holds at least one expert of any tensor
                     for (const ggml_tensor * t : g.ref) {
                         up.stage_bytes = std::max(up.stage_bytes, eh_expert_stride(t));
@@ -668,13 +659,10 @@ struct llama_expert_handoff::impl {
         dims.max_tokens = (int32_t) params.max_tokens;
         dims.max_embd   = (int32_t) model.hparams.n_embd;
         dims.max_used   = (int32_t) model.hparams.n_expert_used_max();
-        // a dual-channel DDR5 host is bandwidth-bound well before its cores run out: 6 workers beat 11 on a
-        // 12-core Ryzen (Gemma 4 26B-A4B, half the experts cached: 67-74 vs 61-71 t/s), so one per 4 logical CPUs
-        int32_t n_workers = params.n_workers;
-        if (n_workers <= 0) {
-            const int32_t hw = (int32_t) std::thread::hardware_concurrency();
-            n_workers = std::max(2, hw/4);
-        }
+        // 0: the pool's choice, one per physical core but one ([TAG_EH_POOL2]: on a 12-core Ryzen with Flash-Next, 11
+        // workers took 142-158 us per layer against 240 for 6; the pool before it was bound by its barriers and polling,
+        // and 6 had beaten 11 there)
+        const int32_t n_workers = std::max(0, params.n_workers);
         if (model.hparams.no_alloc) {
             // a model loaded only to measure memory: the graphs are built, never run
             mailbox_dummy.assign(ggml_expert_handoff_size(dims) + GGML_EXPERT_HANDOFF_ALIGN, 0);
@@ -703,10 +691,16 @@ struct llama_expert_handoff::impl {
                 (int32_t) (g.layers.size()*g.n_expert), 100.0*g.n_slots/std::max<size_t>(1, g.layers.size()*g.n_expert),
                 g.slot_bytes/1048576.0);
         }
+        int32_t n_pool = n_workers;
+        if (host != nullptr) {
+            ggml_expert_handoff_stats st = {};
+            api.get_stats(host, &st);
+            n_pool = st.n_workers;
+        }
         LLAMA_LOG_WARN("%s: %zu of %zu experts cached%s, %d host workers, batches up to %d tokens split (above %d where "
             "the host is sooner than uploading)\n", __func__,
             n_cached, n_all, profile_counts.empty() ? " (no profile: the first experts of each layer)" : " by the profile",
-            n_workers, dims.max_tokens, (int) n_small);
+            n_pool, dims.max_tokens, (int) n_small);
     }
 
     // the device's routing counts [il][e] since the start (decode batches; hits and misses)
@@ -971,10 +965,9 @@ struct llama_expert_handoff::impl {
         // locked before the copy, so the pages are committed once and the memory manager never trims them (a pageable
         // copy was trimmed and faulted back in: Flash-Next decode 12-36 instead of 22-42 t/s). The price on Windows: the
         // GPU driver's next pinned allocation stalls for ~1 s per 150-400 MiB locked (15-17 GiB: 43-93 s, once, in the
-        // warmup). ROCMFPX_EH_RES_LOCK=0 keeps the copy pageable.
+        // warmup).
         std::string note = "pageable";
-        const char * lock_env = getenv("ROCMFPX_EH_RES_LOCK");
-        const size_t locked = lock_env == nullptr || atoi(lock_env) != 0 ? eh_ram_lock(mem, total, note) : 0;
+        const size_t locked = eh_ram_lock(mem, total, note);
 
         const int64_t t0 = ggml_time_us();
         {
@@ -1319,11 +1312,6 @@ struct llama_expert_handoff::impl {
         }
         plan_owner = sched;
         n_up_graphs++;
-        if (tr_on) {
-            tr_begin = ggml_time_us();
-            tr_first = 0;
-            tr_be    = plan[0].be;
-        }
         if (plan_all) {
             for (plan_item & pi : plan) {
                 queue(pi, nullptr);
@@ -1364,10 +1352,6 @@ struct llama_expert_handoff::impl {
         }
         plan_next = k + 1;
         plan_item & pi = plan[k];
-        if (tr_on) {
-            tr_last = ggml_time_us();
-            tr_first = tr_first ? tr_first : tr_last;
-        }
         if (!pi.queued) {
             // the layer's routing is known now: its tensors from here on (their gathers follow in this order)
             for (size_t j = k; j < plan.size() && plan[j].il == pi.il; ++j) {
@@ -1406,15 +1390,6 @@ struct llama_expert_handoff::impl {
         std::lock_guard<std::mutex> lk(plan_mtx);
         if (plan_owner != sched) {
             return;
-        }
-        if (tr_on && tr_be) {
-            ggml_backend_synchronize(tr_be);
-            const int64_t t = ggml_time_us();
-            LLAMA_LOG_WARN("%s: trace: %zu expert tensors; host: start -> first upload %.0f ms, first -> last upload %.0f ms, "
-                "last upload -> device done %.0f ms; previous graph done -> start %.0f ms\n", __func__, plan.size(),
-                (tr_first - tr_begin)/1e3, (tr_last - tr_first)/1e3, (t - tr_last)/1e3,
-                tr_prev_done ? (tr_begin - tr_prev_done)/1e3 : 0.0);
-            tr_prev_done = t;
         }
         for (ggml_upload_engine_t e : engines) {
             if (e) {
@@ -1743,25 +1718,16 @@ struct llama_expert_handoff::impl {
                         us.n_pieces += s.n_pieces; us.n_dma += s.n_dma; us.bytes += s.bytes; us.n_gathers += s.n_gathers;
                         us.copy_ns += s.copy_ns; us.wait_ring_ns += s.wait_ring_ns; us.wait_copy_ns += s.wait_copy_ns;
                         us.wait_gather_ns += s.wait_gather_ns; us.dropped += s.dropped;
-                        us.issue_call_ns += s.issue_call_ns; us.gather_call_ns += s.gather_call_ns;
-                        us.dev_wait_ns += s.dev_wait_ns; us.dev_gather_ns += s.dev_gather_ns; us.dev_between_ns += s.dev_between_ns;
                     }
-                }
-                if (us.dev_gather_ns > up_last.dev_gather_ns) { // ROCMFPX_EH_UPLOAD_TIMING=1
-                    LLAMA_LOG_WARN("%s: uploads on the device: %.2f s waiting for DMAs, %.2f s in gathers, %.2f s between gathers\n",
-                        __func__, (us.dev_wait_ns - up_last.dev_wait_ns)/1e9, (us.dev_gather_ns - up_last.dev_gather_ns)/1e9,
-                        (us.dev_between_ns - up_last.dev_between_ns)/1e9);
                 }
                 if (us.bytes > up_last.bytes) {
                     LLAMA_LOG_WARN("%s: uploads: %" PRIu64 " graphs, %.2f GB in %" PRIu64 " DMAs (%" PRIu64 " experts), %" PRIu64
                         " gathers; host copies %.1f s (all threads), the issuer waited %.1f s for copies and %.1f s for ring "
-                        "space, the graphs %.1f s for DMAs; in runtime calls: issuer %.1f s, gathers %.1f s; %" PRIu64
-                        " experts dropped, %" PRIu64 " uploads not planned\n",
+                        "space, the graphs %.1f s for DMAs; %" PRIu64 " experts dropped, %" PRIu64 " uploads not planned\n",
                         __func__, n_up_graphs - n_up_graphs_last, (us.bytes - up_last.bytes)/1e9, us.n_dma - up_last.n_dma,
                         us.n_pieces - up_last.n_pieces, us.n_gathers - up_last.n_gathers, (us.copy_ns - up_last.copy_ns)/1e9,
                         (us.wait_copy_ns - up_last.wait_copy_ns)/1e9, (us.wait_ring_ns - up_last.wait_ring_ns)/1e9,
-                        (us.wait_gather_ns - up_last.wait_gather_ns)/1e9, (us.issue_call_ns - up_last.issue_call_ns)/1e9,
-                        (us.gather_call_ns - up_last.gather_call_ns)/1e9, us.dropped - up_last.dropped, n_up_fallback);
+                        (us.wait_gather_ns - up_last.wait_gather_ns)/1e9, us.dropped - up_last.dropped, n_up_fallback);
                 }
                 up_last = us;
                 n_up_graphs_last = n_up_graphs;

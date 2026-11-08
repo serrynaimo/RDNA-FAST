@@ -4356,7 +4356,7 @@ llama_context_params llama_context_default_params() {
         /*.adapt_every                 =*/ 4,
         /*.adapt_swaps                 =*/ 96,
         /*.adapt_decay                 =*/ 0.7f,
-        /*.resident_budget_gib         =*/ 0.0f,
+        /*.resident_budget_gib         =*/ -1.0f,
         /*.ram_keep_gib                =*/ 4.0f,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,

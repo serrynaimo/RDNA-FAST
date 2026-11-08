@@ -902,10 +902,9 @@ static int run_upload_bench(size_t mib, const ggml_upload_engine_params & up, in
         ggml_upload_engine_stats st = {};
         ue.stats(eng, &st);
         printf("  %.2f GB: plain %.2f s (%.2f GB/s), engine %.2f s (%.2f GB/s) in %llu DMAs; copies %.2f s, issuer waited "
-            "%.2f s for copies, %.2f s for ring; gathers waited %.2f s; runtime calls: issuer %.2f s, gathers %.2f s\n",
+            "%.2f s for copies, %.2f s for ring; gathers waited %.2f s\n",
             host.size()/1e9, t_plain, host.size()/1e9/t_plain, t_eng, host.size()/1e9/t_eng, (unsigned long long) st.n_dma,
-            st.copy_ns/1e9, st.wait_copy_ns/1e9, st.wait_ring_ns/1e9, st.wait_gather_ns/1e9, st.issue_call_ns/1e9,
-            st.gather_call_ns/1e9);
+            st.copy_ns/1e9, st.wait_copy_ns/1e9, st.wait_ring_ns/1e9, st.wait_gather_ns/1e9);
 
         // with work on the stream between the gathers, as a prompt's layers have: do the copies overlap it?
         if (n_mm > 0 && rep == 1) {
@@ -947,9 +946,8 @@ static int run_upload_bench(size_t mib, const ggml_upload_engine_params & up, in
             ggml_upload_engine_stats s2 = {};
             ue.stats(eng2, &s2);
             printf("  with %d matmuls after each gather: copies alone %.2f s, compute alone %.2f s, both %.2f s "
-                "(overlapped: %.2f s, serial: %.2f s); runtime calls: issuer %.2f s, gathers %.2f s; issuer waited %.2f s "
-                "for ring\n", n_mm, t_eng, t_comp, t_both, std::max(t_eng, t_comp), t_eng + t_comp, s2.issue_call_ns/1e9,
-                s2.gather_call_ns/1e9, s2.wait_ring_ns/1e9);
+                "(overlapped: %.2f s, serial: %.2f s); issuer waited %.2f s for ring\n", n_mm, t_eng, t_comp, t_both,
+                std::max(t_eng, t_comp), t_eng + t_comp, s2.wait_ring_ns/1e9);
             ue.free(eng2);
             ggml_gallocr_free(ga);
             ggml_backend_buffer_free(cbuf);

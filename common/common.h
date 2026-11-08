@@ -610,7 +610,7 @@ struct common_params {
     int32_t     adapt_every      =  4;   // 0 = off
     int32_t     adapt_swaps      = 96;
     float       adapt_decay      = 0.7f;
-    float       resident_budget_gib = 0.0f; // [TAG_EH_RESIDENT] 0 = off, < 0 = what fits
+    float       resident_budget_gib = -1.0f; // [TAG_EH_RESIDENT] < 0 = what fits, > 0 = at most this
     float       ram_keep_gib        = 4.0f;
     bool        poll_explicit       = false; // [TAG_EH_POLL] --poll or --poll-batch given
 

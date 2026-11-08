@@ -24,7 +24,7 @@
 #include <thread>
 #include <vector>
 
-#if defined(_WIN32) // [TAG_EH_POOL2] the workers' affinity
+#if defined(_WIN32) // [TAG_EH_POOL2] the physical cores
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -332,10 +332,9 @@ struct eh_abuf {
     }
 };
 
-// [TAG_EH_POOL2] the first logical processor of each physical core of processor group 0, in order (Windows; empty
-// elsewhere, where the workers are not pinned)
-std::vector<int> eh_core_lps() {
-    std::vector<int> res;
+// [TAG_EH_POOL2] the physical cores of processor group 0 (Windows; 0 elsewhere: unknown)
+int eh_n_cores() {
+    int res = 0;
 #if defined(_WIN32)
     DWORD len = 0;
     GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
@@ -350,21 +349,12 @@ std::vector<int> eh_core_lps() {
         const auto * info = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *) (buf.data() + off);
         if (info->Relationship == RelationProcessorCore && info->Processor.GroupCount >= 1 &&
             info->Processor.GroupMask[0].Group == 0 && info->Processor.GroupMask[0].Mask != 0) {
-            res.push_back(__builtin_ctzll((unsigned long long) info->Processor.GroupMask[0].Mask));
+            res++;
         }
         off += info->Size;
     }
-    std::sort(res.begin(), res.end());
 #endif
     return res;
-}
-
-void eh_pin_thread(int lp) {
-#if defined(_WIN32)
-    SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << lp);
-#else
-    GGML_UNUSED(lp);
-#endif
 }
 
 } // namespace
@@ -378,9 +368,9 @@ void eh_pin_thread(int lp) {
 // workers spin on a cached word of their own, never on the mailbox (mapped into the device), and a worker that sleeps
 // or is late only leaves its tasks to the others: no barrier waits for all of them (the pool wake races of 2026-11-07
 // were barriers that waited for a sleeping worker). Before: 4 barriers per layer and every worker polled the mailbox;
-// host time per layer was ~2-3x the standalone benchmark in the server (Flash-Next, 2026-11-08). With ROCMFPX_EH_PIN=1
-// the workers are pinned one per physical core from core 1 on: core 0's first logical processor takes the GPU's
-// interrupts on Windows, and the other logical processor of each core is left to the rest of the process.
+// host time per layer was ~2-3x the standalone benchmark in the server (Flash-Next, 2026-11-08). One worker per physical
+// core but one by default (11 on a 12-core Ryzen: 142-158 us per layer against 240 for 6); pinning them one per core
+// measured the same and is not done.
 struct ggml_expert_handoff_host {
     uint8_t * mb = nullptr;
     ggml_expert_handoff_dims dims = {};
@@ -390,7 +380,6 @@ struct ggml_expert_handoff_host {
 
     int n_workers = 1;
     std::vector<std::thread> threads;
-    std::vector<int> pin_lp;                // [worker]: its logical processor, -1 if not pinned
 
     std::atomic<bool> stop{false};
     std::atomic<int64_t> spin_until{0};
@@ -981,9 +970,6 @@ struct ggml_expert_handoff_host {
     }
 
     void worker(int iw) {
-        if (iw < (int) pin_lp.size() && pin_lp[iw] >= 0) {
-            eh_pin_thread(pin_lp[iw]);
-        }
         uint64_t my_wake = 0;
         if (iw > 0) {
             uint32_t seen = gen.load(std::memory_order_acquire);
@@ -1076,21 +1062,12 @@ ggml_expert_handoff_host_t ggml_expert_handoff_host_new(
     h->hdr  = (ggml_expert_handoff_header *) mailbox;
     h->dims = { max_tokens, max_embd, max_used };
     h->layers.resize(n_layer);
-    // [TAG_EH_POOL2] n_workers <= 0: one per physical core but the first (or per two logical processors less one)
-    const std::vector<int> lps = eh_core_lps();
+    // [TAG_EH_POOL2] n_workers <= 0: one per physical core but one (or per two logical processors less one)
     if (n_workers <= 0) {
-        n_workers = lps.size() > 1 ? (int32_t) lps.size() - 1 : std::max(1, (int32_t) std::thread::hardware_concurrency()/2 - 1);
+        const int n_cores = eh_n_cores();
+        n_workers = n_cores > 1 ? n_cores - 1 : std::max(1, (int32_t) std::thread::hardware_concurrency()/2 - 1);
     }
     h->n_workers = std::max(1, n_workers);
-    // ROCMFPX_EH_PIN=1: pinned from core 1 on, one per core, as far as the cores go. Off by default: unpinned measured
-    // the same (Flash-Next, 11 workers, 2026-11-08: 158 vs 142 us per layer, decode within noise), and pinned workers
-    // would share cores with whatever else is pinned there (prod's classifier holds cores 6-11)
-    const char * pin_env = getenv("ROCMFPX_EH_PIN");
-    const bool pin = pin_env != nullptr && atoi(pin_env) != 0;
-    h->pin_lp.assign(h->n_workers, -1);
-    for (int i = 0; pin && i < h->n_workers && i + 1 < (int) lps.size(); ++i) {
-        h->pin_lp[i] = lps[i + 1];
-    }
     h->acc.resize(h->n_workers);
 
     // a fresh mailbox: nothing sent, nothing answered
@@ -1214,6 +1191,7 @@ void ggml_expert_handoff_host_get_stats(ggml_expert_handoff_host_t h, ggml_exper
     st->n_gap         = h->st_n_gap.load();
     st->n_read_copy   = h->st_read_copy.load();
     st->n_read_tensor = h->st_read_tensor.load();
+    st->n_workers     = h->n_workers;
 }
 
 const uint64_t * ggml_expert_handoff_host_counts(ggml_expert_handoff_host_t h, int32_t il) {

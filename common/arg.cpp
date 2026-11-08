@@ -2827,10 +2827,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-lzm", "--lazy-mode"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
-        "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
-        "- on-direct: like on, but the arch reads the rows with explicit pread()s instead of demand paging the mmap (currently only PLE tables)\n"
+        "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap;\n"
+        "  per-layer embedding tables are read with parallel explicit reads)\n"
         "- auto: on, but only for tensors larger than 4 GiB\n"
-        "- off: always keep them resident",
+        "- off: always keep them resident\n"
+        "- on-direct: the same as on",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
             else if (value == "on-direct") { params.lazy_mode = LLAMA_LAZY_MODE_DIRECT; }
@@ -2933,7 +2934,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_VRAM_RESERVE_MIB"));
     add_opt(common_arg(
         {"--pool-workers"}, "N",
-        "expert handoff: CPU threads computing the experts the VRAM cache misses (default: 0 = one per 4 logical CPUs, at least 2)",
+        "expert handoff: CPU threads computing the experts the VRAM cache misses (default: 0 = one per physical core but one)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
@@ -2989,17 +2990,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_ADAPT_DECAY"));
     // [TAG_EH_RESIDENT]
     add_opt(common_arg(
-        {"--resident-experts"},
-        "expert handoff: copy the experts the VRAM cache misses into locked RAM, hottest first by the expert profile, "
-        "as many as fit in the available RAM less --ram-keep-gib; the CPU threads and the prompt uploads read them there "
-        "instead of the mapped model file (default: off)",
-        [](common_params & params) {
-            params.resident_budget_gib = -1.0f;
-        }
-    ).set_env("LLAMA_ARG_RESIDENT_EXPERTS"));
-    add_opt(common_arg(
         {"--resident-budget-gib"}, "N",
-        "expert handoff: like --resident-experts, with at most N GiB of experts in RAM",
+        "expert handoff: at most N GiB in the locked RAM copy of the experts the VRAM cache misses (default: as many "
+        "as fit in the available RAM less --ram-keep-gib)",
         [](common_params & params, const std::string & value) {
             const float f = std::stof(value);
             if (!(f > 0.0f)) {

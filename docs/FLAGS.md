@@ -52,15 +52,14 @@ cache. [More](expert-handoff.md)
 | `--expert-cache N\|auto` | off | turns expert handoff on with a VRAM cache of `N` experts (in units of the model's largest expert), or `auto` for the free VRAM less `--vram-reserve-mib` |
 | `--moe-cache-mib N` | off | the same with a cache of `N` MiB |
 | `--vram-reserve-mib N` | 1024 | VRAM that `auto` leaves free beyond the compute buffers, which are sized first |
-| `--pool-workers N` | one per 4 logical CPUs, at least 2 | CPU threads that compute the experts the cache misses |
+| `--pool-workers N` | one per physical core but one | CPU threads that compute the experts the cache misses |
 | `--adapt-every N` | 4 | every `N` decode steps, the most used experts outside the cache replace the least used ones in it; 0 keeps the cache as it started |
 | `--adapt-swaps N` | 96 | the most experts swapped per round |
 | `--adapt-decay F` | 0.7 | how fast old use is forgotten: usage is multiplied by `F` after each round |
 | `--expert-profile FILE` | none | starts the cache with the experts this file ranks most used ([profiles](expert-handoff.md#profiles)) |
 | `--expert-profile-save FILE` | none | writes this run's routing counts (plus those of `--expert-profile`) to `FILE` every 30 s of use and at exit |
-| `--resident-experts` | off | copies the experts the VRAM cache misses into locked RAM, the most used first, as many as fit in the available RAM less `--ram-keep-gib`; the CPU reads them there instead of from the mapped file |
-| `--resident-budget-gib N` | off | the same, with at most `N` GiB in RAM |
-| `--ram-keep-gib N` | 4 | RAM the copy leaves available for everything else |
+| `--ram-keep-gib N` | 4 | RAM left free for everything else; the experts the VRAM cache misses are copied into the rest (locked), the most used first, and the CPU reads them there |
+| `--resident-budget-gib N` | all that fits | at most `N` GiB for that RAM copy |
 
 ## Environment variables
 

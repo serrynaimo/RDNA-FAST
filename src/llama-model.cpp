@@ -2045,12 +2045,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
-const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char * tensor_name, const ggml_tensor * t) {
-    if (ml.lazy.mode != LLAMA_LAZY_MODE_DIRECT) {
-        return nullptr;
+// ROCmFPX [TAG_PLE_DIRECT_WIN] every lazy mode but off reads such a table with explicit reads (auto: when the table is
+// larger than 4 GiB, as the loader's rule): demand paging the mapping faulted the rows in one after another (a
+// Flash-Next prompt: 5.4-7.5 s of each 2048-token batch before its experts, against 0.12-0.19 s with the reads)
+static bool llama_lazy_direct(const llama_model_loader & ml, size_t nbytes) {
+    if (ml.lazy.mode == LLAMA_LAZY_MODE_OFF) {
+        return false;
     }
+    return ml.lazy.mode != LLAMA_LAZY_MODE_AUTO || nbytes > 4ull*1024*1024*1024;
+}
 
-    if (!t) {
+const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char * tensor_name, const ggml_tensor * t) {
+    if (!t || !llama_lazy_direct(ml, ggml_nbytes(t))) {
         return nullptr;
     }
 
@@ -2099,7 +2105,7 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader_segmented(
         int64_t ple_rows,
         const std::vector<uint64_t> & head_offsets,
         const std::vector<uint64_t> & head_vocab_sizes) {
-    if (ml.lazy.mode != LLAMA_LAZY_MODE_DIRECT) {
+    if (ml.lazy.mode == LLAMA_LAZY_MODE_OFF) {
         return nullptr;
     }
 
@@ -2126,6 +2132,10 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader_segmented(
     int n_threads = 2 * (int) std::max(1u, std::thread::hardware_concurrency());
     enum ggml_type type = w0->tensor->type;
     size_t row_size = ggml_row_size(type, head_dim);
+    if (!llama_lazy_direct(ml, (size_t) ple_rows*row_size)) {
+        llama_lazy_close(fd);
+        return nullptr;
+    }
 
     std::vector<llama_lazy_reader::segment> segs;
     for (size_t h = 0; h < head_offsets.size(); ++h) {
