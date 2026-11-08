@@ -202,7 +202,25 @@ struct case_seq_cp : ctx_test {
             TLOG_TRC("%s: seq 1 restored, %zu bytes\n", __func__, seq_store.size());
         }
 
-        if (!generate_tokens_compare(ctx.get(), smpl.get(), n_past, mr.params.n_predict, 1, mr.baseline, NMSE_THRESHOLD)) {
+        // ROCmFPX [TAG_KV_LANES] a unified cache gives every sequence its own lane, so seq 1 holds its cells
+        // elsewhere than seq 0 did and attention adds them up in another order: equally right, but not bit-exact
+        // against the seq 0 baseline (on Qwen3.5-2B the rounding alone grows to an NMSE of ~1e-2). With lanes the
+        // copy goes back into seq 0, through the same cross-sequence restore, and continues on the baseline's cells.
+        llama_seq_id seq_cont = 1;
+        if (llama_kv_lanes_enabled(ctx.get())) {
+            std::vector<uint8_t> seq_store;
+            if (!get_seq_state(ctx.get(), 1, flags, seq_store)) {
+                return case_result::fail();
+            }
+            llama_memory_clear(llama_get_memory(ctx.get()), true);
+            if (!set_seq_state(ctx.get(), 0, flags, seq_store)) {
+                return case_result::fail();
+            }
+            TLOG_TRC("%s: lanes: seq 1 copied back to seq 0, %zu bytes\n", __func__, seq_store.size());
+            seq_cont = 0;
+        }
+
+        if (!generate_tokens_compare(ctx.get(), smpl.get(), n_past, mr.params.n_predict, seq_cont, mr.baseline, NMSE_THRESHOLD)) {
             return case_result::fail();
         }
 
