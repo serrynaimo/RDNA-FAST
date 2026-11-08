@@ -2045,7 +2045,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
-#ifndef _WIN32
 const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char * tensor_name, const ggml_tensor * t) {
     if (ml.lazy.mode != LLAMA_LAZY_MODE_DIRECT) {
         return nullptr;
@@ -2068,7 +2067,7 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader 
     // an independently opened buffered descriptor: dup() would share the
     // loader's open file description, whose readahead advice and O_DIRECT
     // flag would fight the small scattered row reads
-    const int fd = ::open(ml.files[w->idx]->name().c_str(), O_RDONLY | O_CLOEXEC);
+    const intptr_t fd = llama_lazy_open(ml.files[w->idx]->name().c_str()); // [TAG_PLE_DIRECT_WIN]
     if (fd < 0) {
         LLAMA_LOG_WARN("%s: could not open %s for direct reads (%s), using lazy mmap reads\n",
                 __func__, ml.files[w->idx]->name().c_str(), strerror(errno));
@@ -2076,7 +2075,7 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader 
     }
 
 #ifdef __linux__
-    ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+    ::posix_fadvise((int) fd, 0, 0, POSIX_FADV_RANDOM);
 #endif
 
     // in-flight reads are IO queue depth, not compute; 2x cores worked well
@@ -2113,7 +2112,7 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader_segmented(
         return nullptr;
     }
 
-    const int fd = ::open(ml.files[w0->idx]->name().c_str(), O_RDONLY | O_CLOEXEC);
+    const intptr_t fd = llama_lazy_open(ml.files[w0->idx]->name().c_str()); // [TAG_PLE_DIRECT_WIN]
     if (fd < 0) {
         LLAMA_LOG_WARN("%s: could not open %s for direct reads (%s)\n",
                 __func__, ml.files[w0->idx]->name().c_str(), strerror(errno));
@@ -2121,7 +2120,7 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader_segmented(
     }
 
 #ifdef __linux__
-    ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+    ::posix_fadvise((int) fd, 0, 0, POSIX_FADV_RANDOM);
 #endif
 
     int n_threads = 2 * (int) std::max(1u, std::thread::hardware_concurrency());
@@ -2135,13 +2134,13 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader_segmented(
         const auto * wh = ml.get_weight(hname);
         if (!wh) {
             LLAMA_LOG_ERROR("%s: missing %s\n", __func__, hname);
-            ::close(fd);
+            llama_lazy_close(fd);
             return nullptr;
         }
         // A segmented reader uses one file and one row layout. Other layouts use the normal tensor loader.
         if (wh->idx != w0->idx || wh->tensor->type != type || wh->tensor->ne[0] != head_dim ||
                 wh->tensor->ne[1] != (int64_t) head_vocab_sizes[h]) {
-            ::close(fd);
+            llama_lazy_close(fd);
             return nullptr;
         }
         segs.push_back({ wh->offs, (int64_t) head_offsets[h], (int64_t) head_vocab_sizes[h] });
@@ -2156,20 +2155,6 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader_segmented(
     lazy_readers[name] = std::move(reader);
     return lazy_readers.at(name).get();
 }
-#else
-const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char *, const ggml_tensor *) {
-    if (ml.lazy.mode == LLAMA_LAZY_MODE_DIRECT) {
-        LLAMA_LOG_WARN("%s: --lazy-mode on-direct is not supported on this platform, using lazy mmap reads\n", __func__);
-    }
-    return nullptr;
-}
-
-const llama_lazy_reader * llama_model_base::load_lazy_reader_segmented(
-        llama_model_loader & ml, const char *, int64_t, int64_t,
-        const std::vector<uint64_t> &, const std::vector<uint64_t> &) {
-    return nullptr;
-}
-#endif
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
 void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
     uint32_t hadamard_version = 0;

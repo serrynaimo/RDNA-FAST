@@ -920,3 +920,34 @@ void llama_prefetch(llama_memory_ranges mr) {
 size_t llama_path_max() {
     return PATH_MAX;
 }
+
+#if defined(_WIN32)
+// ROCmFPX [TAG_PLE_DIRECT_WIN] llama_lazy_reader's file access (llama-lazy-reader.h): a handle of its own (random
+// access: no read-ahead for the scattered rows) and positioned reads, safe from several threads at once
+intptr_t llama_lazy_open(const char * path) {
+    const int n = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
+    if (n <= 0) {
+        return -1;
+    }
+    std::wstring w((size_t) n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, &w[0], n);
+    HANDLE h = CreateFileW(w.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    return h == INVALID_HANDLE_VALUE ? -1 : (intptr_t) h;
+}
+
+int64_t llama_lazy_pread(intptr_t fd, void * buf, size_t n, size_t off) {
+    OVERLAPPED ov = {};
+    ov.Offset     = (DWORD) (off & 0xFFFFFFFFu);
+    ov.OffsetHigh = (DWORD) ((uint64_t) off >> 32);
+    DWORD got = 0;
+    if (!ReadFile((HANDLE) fd, buf, (DWORD) n, &got, &ov)) {
+        return GetLastError() == ERROR_HANDLE_EOF ? 0 : -1;
+    }
+    return (int64_t) got;
+}
+
+void llama_lazy_close(intptr_t fd) {
+    CloseHandle((HANDLE) fd);
+}
+#endif

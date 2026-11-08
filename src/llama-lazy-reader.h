@@ -17,33 +17,38 @@
 #include <unistd.h>
 #endif
 
-struct llama_lazy_reader {
 #ifdef _WIN32
-    // pread()/open() are unavailable on Windows; --lazy-mode on-direct falls
-    // back to the lazy mmap reads there (see llama_model_base::load_lazy_reader)
-    const int64_t head_dim = 0;
-
-    void gather(const int32_t *, int64_t, float *) const {
-        GGML_ABORT("lazy direct reads are not supported on this platform");
-    }
-
-    // no-op: the lazy reader is never created on Windows; keeps shared call sites compiling
-    void prefetch(const int32_t *, int64_t) const {}
+// ROCmFPX [TAG_PLE_DIRECT_WIN] the file access on Windows (llama-mmap.cpp): no pread()/open() there
+intptr_t llama_lazy_open(const char * path);                                // -1 on failure
+int64_t  llama_lazy_pread(intptr_t fd, void * buf, size_t n, size_t off);   // bytes read, 0 at EOF, -1 on error
+void     llama_lazy_close(intptr_t fd);
 #else
+static inline intptr_t llama_lazy_open(const char * path) {
+    return ::open(path, O_RDONLY | O_CLOEXEC);
+}
+static inline int64_t llama_lazy_pread(intptr_t fd, void * buf, size_t n, size_t off) {
+    return ::pread((int) fd, buf, n, (off_t) off);
+}
+static inline void llama_lazy_close(intptr_t fd) {
+    ::close((int) fd);
+}
+#endif
+
+struct llama_lazy_reader {
     struct segment {
         size_t  file_offs;
         int64_t row_start;
         int64_t n_rows;
     };
 
-    llama_lazy_reader(int fd, size_t base, size_t row_size, int64_t n_rows, int n_threads,
+    llama_lazy_reader(intptr_t fd, size_t base, size_t row_size, int64_t n_rows, int n_threads,
                       enum ggml_type type, int64_t head_dim)
         : fd(fd), base(base), row_size(row_size), n_rows(n_rows), n_threads(n_threads),
           head_dim(head_dim), to_float(type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(type)->to_float) {
         GGML_ASSERT((type == GGML_TYPE_F32 || to_float != nullptr) && head_dim > 0);
     }
 
-    llama_lazy_reader(int fd, std::vector<segment> segs, size_t row_size, int64_t n_rows, int n_threads,
+    llama_lazy_reader(intptr_t fd, std::vector<segment> segs, size_t row_size, int64_t n_rows, int n_threads,
                       enum ggml_type type, int64_t head_dim)
         : fd(fd), base(0), row_size(row_size), n_rows(n_rows), n_threads(n_threads),
           head_dim(head_dim), segments(std::move(segs)),
@@ -56,11 +61,11 @@ struct llama_lazy_reader {
 
     ~llama_lazy_reader() {
         if (fd >= 0) {
-            ::close(fd);
+            llama_lazy_close(fd);
         }
     }
 
-    const int            fd;
+    const intptr_t       fd;
     const size_t         base;       // file offset of row 0
     const size_t         row_size;   // bytes per quantized row
     const int64_t        n_rows;
@@ -145,9 +150,16 @@ struct llama_lazy_reader {
         const int n_workers = (int) std::min<int64_t>(n_threads, std::max<int64_t>(1, (int64_t) uniq.size() / 32));
         auto run = [&](int w) {
             const int64_t b = (int64_t) uniq.size() * w / n_workers, e = (int64_t) uniq.size() * (w + 1) / n_workers;
+            std::vector<uint8_t> scratch(row_size);
+            GGML_UNUSED(scratch);
             for (int64_t i = b; i < e; ++i) {
                 const size_t off = get_row_offset(uniq[i]);
-                ::posix_fadvise(fd, (off_t) off, (off_t) row_size, POSIX_FADV_WILLNEED);
+#ifdef _WIN32
+                // no fadvise: reading the row puts its page in the cache
+                (void) llama_lazy_pread(fd, scratch.data(), row_size, off);
+#else
+                ::posix_fadvise((int) fd, (off_t) off, (off_t) row_size, POSIX_FADV_WILLNEED);
+#endif
             }
         };
         std::vector<std::thread> workers;
@@ -172,7 +184,7 @@ private:
             }
             const size_t off = get_row_offset(pairs[i].first);
             for (size_t done = 0; done < row_size; ) {
-                const ssize_t n_read = ::pread(fd, bounce.data() + done, row_size - done, off + done);
+                const int64_t n_read = llama_lazy_pread(fd, bounce.data() + done, row_size - done, off + done);
                 if (n_read < 0 && errno == EINTR) {
                     continue;
                 }
@@ -194,5 +206,4 @@ private:
             i = j + 1;
         }
     }
-#endif
 };
