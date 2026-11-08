@@ -155,6 +155,7 @@ set "HIP_PATH=%ROCM%"
 set "ROCM_PATH=%ROCM%"
 set "HIP_PLATFORM=amd"
 set "HIP_DEVICE_LIB_PATH=%ROCM%\lib\llvm\amdgcn\bitcode"
+set "PATH=C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64;%PATH%"
 cmake -S . -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release ^
   -DCMAKE_C_COMPILER="%ROCM%\lib\llvm\bin\clang.exe" -DCMAKE_CXX_COMPILER="%ROCM%\lib\llvm\bin\clang++.exe" ^
   -DCMAKE_RC_COMPILER="C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x64/rc.exe" ^
@@ -165,8 +166,9 @@ cmake -S . -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release ^
 cmake --build build-hip --target llama-server -j 12
 ```
 
-ROCm 10.1 brings no resource compiler, so CMake takes the Windows SDK's
-`rc.exe` (use the SDK version folder you have, with forward slashes). The build
+ROCm 10.1 brings no resource compiler or manifest tool, so the build takes the
+Windows SDK's `rc.exe` and `mt.exe` (use the SDK version folder you have, with
+forward slashes for `rc.exe`). The build
 copies ROCm's HIP runtime (`amdhip64_7.dll`, `amd_comgr.dll`, `rocm_kpack.dll`)
 next to `llama-server.exe`: Windows would otherwise load the AMD driver's older
 runtime, on which ROCm 10.1's rocBLAS fails. The build also downloads the
