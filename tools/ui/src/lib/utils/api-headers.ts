@@ -15,6 +15,13 @@ export function getAuthHeaders(): Record<string, string> {
 }
 
 /**
+ * [TAG_UI_ONLY] marks a request as the web UI's own, for the server's UI-only answers (the machine and the SSD
+ * cache in /props, model downloads and deletions, presets). Only for requests to this server: browsers add
+ * Sec-Fetch-Site just in secure contexts, so a UI opened over plain HTTP on a LAN address needs it.
+ */
+export const RDNA_UI_HEADERS: Record<string, string> = { 'X-RDNA-UI': '1' };
+
+/**
  * Get standard JSON headers with optional authorization
  */
 export function getJsonHeaders(): Record<string, string> {

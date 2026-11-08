@@ -7015,13 +7015,13 @@ void server_routes::init_routes() {
         }
         // [TAG_REQUEST_HISTORY] read now, also during sleep: the device memory from the backend, the disk cache
         // counters from the copy the main loop publishes (a thread-safe call that does not touch the model)
-        // [TAG_UI_ONLY] the machine (GPUs and their memory, RAM, OS, CPU) only for the web UI
+        // [TAG_UI_ONLY] the machine (GPUs and their memory, RAM, OS, CPU) and its SSD cache only for the web UI
         if (server_req_from_ui(req)) {
-            props["devices"]       = get_res_devices(meta->devices);
-            props["system_memory"] = get_res_system_memory();
-            props["host"]          = get_res_host();
+            props["devices"]           = get_res_devices(meta->devices);
+            props["system_memory"]     = get_res_system_memory();
+            props["host"]              = get_res_host();
+            props["prompt_cache_disk"] = ctx_server.disk_stats_to_json();
         }
-        props["prompt_cache_disk"] = ctx_server.disk_stats_to_json();
         res->ok(props);
         return res;
     };

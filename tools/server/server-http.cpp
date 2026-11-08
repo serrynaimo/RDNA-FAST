@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <functional>
 #include <future>
 #include <memory>
@@ -76,11 +77,17 @@ static void log_server_request(const httplib::Request & req, const httplib::Resp
 
 // [TAG_UI_ONLY]
 bool server_req_from_ui(const server_http_req & req) {
-    static const std::string name = "sec-fetch-site";
+    auto is = [](const std::string & key, const char * name) {
+        const size_t n = strlen(name);
+        return key.size() == n &&
+            std::equal(key.begin(), key.end(), name, [](char a, char b) { return std::tolower((unsigned char) a) == b; });
+    };
     for (const auto & [key, value] : req.headers) {
-        if (key.size() == name.size() &&
-            std::equal(key.begin(), key.end(), name.begin(), [](char a, char b) { return std::tolower((unsigned char) a) == b; })) {
-            return value == "same-origin";
+        if (is(key, "x-rdna-ui") && !value.empty()) {
+            return true;
+        }
+        if (is(key, "sec-fetch-site") && value == "same-origin") {
+            return true;
         }
     }
     return false;

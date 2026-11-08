@@ -21,7 +21,7 @@ import {
 	sidecarFromFileToken,
 	splitSseRecords
 } from '$lib/utils';
-import { getAuthHeaders } from '$lib/utils/api-headers';
+import { getAuthHeaders, RDNA_UI_HEADERS } from '$lib/utils/api-headers';
 
 export class ModelsService {
 	private static readonly SSE_RECONNECT_MS = 1000;
@@ -56,7 +56,8 @@ export class ModelsService {
 	): Promise<ApiModelsDownloadResponse> {
 		return apiDelete<ApiModelsDownloadResponse>(
 			API_MODELS.DELETE,
-			sidecar ? { model, sidecar } : { model }
+			sidecar ? { model, sidecar } : { model },
+			{ headers: RDNA_UI_HEADERS }
 		);
 	}
 
@@ -72,7 +73,9 @@ export class ModelsService {
 	): Promise<ApiModelsDownloadResponse> {
 		const payload: ApiModelsDownloadRequest = { model, sidecars };
 
-		return apiPost<ApiModelsDownloadResponse>(API_MODELS.DOWNLOAD, payload);
+		return apiPost<ApiModelsDownloadResponse>(API_MODELS.DOWNLOAD, payload, {
+			headers: RDNA_UI_HEADERS
+		});
 	}
 
 	/**

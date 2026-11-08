@@ -71,11 +71,11 @@ struct server_http_req {
     }
 };
 
-// [TAG_UI_ONLY] true for a request the web UI made: a fetch from a page this server served. The browser sets
-// Sec-Fetch-Site itself (page scripts cannot), another site's page gets "cross-site", and API clients send none, so
-// agents and scripts holding the API key do not reach the UI's own actions by accident. A client that writes the
-// header by hand passes: this keeps honest clients out, it is not a secret. The router forwards the header to its
-// children, so a child sees it as well
+// [TAG_UI_ONLY] true for a request the web UI made: it sends X-RDNA-UI with its own requests to this server, and a
+// browser in a secure context (HTTPS, localhost) also sets Sec-Fetch-Site: same-origin on them (browsers leave that
+// header out over plain HTTP, so a UI opened on a LAN address has only the first). API clients send neither, so agents
+// and scripts holding the API key do not reach the UI's own actions by accident. A client that writes either header
+// by hand passes: this keeps honest clients out, it is not a secret. The router forwards both to its children
 bool server_req_from_ui(const server_http_req & req);
 
 struct server_http_context {

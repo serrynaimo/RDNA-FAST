@@ -5,7 +5,7 @@
  */
 
 import { base } from '$app/paths';
-import { getAuthHeaders } from '$lib/utils/api-headers';
+import { getAuthHeaders, RDNA_UI_HEADERS } from '$lib/utils/api-headers';
 
 export interface ApiResult<T> {
 	ok: boolean;
@@ -33,7 +33,7 @@ export async function rdnaGet<T>(
 	try {
 		const res = await fetch(apiUrl(path, params), {
 			cache: 'no-store',
-			headers: getAuthHeaders(),
+			headers: { ...getAuthHeaders(), ...RDNA_UI_HEADERS },
 			signal
 		});
 

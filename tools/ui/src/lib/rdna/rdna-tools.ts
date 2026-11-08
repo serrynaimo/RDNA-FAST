@@ -20,7 +20,7 @@ import type {
 	OpenAIToolDefinition,
 	ToolExecutionResult
 } from '$lib/types';
-import { getAuthHeaders } from '$lib/utils/api-headers';
+import { getAuthHeaders, RDNA_UI_HEADERS } from '$lib/utils/api-headers';
 
 const RDNA_TOOLS = new Set<string>([
 	BuiltInTool.RDNA_RECENT_CONVERSATIONS,
@@ -412,7 +412,7 @@ async function savePreset(
 	try {
 		const res = await fetch(apiUrl('/models/preset'), {
 			body: JSON.stringify({ args: flags, env, model, reload: args.reload === true }),
-			headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+			headers: { ...getAuthHeaders(), ...RDNA_UI_HEADERS, 'Content-Type': 'application/json' },
 			method: 'POST',
 			signal
 		});
