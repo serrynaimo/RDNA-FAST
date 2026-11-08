@@ -29,14 +29,17 @@
 		status: string;
 		pool: { used: number; total: number } | null;
 		memory: MemorySummary | null;
-		/** System RAM under the VRAM line (null: not reported, or the model runs on the CPU, whose line is RAM). */
+		/** System RAM under the VRAM line (null: not reported yet: the line shows empty). */
 		ram?: RamSummary | null;
+		/** The model runs on the CPU (from its arguments, known before any data): its one line is RAM. */
+		cpu?: boolean;
 		hardware: string | null;
 		/** Each slot's latest request, kept after it finished. */
 		lastRequests?: Record<number, SlotMemory>;
 	}
 
 	let {
+		cpu = false,
 		hardware,
 		lastRequests = {},
 		live,
@@ -205,7 +208,7 @@
 
 	<div class:rf-mem-off={!loaded && !loading} class="rf-mem">
 		<p class="rf-mem-line">
-			<span class="rf-mem-hw">{hardware ?? memory?.kind ?? 'VRAM'}</span>
+			<span class="rf-mem-hw">{hardware ?? memory?.kind ?? (cpu ? 'RAM' : 'VRAM')}</span>
 
 			<span class="rf-mem-figure"
 				>{#if memory}<strong>{(memory.used / GIB).toFixed(1)}</strong>/{(
@@ -223,30 +226,31 @@
 			></div>
 		</div>
 
-		<!-- system RAM (owner, 2026-11-07): the whole system's use in a dimmer gray, the model's own share over it in the VRAM bar's color -->
-		{#if ram && memory?.kind !== 'RAM'}
+		<!-- system RAM (owner, 2026-11-07): the whole system's use in a dimmer gray, the model's own share over it in the VRAM bar's color;
+		     shown empty until the data comes, like the VRAM line (owner, 2026-11-09) -->
+		{#if !cpu && memory?.kind !== 'RAM'}
 			<p
 				class="rf-mem-line rf-mem-ram"
-				title={ram.own !== null
+				title={ram && ram.own !== null
 					? `This model: ${(ram.own / GIB).toFixed(1)} GB, everything else: ${((ram.used - ram.own) / GIB).toFixed(1)} GB`
 					: undefined}
 			>
 				<span class="rf-mem-hw">RAM</span>
 
 				<span class="rf-mem-figure"
-					><strong>{(ram.used / GIB).toFixed(1)}</strong>/{(ram.total / GIB).toFixed(
-						1
-					)}&nbsp;GB</span
+					>{#if ram}<strong>{(ram.used / GIB).toFixed(1)}</strong>/{(ram.total / GIB).toFixed(
+							1
+						)}&nbsp;GB{:else}–{/if}</span
 				>
 			</p>
 
 			<div class="rf-track rf-ram-track">
 				<div
 					class="rf-fill rf-ram-rest"
-					style="width: {Math.min(100, (100 * ram.used) / ram.total)}%;"
+					style="width: {ram ? Math.min(100, (100 * ram.used) / ram.total) : 0}%;"
 				></div>
 
-				{#if ram.own !== null}
+				{#if ram && ram.own !== null}
 					<div
 						class="rf-fill rf-ram-own"
 						style="width: {Math.min(

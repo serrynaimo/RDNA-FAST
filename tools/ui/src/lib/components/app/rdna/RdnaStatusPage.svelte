@@ -170,6 +170,7 @@
 							/>
 
 							<RdnaSlotsTile
+								cpu={model.runtime === 'CPU'}
 								hardware={store.hardware}
 								lastRequests={store.slotMemory}
 								live={store.live}
