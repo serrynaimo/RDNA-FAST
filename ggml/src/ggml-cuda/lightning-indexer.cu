@@ -874,7 +874,9 @@ __global__ __launch_bounds__(128) void qsa_indexer_wmma16_keyreg(
 
 static bool supports_indexer4(int device, const ggml_tensor * dst) {
     const auto * q=dst->src[0], * k=dst->src[1], * w=dst->src[2], * m=dst->src[3];
-    if (!q || !k || !w || !m || !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc)) { return false; }
+    // [TAG_QSA_RDNA3] the kernel is gfx11 wave32 WMMA (compiled for every __GFX11__ target), so RDNA3.0 (RX 7900) takes it
+    // too, not only RDNA3.5; 16.6 KB of LDS fits either
+    if (!q || !k || !w || !m || !GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc)) { return false; }
     if (q->type != GGML_TYPE_F32 || (k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16) ||
             w->type != GGML_TYPE_F32 || m->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32 ||
             q->ne[0] != 128 || q->ne[1] != 4 || k->ne[0] != 128 || k->ne[1] != 1 ||
