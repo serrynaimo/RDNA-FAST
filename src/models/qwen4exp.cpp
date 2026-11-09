@@ -293,6 +293,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
 
     switch (hparams.n_layer()) {
         case 48: type = LLM_TYPE_A3B; break;
+        case 64: type = LLM_TYPE_27B; break; // [TAG_QWEN4_DENSE] Qwen3.8-27B's depth, assumed for Qwen4-27B
         default: type = LLM_TYPE_UNKNOWN;
     }
 }
@@ -389,7 +390,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         const int flags = il < n_layer ? trunk_flags : mtp_flags;
 
-        const int64_t n_ff_exp   = hparams.n_ff_exp_arr[il] ? hparams.n_ff_exp_arr[il] : n_ff / n_expert_used;
+        const int64_t n_ff_exp   = hparams.n_ff_exp_arr[il] ? hparams.n_ff_exp_arr[il] : n_ff / std::max<int64_t>(n_expert_used, 1);
         const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
 
         const int64_t head_k_dim = hparams.ssm_d_state;
@@ -461,6 +462,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             layer.ple_conv1d     = create_tensor(tn(LLM_TENSOR_PLE_CONV1D,     "weight", il), { hparams.ple_conv_kernel, hc_dim }, flags);
         }
 
+        if (n_expert > 0) {
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
@@ -469,6 +471,14 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, flags);
         layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, flags);
         layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, flags);
+        } else {
+            // [TAG_QWEN4_DENSE] a dense Qwen4 (Qwen4-27B per its leaked kernel shapes): the Qwen3.8-27B SwiGLU FFN
+            // behind the same HC modules, no expert count in the file
+            const int64_t n_ff = hparams.n_ff(il);
+            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), { n_embd, n_ff }, flags);
+            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), { n_ff, n_embd }, flags);
+            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), { n_embd, n_ff }, flags);
+        }
 
         if (il < n_layer) {
             continue;
@@ -2030,7 +2040,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
-    GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
+    if (model.layers[il].ffn_gate_inp == nullptr) {
+        // [TAG_QWEN4_DENSE] dense SwiGLU, as qwen35
+        GGML_ASSERT(model.layers[il].ffn_up != nullptr && model.layers[il].ffn_gate != nullptr);
+        cur = build_ffn(cur,
+            model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
+            model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
+            model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
+            NULL,
+            LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(cur, "ffn_out", il);
+        return cur;
+    }
 
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
