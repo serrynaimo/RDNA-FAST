@@ -145,6 +145,7 @@ measured here:
 | variable | what it does | where it helps |
 |---|---|---|
 | `GPU_MAX_HW_QUEUES=1` | all GPU work of the process goes through one hardware queue instead of four | Linux (amdgpu): a server with `--mmproj` that keeps the GPU at full load and clocks while idle. Not needed on Windows. Work on separate GPU streams can no longer overlap |
+| `GPU_RESOURCE_CACHE_SIZE`, `GPU_MAX_RESOURCE_CACHE_SIZE` | the runtime's cache of freed GPU memory. This code sets both to 0 on Windows unless they are already set: freed compute buffers go back to the driver instead of staying with the process | Windows. With the cache, Flash-Next on the RX 7900 XT kept ~1.5 GB of freed buffers and spilled into shared memory |
 
 **Diagnostics.** None of these is needed in normal use:
 
