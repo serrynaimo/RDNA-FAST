@@ -9066,9 +9066,14 @@ struct test_flash_attn_ext_qsa : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
+        // every tensor gets data, the sentinels test_case::eval puts around each one included: the compare reads them,
+        // and stale device memory left in a sentinel shows up as "[NONE] NaN at index i" on both backends
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src == nullptr && strcmp(t->name, "m") != 0 && strcmp(t->name, "ids") != 0) {
+                init_tensor_uniform(t);
+            }
+        }
         init_tensor_uniform(ggml_get_tensor(ctx, "q_raw"), -q_range, q_range);
-        init_tensor_uniform(ggml_get_tensor(ctx, "k_cache"));
-        init_tensor_uniform(ggml_get_tensor(ctx, "v_cache"));
 
         const int64_t n = ns();
         std::vector<int32_t> ids((size_t) (n*n_q), -1);
