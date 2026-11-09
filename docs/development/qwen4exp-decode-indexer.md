@@ -7,8 +7,12 @@ selection: sparse attention consumes the selected indices, so selection now runs
 
 ## Dispatch and fallback
 
-The gfx1151 sparse decode kernels read selected cells directly from existing F16
-K/V caches. They support D=256, one stream and 1-8 query tokens, with F32 queries
+The sparse decode kernels run on gfx11 (RDNA3.5 such as gfx1151, and RDNA3 such as
+the RX 7900 XT's gfx1100) and read selected cells directly from the existing K/V
+caches: F16, or Q8_0 / Q4_0 in place. On the RX 7900 XT, Flash-Next with MTP drafting
+and expert handoff measured a mean KL divergence against dense decode of 0.0093 vs
+0.0094 (the noise floor) and decoded at 32.2 instead of 26.9 t/s at 19k tokens.
+They support D=256, one stream and 1-8 query tokens, with F32 queries
 and output, up to 262144 cached cells and 2560 selected indices. Sinks, ALiBi and
 attention soft caps use the existing fallback. The WMMA path requires 12 query
 heads per KV head and aligned keys; other supported layouts use the SIMT path.
