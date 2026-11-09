@@ -878,6 +878,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_CLOVER_MOE:
+        case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_PHIMOE:
         case LLM_ARCH_DBRX:
         case LLM_ARCH_OLMOE:
@@ -943,7 +944,6 @@ static bool moe_implemented(const llm_arch arch) {
         case LLM_ARCH_MISTRAL3:
         case LLM_ARCH_LLAMA_EMBED:
         case LLM_ARCH_K2_HORIZON:
-        case LLM_ARCH_QWEN4EXP: // [TAG_QWEN4_DENSE] MoE (Flash-Next) and dense (Qwen4-27B)
             return true;
         default:
             return false;
