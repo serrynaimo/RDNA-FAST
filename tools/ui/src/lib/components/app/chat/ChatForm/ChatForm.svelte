@@ -29,6 +29,7 @@
 	import {
 		chatStore,
 		conversationsStore,
+		deviceStore,
 		mcpStore,
 		modelsStore,
 		serverStore,
@@ -56,9 +57,12 @@
 		AudioRecorder,
 		convertToWav,
 		createAudioFile,
-		isAudioRecordingSupported
+		describeMicrophoneError,
+		isAudioRecordingSupported,
+		microphoneUnavailableReason
 	} from '$lib/utils/browser-only';
 	import { onMount } from 'svelte';
+	import { toast } from 'svelte-sonner';
 
 	interface Props {
 		// Data
@@ -117,6 +121,10 @@
 	// Audio Recording State
 	let isRecording = $state(false);
 	let recordingSupported = $state(false);
+	/** Why this page can't record at all (no HTTPS, no recorder), which no tap fixes. */
+	let micUnavailableReason = $state<string | null>(null);
+	/** Why the last start failed (denied, no microphone, busy); the next tap tries again. */
+	let micError = $state<string | null>(null);
 
 	// Invisible anchor at the form's top edge so the mention/WD popovers
 	// float above the box.
@@ -124,6 +132,14 @@
 
 	let cwd = $derived(
 		conversationsStore.activeConversation?.cwd ?? conversationsStore.preferences.pendingCwd
+	);
+
+	let showWorkingDirectory = $derived(conversationsStore.preferences.hasEnabledCwdTools());
+	// A phone has no chip for the working directory under the form: a chat shows it in its
+	// header (see ChatScreenMobileHeader), and a new chat, which has no header yet, offers it in
+	// the + menu
+	let isWorkingDirectoryInAddMenu = $derived(
+		showWorkingDirectory && deviceStore.isMobile && !conversationsStore.activeConversation
 	);
 
 	const pickers = useChatFormPickers({
@@ -204,11 +220,16 @@
 
 	onMount(() => {
 		recordingSupported = isAudioRecordingSupported();
+		micUnavailableReason = microphoneUnavailableReason();
 		audioRecorder = new AudioRecorder();
 	});
 
 	export function focus() {
 		inputRef?.focus();
+	}
+
+	export function openWorkingDirectoryPicker() {
+		pickers.handleWorkingDirectoryOpen();
 	}
 
 	export function openModelSelector() {
@@ -458,6 +479,13 @@
 	}
 
 	async function handleMicClick() {
+		// a phone shows no tooltip on a tap, so the reason comes as a toast
+		if (micUnavailableReason) {
+			toast.error(micUnavailableReason);
+
+			return;
+		}
+
 		if (!audioRecorder || !recordingSupported) {
 			console.warn('Audio recording not supported');
 
@@ -479,8 +507,10 @@
 			try {
 				await audioRecorder.startRecording();
 				isRecording = true;
+				micError = null;
 			} catch (error) {
-				console.error('Failed to start recording:', error);
+				micError = describeMicrophoneError(error);
+				toast.error(micError);
 			}
 		}
 	}
@@ -577,10 +607,14 @@
 				{isLoading}
 				isReasoning={chatStore.isReasoning}
 				{isRecording}
+				micWarning={micUnavailableReason ?? micError}
 				onFileUpload={handleFileUpload}
 				onMicClick={handleMicClick}
 				{onStop}
 				onSystemPromptClick={() => onSystemPromptClick?.({ files: uploadedFiles, message: value })}
+				onWorkingDirectoryClick={isWorkingDirectoryInAddMenu
+					? pickers.handleWorkingDirectoryOpen
+					: undefined}
 				{showAddButton}
 				{showModelSelector}
 				{uploadedFiles}
@@ -590,7 +624,8 @@
 
 	<ContextGaugePopup />
 
-	{#if conversationsStore.preferences.hasEnabledCwdTools()}
+	{#if showWorkingDirectory}
+		<!-- a phone opens the picker from elsewhere (see isWorkingDirectoryInAddMenu): no chip here -->
 		<ChatFormCurrentWorkingDirectory
 			bind:query={pickers.workingDirectoryQuery}
 			customAnchor={mentionAnchor}
@@ -600,6 +635,7 @@
 			onChange={handleWorkingDirectoryChange}
 			onClose={pickers.handleWorkingDirectoryClose}
 			onOpen={pickers.handleWorkingDirectoryOpen}
+			showChip={!deviceStore.isMobile}
 		/>
 	{/if}
 </form>
