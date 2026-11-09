@@ -12170,6 +12170,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, 100, 1000, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
     }
 
+    // ROCmFPX [TAG_HC_SKINNY]: many short rows at 1-8 columns (the qwen4exp hyper-connection up-projections, K = 320),
+    // with a row count that is not a whole block of rows, K at the 1024 limit and one past it (the general kernels)
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL}) {
+        for (int n : {1, 2, 4, 5, 8}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 10240, n,  320, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  1030, n,  320, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  2048, n, 1024, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  2048, n, 1056, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+        }
+    }
+
     // test large experts*tokens
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, b, 32, 1024, 16));
@@ -13515,6 +13526,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int64_t n : {1, 2, 4, 5}) {
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, n,  5120, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  5120, n, 17408, {1, 1}, {1, 1}));
+        }
+    }
+
+    // ROCmFPX [TAG_HC_SKINNY]: the hyper-connection projections of qwen4exp at decode, 4 streams: up = the low rank 320
+    // back to 4 x n_embd rows (K = 320), down = 4 x n_embd to 320, inject = 4 x n_embd to 4. Qwen4-27B (n_embd 5120,
+    // HC in Q8_0 in our quant) and Flash-Next (n_embd 2560, BF16 in its GGUF); one token and a verify batch of 4.
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_BF16, GGML_TYPE_F16}) {
+        for (int64_t hc_dim : {20480, 10240}) {
+            for (int64_t n : {1, 4}) {
+                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, hc_dim, n,    320, {1, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,    320, n, hc_dim, {1, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,      4, n, hc_dim, {1, 1}, {1, 1}));
+            }
         }
     }
 
