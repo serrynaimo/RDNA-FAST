@@ -12178,6 +12178,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  1030, n,  320, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  2048, n, 1024, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  2048, n, 1056, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+            // the edges of the one-warp rule: Q8_0 below / at 512, the 4- and 5-bit types below / at 1024
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  2048, n,  480, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  2048, n,  512, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  2048, n,  992, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
         }
     }
 
@@ -13539,6 +13543,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,    320, n, hc_dim, {1, 1}, {1, 1}));
                 test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,      4, n, hc_dim, {1, 1}, {1, 1}));
             }
+        }
+    }
+    // ROCmFPX [TAG_HC_SKINNY]: one column over K, to see where one warp per row stops paying (10240 rows)
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL, GGML_TYPE_BF16}) {
+        for (int64_t k : {256, 320, 480, 512, 768, 992, 1024, 2048, 2560}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 10240, 1, k, {1, 1}, {1, 1}));
         }
     }
 

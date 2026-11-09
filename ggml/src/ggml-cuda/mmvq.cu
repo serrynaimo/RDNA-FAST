@@ -670,14 +670,19 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
-// [TAG_HC_SKINNY] RDNA3.0 (gfx1100) at one column on short rows: the types that take 8 warps per row there leave most
+// [TAG_HC_SKINNY] RDNA3.0 and RDNA4 at one column on short rows: the types that take 8 warps per row there leave most
 // lanes idle when a row has fewer blocks than 8 warps read in one pass (K = 320 in Q8_0 is 10 blocks of the 64), and
 // spend the time on one block and a shared-memory reduction per row (the hyper-connection up-projections of qwen4exp:
-// 20480 rows of 320). Short rows take one warp per block and four rows per block instead. RX 7900 XT (2026-11-09),
-// Q8_0 at one column: 20480 x 320 42.2 -> 6.4 us, 10240 x 320 16.8 -> 4.5 us (2 rows 7.3 / 4.9, 8 rows 6.3 / 4.9, the
-// generic 8 warps x 8 rows 14.9 / 8.2); the synthetic Qwen4-27B decodes 25.0 -> 27.7 t/s at 8k.
-#define GGML_CUDA_RDNA3_SMALLK_NWARPS 1
-#define GGML_CUDA_RDNA3_SMALLK_RPB    4
+// 20480 rows of 320). Rows that keep only one warp busy (fewer blocks than two warps read in one pass: K < 512 in Q8_0,
+// K < 1024 in the 4- and 5-bit types; see should_use_small_k) take one warp per block and four rows per block instead.
+// RX 7900 XT (2026-11-09), Q8_0 at one column: 20480 x 320 42.2 -> 6.4 us, 10240 x 320 16.8 -> 4.5 us (2 rows 7.3 /
+// 4.9, 8 rows 6.3 / 4.9, the generic 8 warps x 8 rows 14.9 / 8.2); the synthetic Qwen4-27B decodes 25.0 -> 27.7 t/s at
+// 8k. RDNA4 not measured here: it has the same 8-warp table, and llama.cpp PR #20831 measured fewer warps for narrow
+// matrices as a gain on the R9700 (gfx1201) and the W7900 (gfx1100). RDNA3.5 already runs one warp per row for these
+// types (more were measured slower on the Radeon 8060S, PR #19478), so it keeps its table.
+#define GGML_CUDA_RDNA_SHORT_ROW_NWARPS 1
+#define GGML_CUDA_RDNA_SHORT_ROW_RPB    4
+#define GGML_CUDA_RDNA_SHORT_ROW_PASSES 2   // rows shorter than what this many warps read in one pass
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
@@ -711,6 +716,10 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         }
     }
     if (table_id == MMVQ_PARAMETERS_RDNA4) {
+        // [TAG_HC_SKINNY] short rows (see should_use_small_k)
+        if (small_k && ncols_dst == 1) {
+            return GGML_CUDA_RDNA_SHORT_ROW_NWARPS;
+        }
         // nwarps=8 benefits types with simple vec_dot on RDNA4 (ncols_dst=1).
         // Types with complex vec_dot (Q3_K, IQ2_*, IQ3_*) regress due to register
         // pressure and lookup table contention at higher thread counts.
@@ -762,9 +771,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         }
     }
     if (table_id == MMVQ_PARAMETERS_RDNA3_0) {
-        // [TAG_HC_SKINNY] short rows (see should_use_small_k): GGML_CUDA_RDNA3_SMALLK_NWARPS warps per block
+        // [TAG_HC_SKINNY] short rows (see should_use_small_k)
         if (small_k && ncols_dst == 1) {
-            return GGML_CUDA_RDNA3_SMALLK_NWARPS;
+            return GGML_CUDA_RDNA_SHORT_ROW_NWARPS;
         }
         // RDNA3 (W7900): stricter whitelist than RDNA4.
         // Q2_K / Q5_K / IQ4_XS regress in full quant sweeps.
@@ -863,8 +872,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
                 return 1;
         }
     }
-    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && small_k && ncols_dst == 1) {
-        return GGML_CUDA_RDNA3_SMALLK_RPB;   // [TAG_HC_SKINNY]
+    if ((table_id == MMVQ_PARAMETERS_RDNA3_0 || table_id == MMVQ_PARAMETERS_RDNA4) && small_k && ncols_dst == 1) {
+        return GGML_CUDA_RDNA_SHORT_ROW_RPB;   // [TAG_HC_SKINNY]
     }
     if (table_id == MMVQ_PARAMETERS_RDNA3_5) {
         if (ncols_dst >= 5 && ncols_dst <= 8) {
@@ -1718,12 +1727,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
             }
         } else if ((ncols_dst == 1 && std::find(iq_slow_other.begin(), iq_slow_other.end(), type) != iq_slow_other.end()) ||
                 (is_nvidia_pascal_older && std::find(slow_pascal.begin(), slow_pascal.end(), type) != slow_pascal.end()) ||
-                (GGML_CUDA_CC_IS_RDNA(cc) && !GGML_CUDA_CC_IS_RDNA3_0(cc))) {
-            use = false;   // RDNA3.0 has its own short-row shape ([TAG_HC_SKINNY], calc_nwarps)
+                (GGML_CUDA_CC_IS_RDNA(cc) && !GGML_CUDA_CC_IS_RDNA3_0(cc) && !GGML_CUDA_CC_IS_RDNA4(cc))) {
+            use = false;   // RDNA3.0 and RDNA4 have their own short-row shape ([TAG_HC_SKINNY], calc_nwarps)
         }
-        // plain products only (expert matmuls keep their measured shape), and the kernel reads every row of its block,
-        // so the rows must fill the last block
-        if (GGML_CUDA_CC_IS_RDNA3_0(cc) && (has_ids || nrows_x % GGML_CUDA_RDNA3_SMALLK_RPB != 0)) {
+        // [TAG_HC_SKINNY] only rows that keep one warp busy, plain products only (expert matmuls keep their measured
+        // shape), and the kernel reads every row of its block, so the rows must fill the last block
+        if ((GGML_CUDA_CC_IS_RDNA3_0(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) &&
+                (blocks_per_row_x >= GGML_CUDA_RDNA_SHORT_ROW_PASSES * blocks_per_iter_1warp || has_ids ||
+                 nrows_x % GGML_CUDA_RDNA_SHORT_ROW_RPB != 0)) {
             use = false;
         }
 

@@ -274,9 +274,10 @@ extern "C" __declspec(dllimport) int __stdcall SetEnvironmentVariableA(const cha
 // back only to an allocation of the same size. When a compute buffer is re-reserved at another size (warmup off, a
 // graph the reserve did not cover) the freed buffers stay committed, invisible to the fit, and push the process into
 // shared memory. RX 7900 XT, Flash-Next with qwen4exp's sparse attention (compute buffer 741 -> 755 -> 783 MiB at the
-// first prompt): 19.82 GB + 0.75 GB shared after a 19k prompt with the cache, 18.84 + 0.22 without, prefill 177 -> 260
-// tokens/s; prod's binary 220 -> 234. ggml keeps its own pools, so the cache is off unless the variables are set.
-// It must happen before the first HIP call, which reads them.
+// first prompt): 19.82 GB + 0.75 GB shared after a 19k prompt with the cache, 18.84 + 0.22 without, prefill at 11.4k /
+// 19k 187 / 177 -> 301 / 245 tokens/s. A build whose buffers keep their size loses nothing either way (Swift 27B 1076 /
+// 1070 t/s prefill at 19.5k). ggml keeps its own pools, so the cache is off unless the variables are set. It must
+// happen before the first HIP call, which reads them.
 static void ggml_cuda_hip_resource_cache_default() {
     for (const char * name : { "GPU_RESOURCE_CACHE_SIZE", "GPU_MAX_RESOURCE_CACHE_SIZE" }) {
         if (GetEnvironmentVariableA(name, nullptr, 0) == 0) {

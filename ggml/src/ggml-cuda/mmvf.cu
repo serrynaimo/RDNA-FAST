@@ -611,7 +611,9 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
 // qwen4exp (Flash-Next: 10240 rows of 320 in BF16, four of them per layer and token) wait on block scheduling, not on
 // memory. Here one warp walks a row and a block holds MMVF_SKINNY_RPB rows; the reduction stays in the warp. RX 7900 XT
 // (2026-11-09), one column: BF16 20480 x 320 37.8 -> 12.8 us, 10240 x 320 19.7 -> 7.1 us (F16 the same; 1, 2 or 8
-// rows per block within 0.4 us); 4-column batches and long rows unchanged. Measured on gfx1100 only, so only taken there.
+// rows per block within 0.4 us); 4-column batches and long rows unchanged. Taken on RDNA3.0 and RDNA4, which share the
+// CU layout, wave32 and the block-per-row cost (RDNA4 not measured here); not on RDNA3.5, whose shared LPDDR5X memory
+// made the MMVQ shapes behave differently (llama.cpp PR #19478), nor on other cards.
 #define MMVF_SKINNY_MAX_K    1024
 #define MMVF_SKINNY_MIN_ROWS 1024
 #define MMVF_SKINNY_RPB      4
@@ -777,7 +779,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     if (!ids && !fusion && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && ne00 % 2 == 0 && s01 % 2 == 0 &&
             stride_col_y % 2 == 0 && ncols_dst <= 8 && ne00 <= MMVF_SKINNY_MAX_K && ne01 >= MMVF_SKINNY_MIN_ROWS &&
-            GGML_CUDA_CC_IS_RDNA3_0(cc)) {
+            (GGML_CUDA_CC_IS_RDNA3_0(cc) || GGML_CUDA_CC_IS_RDNA4(cc))) {
         switch (src0->type) {   // [TAG_HC_SKINNY]
             case GGML_TYPE_F32:
                 mul_mat_vec_f_skinny_cuda((const float *) src0->data, src1_d, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y,
