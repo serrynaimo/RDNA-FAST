@@ -20,7 +20,7 @@ formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
 - **Fast Multi-token prediction.** The model's own MTP head drafts tokens
   ahead: up to 61 t/s on prose and 96 t/s on code. When an answer repeats text
   from the prompt, as code edits do, n-gram drafting copies it at up to 315 t/s.
-  DFlash2 drafters are supported too. [More](#other-cards)
+  DFlash2 and DSpine drafters are supported too. [More](#other-cards)
 
 - **Prompts on the matrix cores.** Prompt processing runs on RDNA3's WMMA units
   through [rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) by Adel
@@ -282,6 +282,9 @@ switch in [Environment variables](docs/FLAGS.md#environment-variables).
   1.5 IQ4_XS. On the RX 7900 XT at 8k, one slot (1.1 GB still paged out): code
   76 t/s median, 95 peak (MTP + n-gram at 32k: 76, 86), prose 43 (MTP 51). MTP
   stays the default; DFlash2 is for code-heavy work on a bigger card.
+  Tencent's DSpine drafter for Qwen3.8-27B loads the same way: on the CPU it
+  accepts as many tokens per pass as DFlash2; it has not run on a GPU yet.
+  [Flags](docs/FLAGS.md#block-drafters)
 - **Settings.** `-c`, `-ub 2048` and the VRAM split in this README are sized
   for 20 GB of VRAM. The speed tables are for the RX 7900 XT.
 
