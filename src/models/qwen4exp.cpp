@@ -293,6 +293,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
 
     switch (hparams.n_layer()) {
         case 48: type = LLM_TYPE_A3B; break;
+        case 64: type = LLM_TYPE_27B; break; // [TAG_QWEN4_DENSE] Qwen3.8-27B's depth, assumed for Qwen4-27B
         default: type = LLM_TYPE_UNKNOWN;
     }
 }
@@ -389,7 +390,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         const int flags = il < n_layer ? trunk_flags : mtp_flags;
 
-        const int64_t n_ff_exp   = hparams.n_ff_exp_arr[il] ? hparams.n_ff_exp_arr[il] : n_ff / n_expert_used;
+        const int64_t n_ff_exp   = hparams.n_ff_exp_arr[il] ? hparams.n_ff_exp_arr[il] : n_ff / std::max<int64_t>(n_expert_used, 1);
         const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
 
         const int64_t head_k_dim = hparams.ssm_d_state;
@@ -461,6 +462,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             layer.ple_conv1d     = create_tensor(tn(LLM_TENSOR_PLE_CONV1D,     "weight", il), { hparams.ple_conv_kernel, hc_dim }, flags);
         }
 
+        if (n_expert > 0) {
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
@@ -469,6 +471,14 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, flags);
         layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, flags);
         layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, flags);
+        } else {
+            // [TAG_QWEN4_DENSE] a dense Qwen4 (Qwen4-27B per its leaked kernel shapes): the Qwen3.8-27B SwiGLU FFN
+            // behind the same HC modules, no expert count in the file
+            const int64_t n_ff = hparams.n_ff(il);
+            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), { n_embd, n_ff }, flags);
+            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), { n_ff, n_embd }, flags);
+            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), { n_embd, n_ff }, flags);
+        }
 
         if (il < n_layer) {
             continue;
@@ -1093,17 +1103,51 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
 // The original `!ubatch.embd` guard was aimed at pure-embedding (vision) batches, which are already
 // excluded by requiring ubatch.token; keeping it shut the draft out of block selection, and with it out of
 // the maskless/packed-key layout and the qsa3 attention kernel.
+// [TAG_QSA_CAPS] the QSA kernels dev has for one attention shape and KV cache type (ggml-cuda qsa.cuh): bit 0 the decode
+// kernel (1..8 queries, keeps the mask), bit 1 the prompt kernel (128+ queries, the mask may be dropped). Only an op one
+// of them takes may carry the selected cells in src[5]: every other flash-attention path ignores src[5] and would attend
+// to the whole cache. Backends without the query answer 0.
+enum : uint32_t {
+    QWEN4EXP_QSA_DECODE = 1u << 0,
+    QWEN4EXP_QSA_PROMPT = 1u << 1,
+};
+static uint32_t qwen4exp_dev_qsa_caps(ggml_backend_dev_t dev, int64_t head_size, int64_t gqa, ggml_type type_k, ggml_type type_v) {
+    if (dev == nullptr) {
+        return 0;
+    }
+    using fn_t = uint32_t (*)(ggml_backend_dev_t, int64_t, int64_t, ggml_type, ggml_type);
+    auto fn = (fn_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_dev_qsa_caps");
+    return fn != nullptr ? fn(dev, head_size, gqa, type_k, type_v) : 0;
+}
+
+// every sparse layer's device has the decode kernel for this cache (K/V types, GQA, head size)
+static bool qwen4exp_qsa_decode_kernel(const llama_model & model, const llama_hparams & hparams, ggml_type type_k, ggml_type type_v) {
+    bool any = false;
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        if (hparams.dsv4_compress_ratios[il] == 0 || hparams.n_head_kv(il) == 0) {
+            continue;
+        }
+        any = true;
+        const int64_t gqa = hparams.n_head(il) / hparams.n_head_kv(il);
+        if (!(qwen4exp_dev_qsa_caps(model.dev_layer(il), hparams.n_embd_head_k(il), gqa, type_k, type_v) & QWEN4EXP_QSA_DECODE)) {
+            return false;
+        }
+    }
+    return any;
+}
+
 // Decode-sized ubatches (1..8 tokens) go to the bounded sparse decode kernel (ggml-cuda/qsa-decode.cuh) when
-// ROCMFPX_QWEN4_QSA_DECODE=1; build_qsa_top_k and build_attn_qsa must agree on it, so both ask here.
-static bool qwen4exp_qsa_decode_direct(int64_t n_tokens, int64_t n_query, int64_t n_kv) {
+// ROCMFPX_QWEN4_QSA_DECODE=1 and every sparse layer's device has it for the cache (kernel, see qwen4exp_qsa_decode_kernel);
+// build_qsa_top_k and build_attn_qsa must agree on it, so both ask here.
+static bool qwen4exp_qsa_decode_direct(int64_t n_tokens, int64_t n_query, int64_t n_kv, bool kernel) {
 #if defined(GGML_USE_HIP)
     static const bool enabled = [] {
         const char * v = getenv("ROCMFPX_QWEN4_QSA_DECODE");
         return v && strcmp(v, "1") == 0;
     }();
-    return enabled && n_tokens >= 1 && n_tokens <= 8 && n_query >= 1 && n_query <= 8 && n_kv >= 8192;
+    return enabled && kernel && n_tokens >= 1 && n_tokens <= 8 && n_query >= 1 && n_query <= 8 && n_kv >= 8192;
 #else
-    GGML_UNUSED(n_tokens); GGML_UNUSED(n_query); GGML_UNUSED(n_kv);
+    GGML_UNUSED(n_tokens); GGML_UNUSED(n_query); GGML_UNUSED(n_kv); GGML_UNUSED(kernel);
     return false;
 #endif
 }
@@ -1113,16 +1157,17 @@ static bool qwen4exp_qsa_decode_direct(int64_t n_tokens, int64_t n_query, int64_
 // context (per-cell score expansion, mask add and a top-k over n_kv cells per layer, plus the O(n_kv) CPU block scan
 // per ubatch; ~18 ms per token at 165k on gfx1151). The masked dense attention path cannot (set_rows on -1), so this
 // is tied to the decode kernel. ROCMFPX_QWEN4_QSA_DECODE_BLOCKS=0 keeps the per-cell selection.
-static bool qwen4exp_qsa_decode_blocks(int64_t n_tokens, int64_t n_stream, int64_t n_kv) {
+static bool qwen4exp_qsa_decode_blocks(int64_t n_tokens, int64_t n_stream, int64_t n_kv, bool decode_kernel) {
     static const bool enabled = [] {
         const char * v = getenv("ROCMFPX_QWEN4_QSA_DECODE_BLOCKS");
         return !v || strcmp(v, "0") != 0;
     }();
-    return enabled && n_stream == 1 && qwen4exp_qsa_decode_direct(n_tokens, n_tokens, n_kv);
+    return enabled && n_stream == 1 && qwen4exp_qsa_decode_direct(n_tokens, n_tokens, n_kv, decode_kernel);
 }
 
-// the block selection of prompt ubatches lists -1 sentinels that only the maskless qsa kernel reads; it exists on
-// RDNA3.5 only, so on other cards (and when any layer's device lacks it) prompts keep the masked path
+// the block selection of prompt ubatches lists -1 sentinels that only the maskless qsa kernel and the fused top-k mask
+// read; the kernel exists on gfx11 (RDNA3, RDNA3.5), so on other cards (and when any layer's device lacks it) prompts
+// keep the masked path with the block-expanded top-k
 static bool qwen4exp_dev_sparse_maskless(ggml_backend_dev_t dev) {
     if (dev == nullptr) {
         return false;
@@ -1133,10 +1178,11 @@ static bool qwen4exp_dev_sparse_maskless(ggml_backend_dev_t dev) {
 }
 
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_t ratio, int64_t n_kv,
-        const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams, bool sparse_maskless) {
+        const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams, bool sparse_maskless,
+        bool decode_kernel) {
     return blk_bias && n_stream==1 && ratio>1 && hparams.indexer_top_k%ratio==0 &&
         n_kv>hparams.indexer_top_k+ratio-1 && n_kv<=16777216 && ubatch.token &&
-        ((ubatch.n_tokens >= 128 && sparse_maskless) || qwen4exp_qsa_decode_blocks(ubatch.n_tokens, n_stream, n_kv)) &&
+        ((ubatch.n_tokens >= 128 && sparse_maskless) || qwen4exp_qsa_decode_blocks(ubatch.n_tokens, n_stream, n_kv, decode_kernel)) &&
         cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias==0.0f &&
         !hparams.attn_soft_cap && hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256;
 }
@@ -1219,7 +1265,7 @@ public:
         res &= bias->ne[0] == (compact ? n_blocks+params.ubatch.n_tokens : (blk_bias ? n_blocks : n_kv));
         res &= compact || bias->ne[1] == params.ubatch.n_tokens/n_stream;
         const bool blocks=qwen4exp_use_block_selection(blk_bias,n_stream,ratio,n_kv,
-                params.ubatch,params.cparams,params.hparams,sparse_maskless);
+                params.ubatch,params.cparams,params.hparams,sparse_maskless,decode_kernel);
         const bool scalar=blocks && causal_attn && params.hparams.n_swa==0 && mctx->qsa_scalar_visibility(params.ubatch);
         res &= (tail_idxs != nullptr) == scalar;
         res &= compact == scalar;
@@ -1248,6 +1294,7 @@ public:
     bool compact = false;
     bool maskless = false;
     bool sparse_maskless = false;   // every layer's device has the maskless qsa kernel
+    bool decode_kernel = false;     // [TAG_QSA_CAPS] every sparse layer's device has the qsa decode kernel for the cache
     int64_t score_strip = 0;
     std::vector<int64_t> score_key_limits;       // [QSA_SCORE_BOUNDS] per strip, empty = no bound
 
@@ -1408,7 +1455,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             sparse_maskless = qwen4exp_dev_sparse_maskless(model.dev_layer(jl));
         }
         qsa->sparse_maskless = sparse_maskless;
-        const bool scalar = qwen4exp_use_block_selection(blk_bias,n_stream,r,n_kv,ubatch,cparams,hparams,sparse_maskless) &&
+        const auto * kv_attn = mctx_hyb->get_attn();
+        qsa->decode_kernel = kv_attn != nullptr && qwen4exp_qsa_decode_kernel(model, hparams, kv_attn->type_k(), kv_attn->type_v());
+        const bool scalar = qwen4exp_use_block_selection(blk_bias,n_stream,r,n_kv,ubatch,cparams,hparams,sparse_maskless,
+                qsa->decode_kernel) &&
             cparams.causal_attn && hparams.n_swa==0 && mctx_hyb->qsa_scalar_visibility(ubatch);
         qsa->incremental_prefix = r == 4 && mctx_hyb->qsa_prefix_matches(ubatch);
         qsa->compact = scalar;
@@ -1662,6 +1712,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
             ggml_build_forward_expand(gf,packed_values);
         }
     }
+    // [TAG_QSA_CAPS] the kernels of this layer's device that read top_k as the selected cells (src[5]); everything else
+    // takes the masked path below. f16 caches reach the prompt kernel through the packed layouts above, q8_0 / q4_0 caches
+    // are read in place (no f16 copy of the cache).
+    const ggml_type kv_type_k = mctx_cur->type_k(), kv_type_v = mctx_cur->type_v();
+    const uint32_t qsa_caps = qwen4exp_dev_qsa_caps(model.dev_layer(il), q_cur->ne[0], q_cur->ne[1]/k_cur->ne[1], kv_type_k, kv_type_v);
+    const bool decode_kernel = shared_qsa != qsa_inps.end() && shared_qsa->second->decode_kernel;
+    const bool sparse_ok = n_stream == 1 && cparams.flash_attn && cparams.offload_kqv &&
+        hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap;
     std::vector<ggml_tensor *> output;
     for (int64_t first = 0; first < n_tps; first += strip) {
         const int64_t n_query = std::min(strip, n_tps - first);
@@ -1670,20 +1728,29 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_tensor * top_k = ggml_view_4d(ctx0, indices_all, indices_all->ne[0], n_query, 1, n_stream,
                 indices_all->nb[1], indices_all->nb[2], indices_all->nb[3], first*indices_all->nb[1]);
 
-        // Private gfx1151 experiment: the existing QSA decode kernel consumes
-        // the selected indices too. Keep the causal mask and fail closed on
-        // unsupported shapes below. Keep the original path for short caches:
-        // the sparse WMMA path changes rounding and only benefits longer scans.
-        // The default path is unchanged.
-        const bool decode_direct = qwen4exp_qsa_decode_direct(n_tokens, n_query, kq_mask->ne[0]);
-        const bool direct_indices =
-            (n_tokens >= 128 || decode_direct) &&
-            n_stream == 1 && cparams.flash_attn && cparams.offload_kqv &&
-            hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap;
-        // a complete-block list (compact selection) carries -1 sentinels that only the index-consuming kernels skip
-        GGML_ASSERT(direct_indices || shared_qsa == qsa_inps.end() || !shared_qsa->second->compact);
+        // The QSA decode kernel (ROCMFPX_QWEN4_QSA_DECODE=1, see qwen4exp_qsa_decode_direct) consumes the selected
+        // indices too and keeps the causal mask; shapes it does not take fail closed below. Short caches keep the
+        // original path: the sparse WMMA path changes rounding and only benefits longer scans.
+        const bool decode_direct = sparse_ok && (qsa_caps & QWEN4EXP_QSA_DECODE) &&
+            qwen4exp_qsa_decode_direct(n_tokens, n_query, kq_mask->ne[0], decode_kernel) &&
+            top_k->ne[0] <= 2560 && kq_mask->ne[0] <= 262144;
+        // [TAG_QSA_KV_TYPE] the prompt kernel reads f16 caches through the packed layouts and q8_0 / q4_0 caches in place;
+        // anything it does not take (no packed layouts for an f16 cache, a wider selection, a longer cache) keeps the
+        // masked path below rather than an op that a dense kernel would run over the whole cache
+        const bool prompt_direct = sparse_ok && (qsa_caps & QWEN4EXP_QSA_PROMPT) && n_tokens >= 128 && n_query >= 128 &&
+            top_k->ne[0] <= 2560 && kq_mask->ne[0] <= 262140 && kq_mask->ne[0] % 4 == 0 &&
+            (kv_type_k != GGML_TYPE_F16 || (packed_keys && packed_values));
+        const bool direct_indices = decode_direct || prompt_direct;
+        // a complete-block list (compact selection) carries -1 sentinels that only the index-consuming kernels and the
+        // fused top-k mask (which skips picks out of range) handle
+        GGML_ASSERT(direct_indices || cparams.fused_top_k_mask || shared_qsa == qsa_inps.end() || !shared_qsa->second->compact);
         ggml_tensor * kq_mask_top_k = kq_mask;
-        if (!direct_indices) {
+        if (!direct_indices && cparams.fused_top_k_mask) {
+            // [TAG_QSA_FUSED_MASK] one op: the kq_mask cells of the picks, -inf elsewhere (top_k already comes in the
+            // row layout of this strip of the mask, so no reshape)
+            kq_mask_top_k = ggml_top_k_mask(ctx0, kq_mask, top_k, nullptr, nullptr, nullptr);
+            res->add_fused_node({LLM_FUSED_OP_TOP_K_MASK, kq_mask_top_k, il});
+        } else if (!direct_indices) {
         // prepare new kq mask - starts filled with -INFINITY
         ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
 
@@ -1723,7 +1790,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         //ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
         ggml_tensor * cur;
         if (direct_indices) {
-            GGML_ASSERT(q->ne[0] == 256 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
+            GGML_ASSERT(q->ne[0] == 256 && k->type == kv_type_k && v->type == kv_type_v);
             const bool v_trans = v->nb[1] > v->nb[2];
             ggml_tensor * q_view = ggml_permute(ctx0, q, 0, 2, 1, 3);
             ggml_tensor * k_view = ggml_permute(ctx0, k, 0, 2, 1, 3);
@@ -1732,19 +1799,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
             const auto qsa_it=qsa_inps.find((uint32_t)hparams.dsv4_compress_ratios[il]);
             // without the mask, top_k is the only record of which cells are visible, and only the qsa3
             // kernel reads it: every other flash-attention path ignores src[5] and would attend to the
-            // whole padded cache. qsa3 needs both packed layouts and bails below 128 queries, so the
-            // mask may only be dropped where those hold - a decode ubatch keeps it.
-            const bool qsa3=packed_keys && packed_values && n_query>=128;
-            const bool maskless=qsa3 && qsa_it!=qsa_inps.end() && qsa_it->second->maskless;
+            // whole padded cache. qsa3 bails below 128 queries (and an f16 cache needs both packed
+            // layouts), so the mask may only be dropped where prompt_direct holds - a decode ubatch keeps it.
+            const bool maskless=prompt_direct && qsa_it!=qsa_inps.end() && qsa_it->second->maskless;
             ggml_tensor * mask = maskless ? nullptr : (ggml_is_contiguous(kq_mask) ? kq_mask : ggml_cont(ctx0, kq_mask));
             ggml_tensor * indices = ggml_is_contiguous(top_k) ? top_k : ggml_cont(ctx0, top_k);
             GGML_ASSERT(indices->ne[1] == kq_mask->ne[1] && indices->ne[3] == kq_mask->ne[3]);
             if (decode_direct) {
-                const auto device = model.dev_layer(il);
-                GGML_ASSERT(device && strcmp(ggml_backend_dev_name(device), "ROCm0") == 0 &&
-                    strstr(ggml_backend_dev_description(device), "8060S"));
+                // the device has the decode kernel for this cache (qsa_caps); these are the shape rules it admits
                 GGML_ASSERT(q_view->type == GGML_TYPE_F32 && q_view->ne[1] >= 1 && q_view->ne[1] <= 8);
-                GGML_ASSERT(q_view->nb[0] == 4 && k_view->nb[0] == 2 && v_view->nb[0] == 2);
+                GGML_ASSERT(q_view->nb[0] == 4 && k_view->nb[0] == ggml_type_size(k_view->type) &&
+                    v_view->nb[0] == ggml_type_size(v_view->type));
                 GGML_ASSERT(k_view->ne[0] == 256 && v_view->ne[0] == 256);
                 GGML_ASSERT(k_view->ne[1] >= 1 && k_view->ne[1] <= 262144 && v_view->ne[1] == k_view->ne[1]);
                 GGML_ASSERT(q_view->ne[3] == 1 && k_view->ne[3] == 1 && v_view->ne[3] == 1);
@@ -2021,7 +2086,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
-    GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
+    if (model.layers[il].ffn_gate_inp == nullptr) {
+        // [TAG_QWEN4_DENSE] dense SwiGLU, as qwen35
+        GGML_ASSERT(model.layers[il].ffn_up != nullptr && model.layers[il].ffn_gate != nullptr);
+        cur = build_ffn(cur,
+            model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
+            model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
+            model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
+            NULL,
+            LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(cur, "ffn_out", il);
+        return cur;
+    }
 
     ggml_tensor * moe_out =
         build_moe_ffn(cur,

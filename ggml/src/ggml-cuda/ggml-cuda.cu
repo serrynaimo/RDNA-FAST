@@ -36,6 +36,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/qsa.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -88,6 +89,7 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx, const 
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/top-k-mask.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2963,6 +2965,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
+            break;
+        case GGML_OP_TOP_K_MASK:
+            ggml_cuda_op_top_k_mask(ctx, dst);
             break;
         default:
             return false;
@@ -7659,6 +7664,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_TOP_K_MASK:
+            return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
 
         default:
             return false;
@@ -7831,20 +7838,35 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
-// ROCmFPX: whether dev runs sparse flash attention without a mask (the qsa kernel, RDNA3.5 only). A model that drops
-// the mask for its selected cells needs it; without it, the attention keeps the mask.
+// ROCmFPX: whether dev runs sparse flash attention without a mask (the qsa prompt kernel, any gfx11: RDNA3 and RDNA3.5).
+// A model that drops the mask for its selected cells needs it; without it, the attention keeps the mask. Which shapes
+// and cache types the kernels take is ggml_backend_dev_qsa_caps.
 static bool ggml_backend_cuda_dev_sparse_attn_maskless(ggml_backend_dev_t dev) {
     if (dev == nullptr || ggml_backend_dev_backend_reg(dev) != ggml_backend_cuda_reg()) {
         return false;
     }
     const auto * ctx = (const ggml_backend_cuda_device_context *) dev->context;
-    return GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx->device].cc);
+    return ggml_cuda_qsa_caps(ggml_cuda_info().devices[ctx->device].cc, 256, 12, GGML_TYPE_F16, GGML_TYPE_F16) & GGML_CUDA_QSA_PROMPT;
+}
+
+// [TAG_QSA_CAPS] ROCmFPX: the QSA kernels dev has for one attention shape and KV cache type (bit 0 decode, bit 1 prompt,
+// see qsa.cuh). A graph may only build an op that carries the selected cells in src[5] for a kernel listed here: every
+// other flash-attention path ignores src[5] and attends to the whole cache.
+static uint32_t ggml_backend_cuda_dev_qsa_caps(ggml_backend_dev_t dev, int64_t head_size, int64_t gqa, ggml_type type_k, ggml_type type_v) {
+    if (dev == nullptr || ggml_backend_dev_backend_reg(dev) != ggml_backend_cuda_reg()) {
+        return 0;
+    }
+    const auto * ctx = (const ggml_backend_cuda_device_context *) dev->context;
+    return ggml_cuda_qsa_caps(ggml_cuda_info().devices[ctx->device].cc, head_size, gqa, type_k, type_v);
 }
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_dev_sparse_attn_maskless") == 0) {
         return (void *)ggml_backend_cuda_dev_sparse_attn_maskless;
+    }
+    if (strcmp(name, "ggml_backend_dev_qsa_caps") == 0) {
+        return (void *)ggml_backend_cuda_dev_qsa_caps;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
