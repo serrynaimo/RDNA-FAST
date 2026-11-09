@@ -334,6 +334,13 @@ target_link_libraries(test-backend-ops PRIVATE Threads::Threads)
 # ROCmFPX [TAG_EXPERT_HANDOFF] the expert handoff protocol against a plain MoE layer (CPU backend, plus the GPU with --gpu)
 llama_build(test-expert-handoff.cpp)
 
+if (BUILD_SHARED_LIBS)
+    llama_build_and_test(test-llama-mmap.cpp ${PROJECT_SOURCE_DIR}/src/llama-impl.cpp ${PROJECT_SOURCE_DIR}/src/llama-mmap.cpp LABEL behavior)
+    target_compile_definitions(test-llama-mmap PRIVATE LLAMA_BUILD)
+else()
+    llama_build_and_test(test-llama-mmap.cpp LABEL behavior)
+endif()
+
 llama_build_and_test(test-tiled-mulmat.cpp)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
