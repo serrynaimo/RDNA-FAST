@@ -26,6 +26,8 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 //
 // llama_context
@@ -808,6 +810,53 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         LLAMA_LOG_INFO("%s: resolving fused top-k mask support:\n", func);
         resolve(llm_fused_op_top_k_mask_probe, cparams.fused_top_k_mask);
         cparams.auto_ftkm = false;
+    }
+}
+
+// [TAG_RESERVE_TOP] diagnostics (LLAMA_RESERVE_TOP=N): the N largest allocations of a graph about to be reserved, at
+// the size the backend allocates for each (an op's scratch included, e.g. flash attention's f16 copy of a quantized
+// cache), and the totals per op. Graph inputs that live in the compute buffer count too; views and weights don't. The
+// sum is what the graph would take if the allocator reused nothing - the largest lines show what to look at.
+static void llama_print_reserve_top(ggml_backend_buffer_type_t buft, ggml_cgraph * gf, int n_top) {
+    struct entry { size_t size; const ggml_tensor * t; };
+    std::vector<entry> entries;
+    std::unordered_set<const ggml_tensor *> seen;
+    auto add = [&](const ggml_tensor * t) {
+        if (t == nullptr || t->view_src != nullptr || t->buffer != nullptr || !seen.insert(t).second) {
+            return;
+        }
+        entries.push_back({ ggml_backend_buft_get_alloc_size(buft, const_cast<ggml_tensor *>(t)), t });
+    };
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (node->src[j] && node->src[j]->op == GGML_OP_NONE) {
+                add(node->src[j]);
+            }
+        }
+        add(node);
+    }
+    std::sort(entries.begin(), entries.end(), [](const entry & a, const entry & b) { return a.size > b.size; });
+    std::map<std::string, std::pair<size_t, int>> by_op;
+    size_t total = 0;
+    for (const auto & e : entries) {
+        auto & o = by_op[e.t->op == GGML_OP_NONE ? std::string("input") : std::string(ggml_op_desc(e.t))];
+        o.first += e.size;
+        o.second++;
+        total += e.size;
+    }
+    const double mib = 1024.0*1024.0;
+    LLAMA_LOG_INFO("%s: %zu tensors, %.1f MiB without reuse; largest:\n", __func__, entries.size(), total/mib);
+    for (int i = 0; i < n_top && i < (int) entries.size(); ++i) {
+        const ggml_tensor * t = entries[i].t;
+        LLAMA_LOG_INFO("%s: %9.1f MiB (tensor %9.1f) %-16s %-36s [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] %s\n", __func__,
+                entries[i].size/mib, ggml_nbytes(t)/mib, t->op == GGML_OP_NONE ? "input" : ggml_op_desc(t), t->name,
+                t->ne[0], t->ne[1], t->ne[2], t->ne[3], ggml_type_name(t->type));
+    }
+    std::vector<std::pair<std::string, std::pair<size_t, int>>> ops(by_op.begin(), by_op.end());
+    std::sort(ops.begin(), ops.end(), [](const auto & a, const auto & b) { return a.second.first > b.second.first; });
+    for (size_t i = 0; i < ops.size() && i < 12; ++i) {
+        LLAMA_LOG_INFO("%s: per op %-16s %5d tensors %9.1f MiB\n", __func__, ops[i].first.c_str(), ops[i].second.second, ops[i].second.first/mib);
     }
 }
 
@@ -3006,6 +3055,11 @@ ggml_cgraph * llama_context::graph_reserve(
 
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
     this->n_outputs = save_n_outputs;
+
+    if (const char * top = getenv("LLAMA_RESERVE_TOP"); top && gf && !split_only) {
+        LLAMA_LOG_INFO("%s: ubatch n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
+        llama_print_reserve_top(ggml_backend_get_default_buffer_type(ggml_backend_sched_get_backend(sched.get(), 0)), gf, atoi(top));
+    }
 
     // initialize scheduler with the specified graph
     if (split_only) {
