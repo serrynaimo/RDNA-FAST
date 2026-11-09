@@ -33,6 +33,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <regex>
 #include <set>
@@ -8980,6 +8981,189 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// [TAG_QSA_CAPS] QSA flash attention as qwen4exp build_attn_qsa builds it: the lightning indexer's selected cells of every
+// query in src[5] (I32 [ns, n_q], -1 = none), K/V as views of a cache laid out [256, n_head_kv, n_kv] (permuted to
+// [256, n_kv, n_head_kv]), q permuted from [256, n_head, n_q], and for an f16 prompt the packed key/value layouts in
+// src[6]/src[7] (src/models/pack.inc); q8_0 / q4_0 caches are read in place. The CPU reference ignores src[5..7] and
+// attends through the mask, so the mask is -inf outside the selection, with a small bias on the selected cells that the
+// kernels add as well. A kernel that ignores src[5] gives the same result through that mask, so a kernel trace has to
+// show that the qsa kernels ran (qsa_decode_wmma_partial / qsa3_attn_kernel).
+// maskless: the prompt kernel without a mask, as production runs it; then every query selects every cell (in order,
+// shuffled, reversed, with a duplicate, an out-of-range entry and -1 padding), which makes dense attention the reference.
+struct test_flash_attn_ext_qsa : public test_case {
+    const int64_t gqa;        // query heads per KV head (Qwen4-27B 6, Flash-Next 12)
+    const int64_t n_head_kv;
+    const int64_t kv;
+    const int64_t n_q;
+    const int64_t budget;     // selected tokens per query, whole blocks of 4, plus the query's incomplete block (<= 3)
+    const ggml_type type_kv;
+    const bool maskless;
+    const float q_range;
+
+    static constexpr int64_t D = 256;
+
+    int64_t ns() const { return budget + 3; }
+    bool packed() const { return type_kv == GGML_TYPE_F16 && n_q > 8; }
+
+    std::string vars() override {
+        const std::string qsa = n_q <= 8 ? "decode" : (maskless ? "prompt_maskless" : "prompt");
+        return VARS_TO_STR9(qsa, gqa, n_head_kv, kv, n_q, budget, type_kv, maskless, q_range);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * gqa*n_head_kv * n_q * 2*D * std::min(ns(), kv);
+    }
+
+    test_flash_attn_ext_qsa(int64_t gqa = 6, int64_t n_head_kv = 4, int64_t kv = 8192, int64_t n_q = 1, int64_t budget = 2048,
+                            ggml_type type_kv = GGML_TYPE_F16, bool maskless = false, float q_range = 1.0f)
+        : gqa(gqa), n_head_kv(n_head_kv), kv(kv), n_q(n_q), budget(budget), type_kv(type_kv), maskless(maskless), q_range(q_range) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_head = gqa*n_head_kv;
+
+        ggml_tensor * q_raw = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_head, n_q);
+        ggml_set_name(q_raw, "q_raw");
+        ggml_tensor * k_cache = ggml_new_tensor_3d(ctx, type_kv, D, n_head_kv, kv);
+        ggml_set_name(k_cache, "k_cache");
+        ggml_tensor * v_cache = ggml_new_tensor_3d(ctx, type_kv, D, n_head_kv, kv);
+        ggml_set_name(v_cache, "v_cache");
+
+        ggml_tensor * q = ggml_permute(ctx, q_raw,   0, 2, 1, 3); // [D, n_q, n_head]
+        ggml_tensor * k = ggml_permute(ctx, k_cache, 0, 2, 1, 3); // [D, kv, n_head_kv]
+        ggml_tensor * v = ggml_permute(ctx, v_cache, 0, 2, 1, 3);
+
+        ggml_tensor * m = nullptr;
+        if (!maskless) {
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, n_q, 1, 1);
+            ggml_set_name(m, "m");
+        }
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ns(), n_q);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) D), 0.0f, 0.0f);
+        out->src[5] = ids;
+        if (packed()) {
+            // qsa_pack_keys / qsa_pack_values (src/models/pack.inc)
+            ggml_tensor * kc = ggml_cont(ctx, k);
+            ggml_tensor * pk = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, kc, 16, 16, 4, kv/4*n_head_kv), 0, 2, 1, 3));
+            ggml_set_name(pk, "qsa_packed_keys");
+            ggml_tensor * vc = ggml_cont(ctx, v);
+            ggml_tensor * pv = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, vc, D, 4, kv/4*n_head_kv), 1, 0, 2, 3));
+            ggml_set_name(pv, "qsa_packed_values");
+            out->src[6] = pk;
+            out->src[7] = pv;
+        }
+        ggml_flash_attn_ext_set_n_kv_max(out, (int32_t) ns());
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_tensor_uniform(ggml_get_tensor(ctx, "q_raw"), -q_range, q_range);
+        init_tensor_uniform(ggml_get_tensor(ctx, "k_cache"));
+        init_tensor_uniform(ggml_get_tensor(ctx, "v_cache"));
+
+        const int64_t n = ns();
+        std::vector<int32_t> ids((size_t) (n*n_q), -1);
+        std::mt19937 rng((uint32_t) (0x515A + kv*31 + n_q*7 + gqa*3 + (int) type_kv));
+        auto pick = [&](int64_t bound) { return (int32_t) (rng() % (uint32_t) bound); };
+
+        if (maskless) {
+            // every query selects every cell
+            GGML_ASSERT(kv + 2 <= n);
+            std::vector<int32_t> row;
+            for (int64_t qi = 0; qi < n_q; ++qi) {
+                row.resize((size_t) kv);
+                std::iota(row.begin(), row.end(), 0);
+                int32_t * dst = ids.data() + qi*n;
+                switch (qi % 4) {
+                    case 0: // in order, -1 padding at the end: read in place
+                        break;
+                    case 1: // shuffled, a duplicate and a cell past the cache, -1 spread through it: rank-sorted first
+                        { const int32_t twin = row[(size_t) pick(kv)]; row.push_back(twin); }
+                        row.push_back((int32_t) kv + 1);
+                        row.resize((size_t) n, -1);
+                        std::shuffle(row.begin(), row.end(), rng);
+                        break;
+                    case 2: { // in order with a duplicate next to its twin: still non-decreasing, read in place
+                        const int32_t c = pick(kv);
+                        row.insert(row.begin() + c, c);
+                        } break;
+                    case 3: // reversed
+                        std::reverse(row.begin(), row.end());
+                        break;
+                }
+                std::copy(row.begin(), row.end(), dst);
+            }
+        } else {
+            std::vector<ggml_fp16_t> mask((size_t) (kv*n_q), ggml_fp32_to_fp16(-INFINITY));
+            const int64_t nb        = budget/4;
+            const int64_t first_pos = kv - n_q;          // query qi sits at position first_pos + qi, cell c at position c
+            const int64_t vis0      = (first_pos + 1)/4; // complete blocks every query sees
+            GGML_ASSERT(budget % 4 == 0 && nb < vis0);
+            // the queries of one ubatch pick mostly the same blocks: a shared base, 1/8 of it swapped per query
+            std::vector<int32_t> base((size_t) vis0);
+            std::iota(base.begin(), base.end(), 0);
+            std::shuffle(base.begin(), base.end(), rng);
+            base.resize((size_t) nb);
+            std::vector<char> mark((size_t) (kv/4 + 1), 0);
+            std::vector<int32_t> sel, row;
+            for (int64_t qi = 0; qi < n_q; ++qi) {
+                const int64_t pos = first_pos + qi;
+                const int64_t vis = (pos + 1)/4;
+                sel = base;
+                for (int32_t b : sel) { mark[b] = 1; }
+                for (int64_t i = 0; i < nb/8; ++i) {
+                    const int32_t idx = pick(nb);
+                    int32_t b;
+                    do { b = pick(vis); } while (mark[b]);
+                    mark[sel[idx]] = 0;
+                    mark[b] = 1;
+                    sel[idx] = b;
+                }
+                row.clear();
+                for (int32_t b : sel) {
+                    mark[b] = 0;
+                    for (int32_t c = 0; c < 4; ++c) { row.push_back(4*b + c); }
+                }
+                for (int64_t c = 4*vis; c <= pos; ++c) { row.push_back((int32_t) c); } // the query's incomplete block
+                for (int32_t c : row) {
+                    mask[(size_t) (qi*kv + c)] = ggml_fp32_to_fp16(-0.03125f*(float) (1 + (c + qi) % 7));
+                }
+                int32_t * dst = ids.data() + qi*n;
+                switch (qi % 3) {
+                    case 0: // in order, -1 padding at the end: read in place
+                        std::sort(row.begin(), row.end());
+                        if (n_q > 8 && (int64_t) row.size() < n) {
+                            // the union dedups a repeated cell (the decode kernel takes top-k rows, which have none)
+                            const int32_t twin = row[0];
+                            row.insert(row.begin() + 1, twin);
+                        }
+                        break;
+                    case 1: // shuffled, a cell past the cache, -1 spread through it: rank-sorted first
+                        if ((int64_t) row.size() < n) { row.push_back((int32_t) kv + 1); }
+                        row.resize((size_t) n, -1);
+                        std::shuffle(row.begin(), row.end(), rng);
+                        break;
+                    case 2: // reversed
+                        std::sort(row.rbegin(), row.rend());
+                        break;
+                }
+                std::copy(row.begin(), row.end(), dst);
+            }
+            ggml_backend_tensor_set(ggml_get_tensor(ctx, "m"), mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
+        }
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "ids"), ids.data(), 0, ids.size()*sizeof(int32_t));
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12839,6 +13023,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // quantized cache, deep enough to take the sparse path
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2048));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
+    // [TAG_QSA_CAPS] the QSA kernels themselves (selected cells in src[5]; the cases above only set the n_kv_max hint):
+    // Qwen4-27B (24 query heads on 4 KV heads, GQA 6) and Flash-Next (24 on 2, GQA 12), head 256, budget 2048 + tail
+    for (int64_t gqa : {6, 12}) {
+        const int64_t n_head_kv = 24/gqa;
+        for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+            for (int64_t kv : {8192, 32768, 131072}) {
+                for (int64_t n_q : {1, 2, 4, 8}) {      // decode kernel
+                    test_cases.emplace_back(new test_flash_attn_ext_qsa(gqa, n_head_kv, kv, n_q, 2048, type));
+                }
+                for (int64_t n_q : {128, 512, 2048}) {  // prompt kernel, with the mask
+                    test_cases.emplace_back(new test_flash_attn_ext_qsa(gqa, n_head_kv, kv, n_q, 2048, type));
+                }
+            }
+            // a last group of queries that is not full (131 = 32*4 + 3 = 16*8 + 3)
+            test_cases.emplace_back(new test_flash_attn_ext_qsa(gqa, n_head_kv, 8192, 131, 2048, type));
+            // prompt kernel without the mask, as production runs it: every query selects every cell
+            for (int64_t n_q : {128, 512}) {
+                test_cases.emplace_back(new test_flash_attn_ext_qsa(gqa, n_head_kv, 2048, n_q, 2048, type, true));
+            }
+        }
+        // peaked softmax: the online rescaling across chunks and splits
+        test_cases.emplace_back(new test_flash_attn_ext_qsa(gqa, n_head_kv, 32768,   4, 2048, GGML_TYPE_F16, false, 6.0f));
+        test_cases.emplace_back(new test_flash_attn_ext_qsa(gqa, n_head_kv, 32768, 512, 2048, GGML_TYPE_F16, false, 6.0f));
+    }
+
     // single head with quantized K (MMQ on Vulkan)
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 1, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 1, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_1, GGML_TYPE_Q4_1, {0, 1, 2, 3}, true, false, 512));
@@ -13667,6 +13876,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // [TAG_QSA_CAPS] QSA kernels: Qwen4-27B (GQA 6) decode and prompt on the production q4_0 cache, Flash-Next (GQA 12)
+    for (int64_t gqa : {6, 12}) {
+        for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+            for (int64_t kv : {32768, 131072}) {
+                for (int64_t n_q : {1, 4, 512, 2048}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_qsa(gqa, 24/gqa, kv, n_q, 2048, type));
+                }
+            }
+        }
+    }
 
     // Sparse flash attention (n_kv_max hint) decode across KV depths.
     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.
