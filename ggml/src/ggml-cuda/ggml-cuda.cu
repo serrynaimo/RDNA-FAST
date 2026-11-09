@@ -187,13 +187,6 @@ static bool ggml_cuda_register_host_enabled() {
     return enabled;
 }
 
-// [TAG_QSA_RDNA3] the qwen4exp fusions (HC gate GEMM + mix, HC stream mix, HC combine + norm and its BF16-only marks,
-// the indexer's relu-sum, QSA expand, pooled get_rows) and their alloc deps: written for Strix Halo, but the kernels are
-// wave-size generic with a few KB of LDS, so every gfx11 card takes them (RDNA4 untested, kept off)
-static bool ggml_cuda_qwen4_fusions(const int cc) {
-    return GGML_CUDA_CC_IS_RDNA3(cc);
-}
-
 static bool ggml_cuda_fusion_disabled() {
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_FUSION");
     return disabled;
@@ -4654,7 +4647,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 #endif // defined(GGML_USE_HIP)
 
-    if ((fuse_mask0 & (1u << 4)) && (node->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_gatemix() && i + 1 < cgraph->n_nodes && ggml_cuda_qwen4_fusions(ggml_cuda_info().devices[cuda_ctx->device].cc))) {
+    if ((fuse_mask0 & (1u << 4)) && (node->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_gatemix() && i + 1 < cgraph->n_nodes && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc))) {
         // HC gate GEMM [320 -> 10240] whose only consumer is the fused stream mix: run GEMM + sigmoid + mix in one kernel
         const ggml_tensor * w = node->src[0], * lo = node->src[1];
         if (ggml_is_quantized(w->type) && ggml_node_has_n_uses(cgraph, i, 1) && ggml_cuda_mmb_supported_mm(w, lo, node)) {
@@ -4664,13 +4657,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    if ((fuse_mask0 & (1u << 5)) && (node->op == GGML_OP_UNARY && ggml_cuda_qwen4_fusions(ggml_cuda_info().devices[cuda_ctx->device].cc))) {
+    if ((fuse_mask0 & (1u << 5)) && (node->op == GGML_OP_UNARY && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc))) {
         ggml_cuda_idx_relu_sum_args args;
         const int count = ggml_cuda_match_idx_relu_sum(cgraph, i, args);
         if (count > 0) { ggml_cuda_op_idx_relu_sum(*cuda_ctx, args); return count - 1; }
     }
 
-    if ((fuse_mask0 & (1u << 6)) && (ggml_cuda_qwen4_fusions(ggml_cuda_info().devices[cuda_ctx->device].cc))) {
+    if ((fuse_mask0 & (1u << 6)) && (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc))) {
         ggml_cuda_hc_mix_args args;
         const int count=ggml_cuda_hc_mix_closed(cgraph,i,args);
         if (count>0) {
@@ -4679,7 +4672,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    if ((fuse_mask0 & (1u << 7)) && (ggml_cuda_qwen4_fusions(ggml_cuda_info().devices[cuda_ctx->device].cc))) {
+    if ((fuse_mask0 & (1u << 7)) && (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc))) {
         ggml_cuda_qsa_expand_args args;
         const int skip = ggml_cuda_match_qsa_expand(cgraph,i,args);
         if (skip) {
@@ -4691,7 +4684,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    if ((fuse_mask0 & (1u << 8)) && (ggml_cuda_qwen4_fusions(ggml_cuda_info().devices[cuda_ctx->device].cc))) {
+    if ((fuse_mask0 & (1u << 8)) && (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc))) {
         ggml_cuda_hc_combine_norm_args args;
         const int skip = ggml_cuda_match_hc_combine_norm(
             cgraph, i, ggml_cuda_info().devices[cuda_ctx->device].warp_size, args);
@@ -4744,7 +4737,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    if ((fuse_mask0 & (1u << 9)) && (ggml_cuda_qwen4_fusions(ggml_cuda_info().devices[cuda_ctx->device].cc))) {
+    if ((fuse_mask0 & (1u << 9)) && (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc))) {
         ggml_cuda_get_rows_mean4_match match;
         if (ggml_cuda_match_get_rows_mean4(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
@@ -6236,7 +6229,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
     {   // HC16 step 2: mark HC normalized-stream (xn) and gate tensors whose consumers all read the BF16 copies
         static const int hc16 = 2;
-        if (hc16 >= 2 && ggml_cuda_qwen4_fusions(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        if (hc16 >= 2 && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
             auto reads = [](const ggml_tensor * t, const ggml_tensor * x) { for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (t->src[s] == x || t->src[s]->view_src == x) return true; return false; };
             for (int i = 0; i < cgraph->n_nodes; ++i) {
                 ggml_cuda_hc_combine_norm_args ca;
@@ -6465,7 +6458,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     continue;
                 }
             }
-            if (ggml_cuda_qwen4_fusions(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+            if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
                 ggml_cuda_hc_mix_args args;
                 const int count=ggml_cuda_hc_mix_closed(cgraph,i,args);
                 if (count>0) {
@@ -6479,7 +6472,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     continue;
                 }
             }
-            if (ggml_cuda_qwen4_fusions(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+            if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
                 ggml_cuda_qsa_expand_args args;
                 const int skip = ggml_cuda_match_qsa_expand(cgraph,i,args);
                 if (skip) {
@@ -6491,7 +6484,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     continue;
                 }
             }
-            if (ggml_cuda_qwen4_fusions(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+            if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
                 ggml_cuda_hc_combine_norm_args args;
                 const int skip = ggml_cuda_match_hc_combine_norm(
                     cgraph, i, ggml_cuda_info().devices[cuda_ctx->device].warp_size, args);
@@ -6509,7 +6502,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
             }
 
-            if (ggml_cuda_qwen4_fusions(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+            if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
                 ggml_cuda_get_rows_mean4_match pool;
                 if (ggml_cuda_match_get_rows_mean4(cgraph, i, pool)) {
                     params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(pool.src), pool.dst);
