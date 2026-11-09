@@ -124,7 +124,7 @@ measured here:
 
 | variable | what it does | where it helps |
 |---|---|---|
-| `ROCMFPX_QWEN4_QSA_DECODE=1`, `ROCMFPX_QWEN4_QSA_DECODE_BLOCKS`, `ROCMFPX_QWEN4_QSA_DECODE_CACHE` | sparse attention for decode batches at 8k cells and more, block selection as in the prompt, and a cache of the pooled keys (the last two on by default) | Qwen3.8-Flash-Next (qwen4exp) on HIP |
+| `ROCMFPX_QWEN4_QSA_DECODE_BLOCKS`, `ROCMFPX_QWEN4_QSA_DECODE_CACHE` (on) | for the sparse decode attention (always on at 8k cells and more on RDNA3 and RDNA3.5): block selection as in the prompt, and a cache of the pooled keys | Qwen3.8-Flash-Next (qwen4exp) on HIP |
 | `LLAMA_MTP_QSA_MIN_T` (1) | below this batch size the MTP layer attends densely | Qwen3.8-Flash-Next MTP |
 | `ROCMFPX_DRAFT_HEAD_QUANT` (on), `ROCMFPX_QWEN4_PAD_HEAD=1` | draft steps use a Q4_0 copy of the output head; 2-3-row head products padded to 4 rows | Qwen3.8-Flash-Next MTP |
 | `ROCMFPX_MTP_CUM_P` (`ROCMFPX_MTP_CUM_MIN`, `ROCMFPX_MTP_CUM_MAX`: 1, 5) | stops drafting once the product of the drafted tokens' probabilities falls below P | MTP with an adaptive draft length; off by default |
@@ -145,6 +145,7 @@ measured here:
 | variable | what it does | where it helps |
 |---|---|---|
 | `GPU_MAX_HW_QUEUES=1` | all GPU work of the process goes through one hardware queue instead of four | Linux (amdgpu): a server with `--mmproj` that keeps the GPU at full load and clocks while idle. Not needed on Windows. Work on separate GPU streams can no longer overlap |
+| `GPU_RESOURCE_CACHE_SIZE`, `GPU_MAX_RESOURCE_CACHE_SIZE` | the runtime's cache of freed GPU memory. This code sets both to 0 on Windows unless they are already set: freed compute buffers go back to the driver instead of staying with the process | Windows. With the cache, Flash-Next on the RX 7900 XT kept ~1.5 GB of freed buffers and spilled into shared memory |
 
 **Diagnostics.** None of these is needed in normal use:
 

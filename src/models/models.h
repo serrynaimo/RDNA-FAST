@@ -8,6 +8,7 @@
 #include <cmath>
 #include <map>
 #include <mutex>
+#include <tuple>
 #include <vector>
 
 class llama_memory_hybrid_idx_context;
@@ -2841,6 +2842,12 @@ struct llama_model_qwen4exp : public llama_model_base {
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
         llm_graph_input_qsa_k * qsa_k_inp = nullptr;
+
+        // [TAG_QSA_INPUT_VIEWS] the query strips of a host input (the KQ mask, the indexer bias), one view per strip for
+        // the whole graph: the scheduler uploads every distinct view of a host input on its own and keeps the uploads
+        // for the whole split, so per-layer views made one copy per layer and strip
+        std::map<std::tuple<const ggml_tensor *, int64_t, int64_t>, ggml_tensor *> input_strips;
+        ggml_tensor * input_strip(ggml_tensor * t, int64_t first, int64_t n_rows);
 
         void build_qsa_store_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,

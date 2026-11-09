@@ -1136,16 +1136,13 @@ static bool qwen4exp_qsa_decode_kernel(const llama_model & model, const llama_hp
     return any;
 }
 
-// Decode-sized ubatches (1..8 tokens) go to the bounded sparse decode kernel (ggml-cuda/qsa-decode.cuh) when
-// ROCMFPX_QWEN4_QSA_DECODE=1 and every sparse layer's device has it for the cache (kernel, see qwen4exp_qsa_decode_kernel);
-// build_qsa_top_k and build_attn_qsa must agree on it, so both ask here.
+// Decode-sized ubatches (1..8 tokens) at 8k cells and more go to the bounded sparse decode kernel
+// (ggml-cuda/qsa-decode.cuh) whenever every sparse layer's device has it for the cache (kernel, see
+// qwen4exp_qsa_decode_kernel); build_qsa_top_k and build_attn_qsa must agree on it, so both ask here. RX 7900 XT,
+// Flash-Next with MTP (2026-11-09): KLD vs dense 0.0093 vs 0.0094 (noise floor), decode at 19k 32.2 vs 26.9 t/s.
 static bool qwen4exp_qsa_decode_direct(int64_t n_tokens, int64_t n_query, int64_t n_kv, bool kernel) {
 #if defined(GGML_USE_HIP)
-    static const bool enabled = [] {
-        const char * v = getenv("ROCMFPX_QWEN4_QSA_DECODE");
-        return v && strcmp(v, "1") == 0;
-    }();
-    return enabled && kernel && n_tokens >= 1 && n_tokens <= 8 && n_query >= 1 && n_query <= 8 && n_kv >= 8192;
+    return kernel && n_tokens >= 1 && n_tokens <= 8 && n_query >= 1 && n_query <= 8 && n_kv >= 8192;
 #else
     GGML_UNUSED(n_tokens); GGML_UNUSED(n_query); GGML_UNUSED(n_kv); GGML_UNUSED(kernel);
     return false;
@@ -1405,6 +1402,19 @@ static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
     return n_stream == 1 ? std::min<int64_t>(n_tokens, 512) : n_tokens;
 }
 
+// [TAG_QSA_INPUT_VIEWS] rows [first, first + n_rows) of a host input, the same view for every layer of the graph.
+// With per-layer views the synthetic Qwen4-27B uploaded the KQ mask once per layer and strip and kept every copy for
+// the whole split: a 5.9 GB compute buffer at 32k, 21 GB at 128k on the RX 7900 XT.
+ggml_tensor * llama_model_qwen4exp::graph::input_strip(ggml_tensor * t, int64_t first, int64_t n_rows) {
+    const auto key = std::make_tuple((const ggml_tensor *) t, first, n_rows);
+    if (auto it = input_strips.find(key); it != input_strips.end()) {
+        return it->second;
+    }
+    ggml_tensor * v = ggml_view_4d(ctx0, t, t->ne[0], n_rows, t->ne[2], t->ne[3], t->nb[1], t->nb[2], t->nb[3], first*t->nb[1]);
+    input_strips.emplace(key, v);
+    return v;
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const llama_memory_hybrid_idx_context * mctx_hyb,
         ggml_tensor *                           cur,
@@ -1575,10 +1585,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             score_keys = ggml_view_3d(ctx0, pooled, idx_dim, score_blocks, n_stream, pooled->nb[1], pooled->nb[2], 0);
             cb(score_keys, "indexer_k_bounded", il);
         }
-        ggml_tensor * bias = inp->compact ? nullptr : ggml_view_3d(ctx0, inp->bias, inp->bias->ne[0], n_query, n_stream,
-                inp->bias->nb[1], inp->bias->nb[2], first*inp->bias->nb[1]);
-        ggml_tensor * query_mask = kq_mask == nullptr ? nullptr : ggml_view_4d(ctx0, kq_mask,
-                n_kv, n_query, 1, n_stream, kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], first*kq_mask->nb[1]);
+        GGML_ASSERT(inp->compact || (inp->bias->ne[2] == n_stream && inp->bias->ne[3] == 1));
+        GGML_ASSERT(kq_mask == nullptr || (kq_mask->ne[0] == n_kv && kq_mask->ne[2] == 1 && kq_mask->ne[3] == n_stream));
+        ggml_tensor * bias = inp->compact ? nullptr : input_strip(inp->bias, first, n_query);
+        ggml_tensor * query_mask = kq_mask == nullptr ? nullptr : input_strip(kq_mask, first, n_query);
 
         // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
         // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
@@ -1723,12 +1733,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     std::vector<ggml_tensor *> output;
     for (int64_t first = 0; first < n_tps; first += strip) {
         const int64_t n_query = std::min(strip, n_tps - first);
-        ggml_tensor * kq_mask = ggml_view_4d(ctx0, mask_all, mask_all->ne[0], n_query, 1, n_stream,
-                mask_all->nb[1], mask_all->nb[2], mask_all->nb[3], first*mask_all->nb[1]);
+        GGML_ASSERT(mask_all->ne[2] == 1 && mask_all->ne[3] == n_stream);
+        ggml_tensor * kq_mask = input_strip(mask_all, first, n_query);
         ggml_tensor * top_k = ggml_view_4d(ctx0, indices_all, indices_all->ne[0], n_query, 1, n_stream,
                 indices_all->nb[1], indices_all->nb[2], indices_all->nb[3], first*indices_all->nb[1]);
 
-        // The QSA decode kernel (ROCMFPX_QWEN4_QSA_DECODE=1, see qwen4exp_qsa_decode_direct) consumes the selected
+        // The QSA decode kernel (see qwen4exp_qsa_decode_direct) consumes the selected
         // indices too and keeps the causal mask; shapes it does not take fail closed below. Short caches keep the
         // original path: the sparse WMMA path changes rounding and only benefits longer scans.
         const bool decode_direct = sparse_ok && (qsa_caps & QWEN4EXP_QSA_DECODE) &&

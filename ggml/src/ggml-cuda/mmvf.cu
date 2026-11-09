@@ -605,6 +605,78 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
     }
 }
 
+// ROCmFPX [TAG_HC_SKINNY]: many short rows at decode widths (a plain 2D product, no fusion, no ids). The kernel above
+// gives every row a block of its own and sizes the block to finish K in one pass, so a row of K = 320 is one block of
+// 160 threads that loads one pair each and reduces through shared memory: the hyper-connection up-projections of
+// qwen4exp (Flash-Next: 10240 rows of 320 in BF16, four of them per layer and token) wait on block scheduling, not on
+// memory. Here one warp walks a row and a block holds MMVF_SKINNY_RPB rows; the reduction stays in the warp. RX 7900 XT
+// (2026-11-09), one column: BF16 20480 x 320 37.8 -> 12.8 us, 10240 x 320 19.7 -> 7.1 us (F16 the same; 1, 2 or 8
+// rows per block within 0.4 us); 4-column batches and long rows unchanged. Measured on gfx1100 only, so only taken there.
+#define MMVF_SKINNY_MAX_K    1024
+#define MMVF_SKINNY_MIN_ROWS 1024
+#define MMVF_SKINNY_RPB      4
+
+template <typename T, int ncols_dst, int rows_per_block>
+static __global__ void mul_mat_vec_f_skinny(
+        const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
+        const int ncols2, const int nrows, const int64_t stride_row, const int64_t stride_col_y2, const int64_t stride_col_dst) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int row = blockIdx.x*rows_per_block + threadIdx.y;
+    if (row >= nrows) {
+        return;
+    }
+    const T      * xr = x + row*stride_row;
+    const float2 * y2 = (const float2 *) y;
+
+    float sumf[ncols_dst] = {0.0f};
+    for (int col2 = threadIdx.x; col2 < ncols2; col2 += warp_size) {
+        float2 xf;
+        if constexpr (std::is_same_v<T, float>) {
+            xf = ((const float2 *) xr)[col2];
+        } else if constexpr (std::is_same_v<T, half>) {
+            xf = __half22float2(((const half2 *) xr)[col2]);
+        } else {
+            static_assert(std::is_same_v<T, nv_bfloat16>, "unsupported type");
+            const nv_bfloat162 xb = ((const nv_bfloat162 *) xr)[col2];
+            xf.x = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&xb)[0]);
+            xf.y = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&xb)[1]);
+        }
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const float2 yf = y2[j*stride_col_y2 + col2];
+            sumf[j] += xf.x*yf.x + xf.y*yf.y;
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        const float s = warp_reduce_sum<warp_size>(sumf[j]);
+        if (threadIdx.x == 0) {
+            dst[j*stride_col_dst + row] = s;
+        }
+    }
+}
+
+template <typename T>
+static void mul_mat_vec_f_skinny_cuda(
+        const T * x, const float * y, float * dst, const int64_t ncols, const int64_t nrows, const int64_t ncols_dst,
+        const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst, cudaStream_t stream) {
+    constexpr int rpb = MMVF_SKINNY_RPB;
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const dim3 block_nums((nrows + rpb - 1)/rpb, 1, 1);
+    const dim3 block_dims(warp_size, rpb, 1);
+    const int ncols2 = ncols/2;
+    const int64_t stride_col_y2 = stride_col_y/2;
+    switch (ncols_dst) {
+#define MMVF_SKINNY_CASE(n) \
+        case n: mul_mat_vec_f_skinny<T, n, rpb><<<block_nums, block_dims, 0, stream>>>(x, y, dst, ncols2, nrows, stride_row, stride_col_y2, stride_col_dst); break;
+        MMVF_SKINNY_CASE(1) MMVF_SKINNY_CASE(2) MMVF_SKINNY_CASE(3) MMVF_SKINNY_CASE(4)
+        MMVF_SKINNY_CASE(5) MMVF_SKINNY_CASE(6) MMVF_SKINNY_CASE(7) MMVF_SKINNY_CASE(8)
+#undef MMVF_SKINNY_CASE
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
 template<typename T>
 static void mul_mat_vec_f_cuda(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -702,6 +774,27 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    if (!ids && !fusion && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && ne00 % 2 == 0 && s01 % 2 == 0 &&
+            stride_col_y % 2 == 0 && ncols_dst <= 8 && ne00 <= MMVF_SKINNY_MAX_K && ne01 >= MMVF_SKINNY_MIN_ROWS &&
+            GGML_CUDA_CC_IS_RDNA3_0(cc)) {
+        switch (src0->type) {   // [TAG_HC_SKINNY]
+            case GGML_TYPE_F32:
+                mul_mat_vec_f_skinny_cuda((const float *) src0->data, src1_d, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y,
+                    stride_col_dst, ctx.stream());
+                return;
+            case GGML_TYPE_F16:
+                mul_mat_vec_f_skinny_cuda((const half *) src0->data, src1_d, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y,
+                    stride_col_dst, ctx.stream());
+                return;
+            case GGML_TYPE_BF16:
+                mul_mat_vec_f_skinny_cuda((const nv_bfloat16 *) src0->data, src1_d, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y,
+                    stride_col_dst, ctx.stream());
+                return;
+            default:
+                break;
+        }
+    }
 
     switch (src0->type) {
         case GGML_TYPE_F32: {
