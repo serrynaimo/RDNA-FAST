@@ -87,6 +87,14 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
+    // [TAG_KV_LANES] the indexer cache tracks the attention cache cell for cell (qwen4exp asserts the same n_kv), but
+    // only the attention cache had lanes: the second slot of a shared pool then attended to its own lane while the
+    // indexer scored the whole cache, and the graph asserted. Mirroring lanes would need the same range offset in the
+    // indexer views, its block metadata and per-sequence ubatches in init_batch below, so lanes stay off here: the
+    // idle slot's cells are scored by the indexer and masked out of the (sparse) attention.
+    if (mem_idx) {
+        get_mem_attn()->set_lanes(false);
+    }
 #if defined(GGML_USE_HIP)
     incremental_qsa = mem_idx && offload && n_swa == 0;
 #endif
