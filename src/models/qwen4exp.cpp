@@ -1679,11 +1679,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         const bool direct_indices =
             (n_tokens >= 128 || decode_direct) &&
             n_stream == 1 && cparams.flash_attn && cparams.offload_kqv &&
-            hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap;
-        // a complete-block list (compact selection) carries -1 sentinels that only the index-consuming kernels skip
-        GGML_ASSERT(direct_indices || shared_qsa == qsa_inps.end() || !shared_qsa->second->compact);
+            hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
+            // [TAG_QSA_KV_TYPE] the index-consuming kernels read an f16 cache; a quantized one (q4_0, q8_0) takes the
+            // masked path below instead of failing the assert there
+            mctx_cur->get_k(ctx0, il)->type == GGML_TYPE_F16 && mctx_cur->get_v(ctx0, il)->type == GGML_TYPE_F16;
+        // a complete-block list (compact selection) carries -1 sentinels that only the index-consuming kernels and the
+        // fused top-k mask (which skips picks out of range) handle
+        GGML_ASSERT(direct_indices || cparams.fused_top_k_mask || shared_qsa == qsa_inps.end() || !shared_qsa->second->compact);
         ggml_tensor * kq_mask_top_k = kq_mask;
-        if (!direct_indices) {
+        if (!direct_indices && cparams.fused_top_k_mask) {
+            // [TAG_QSA_FUSED_MASK] one op: the kq_mask cells of the picks, -inf elsewhere (top_k already comes in the
+            // row layout of this strip of the mask, so no reshape)
+            kq_mask_top_k = ggml_top_k_mask(ctx0, kq_mask, top_k, nullptr, nullptr, nullptr);
+            res->add_fused_node({LLM_FUSED_OP_TOP_K_MASK, kq_mask_top_k, il});
+        } else if (!direct_indices) {
         // prepare new kq mask - starts filled with -INFINITY
         ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
 
