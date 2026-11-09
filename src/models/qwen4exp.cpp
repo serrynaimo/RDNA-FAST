@@ -1136,16 +1136,13 @@ static bool qwen4exp_qsa_decode_kernel(const llama_model & model, const llama_hp
     return any;
 }
 
-// Decode-sized ubatches (1..8 tokens) go to the bounded sparse decode kernel (ggml-cuda/qsa-decode.cuh) when
-// ROCMFPX_QWEN4_QSA_DECODE=1 and every sparse layer's device has it for the cache (kernel, see qwen4exp_qsa_decode_kernel);
-// build_qsa_top_k and build_attn_qsa must agree on it, so both ask here.
+// Decode-sized ubatches (1..8 tokens) at 8k cells and more go to the bounded sparse decode kernel
+// (ggml-cuda/qsa-decode.cuh) whenever every sparse layer's device has it for the cache (kernel, see
+// qwen4exp_qsa_decode_kernel); build_qsa_top_k and build_attn_qsa must agree on it, so both ask here. RX 7900 XT,
+// Flash-Next with MTP (2026-11-09): KLD vs dense 0.0093 vs 0.0094 (noise floor), decode at 19k 32.2 vs 26.9 t/s.
 static bool qwen4exp_qsa_decode_direct(int64_t n_tokens, int64_t n_query, int64_t n_kv, bool kernel) {
 #if defined(GGML_USE_HIP)
-    static const bool enabled = [] {
-        const char * v = getenv("ROCMFPX_QWEN4_QSA_DECODE");
-        return v && strcmp(v, "1") == 0;
-    }();
-    return enabled && kernel && n_tokens >= 1 && n_tokens <= 8 && n_query >= 1 && n_query <= 8 && n_kv >= 8192;
+    return kernel && n_tokens >= 1 && n_tokens <= 8 && n_query >= 1 && n_query <= 8 && n_kv >= 8192;
 #else
     GGML_UNUSED(n_tokens); GGML_UNUSED(n_query); GGML_UNUSED(n_kv); GGML_UNUSED(kernel);
     return false;
@@ -1741,7 +1738,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_tensor * top_k = ggml_view_4d(ctx0, indices_all, indices_all->ne[0], n_query, 1, n_stream,
                 indices_all->nb[1], indices_all->nb[2], indices_all->nb[3], first*indices_all->nb[1]);
 
-        // The QSA decode kernel (ROCMFPX_QWEN4_QSA_DECODE=1, see qwen4exp_qsa_decode_direct) consumes the selected
+        // The QSA decode kernel (see qwen4exp_qsa_decode_direct) consumes the selected
         // indices too and keeps the causal mask; shapes it does not take fail closed below. Short caches keep the
         // original path: the sparse WMMA path changes rounding and only benefits longer scans.
         const bool decode_direct = sparse_ok && (qsa_caps & QWEN4EXP_QSA_DECODE) &&

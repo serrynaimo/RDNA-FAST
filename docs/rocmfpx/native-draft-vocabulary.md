@@ -28,7 +28,6 @@ Set these only for the measured Flash Next server (RDNA 3.5, Strix Halo):
 
 ```text
 ROCMFPX_DRAFT_VOCAB=16384
-ROCMFPX_QWEN4_QSA_DECODE=1
 ROCMFPX_QWEN4_PAD_HEAD=1
 ROCMFPX_NGRAM_WINDOW=1
 ROCMFPX_NGRAM_FLOOR4=1
@@ -37,7 +36,7 @@ ROCMFPX_MOE_SORT_IDS=1
 ROCMFPX_ROCMI4_MOE_RPB8=1
 ```
 
-`ROCMFPX_QWEN4_QSA_DECODE=1` requires the Radeon 8060S as `ROCm0` and stops if the device or tensor shape is outside the kernel it was measured on. `ROCMFPX_HIP_GRAPH_COPY_KERNEL`, `ROCMFPX_MOE_SORT_IDS` and `ROCMFPX_ROCMI4_MOE_RPB8` act only on RDNA 3.5. The signed ROCmI4 dot is compiled only for gfx1151; other GPU targets keep the previous dot.
+Sparse decode attention needs no switch: it runs on its own at 8k cells and more on RDNA 3 and RDNA 3.5, and other cards keep dense attention. `ROCMFPX_HIP_GRAPH_COPY_KERNEL`, `ROCMFPX_MOE_SORT_IDS` and `ROCMFPX_ROCMI4_MOE_RPB8` act only on RDNA 3.5. The signed ROCmI4 dot is compiled only for gfx1151; other GPU targets keep the previous dot.
 
 On a 20 GB discrete card such as the RX 7900 XT, Flash Next runs through the [expert handoff](../expert-handoff.md) instead.
 
