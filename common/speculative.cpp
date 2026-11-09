@@ -1012,6 +1012,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool    is_mrope       = false;
     int32_t selector_top_k = 0;
 
+    // [TAG_DSPINE] a DSpine draft packs its refinement table like the DFlash2 lattice, so both draft through the
+    // same walk: is_lattice covers the two, selector_top_k holds the width of either
+    bool    is_dspine      = false;
+    bool    is_lattice     = false;
+
     // DFlash2 probabilistic drafting: one generator per sequence and the seed it was last seeded with (-1: reseed)
     std::vector<std::mt19937> dflash2_rng;
     std::vector<int64_t>      dflash2_seed;
@@ -1066,6 +1071,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
         is_dflash2     = selector_top_k > 0;
+        if (const int32_t dspine_top_k = llama_model_dflash_dspine_top_k(model_dft); dspine_top_k > 0) {
+            is_dspine      = true;
+            selector_top_k = dspine_top_k;
+        }
+        is_lattice = is_dflash2 || is_dspine;
         dflash2_rng.resize(n_seq);
         dflash2_seed.assign(n_seq, -1);
         char lilicorr_meta[32] = {};
@@ -1094,6 +1104,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
+        if (is_dspine) {
+            LOG_INF("%s: - DSpine code bridge, refinement top-k=%d\n", __func__, selector_top_k);
+        }
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
         // block_size-1 draft tokens, anchor-first DSpark yields a full block_size draft tokens
@@ -1123,7 +1136,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling && !is_dflash2 && !is_lilicorr) {
+        if (this->params.backend_sampling && !is_lattice && !is_lilicorr) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
@@ -1142,8 +1155,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
-        // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
-        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
+        // DFlash2 (and DSpine) read their lattice from h_nextn and never consume raw logits.
+        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_lattice && !is_lilicorr);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
     }
 
@@ -1310,7 +1323,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, !is_dflash2 && !is_lilicorr);
+                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, !is_lattice && !is_lilicorr);
                 if (is_lilicorr) {
                     // For LiliCorr drafting batch, set state embeddings for use in the associated transformer head.
                     const llama_pos pos = dp.pos0 - 1;
@@ -1344,13 +1357,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             auto & result = *dp.result;
 
-            if (is_dflash2 || is_lilicorr) {
-                // Both DFlash and LiliCorr greedily walk the candidate lattice.
+            if (is_lattice || is_lilicorr) {
+                // DFlash2, DSpine and LiliCorr greedily walk the candidate lattice.
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
                 // DFlash2 can instead sample each step and hand q to the verifier for rejection sampling
-                const bool sample = is_dflash2 && params.probabilistic && dp.result_q;
+                const bool sample = is_lattice && params.probabilistic && dp.result_q;
 
                 // greedy keeps temperature 1, sampling uses the target's
                 const float temp = sample ? dp.temp : 1.0f;
@@ -1365,9 +1378,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 std::vector<int32_t> sorted_idx;
 
                 int32_t predecessor = 0;
-                for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
+                for (int32_t i = 1; i < (is_lattice ? n_block_tokens : params.n_max + 1); ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
-                    const int32_t top_k = is_dflash2 ? selector_top_k : lilicorr_top_k;
+                    const int32_t top_k = is_lattice ? selector_top_k : lilicorr_top_k;
                     const float * scores = row + top_k + (size_t) predecessor * top_k;
 
                     predecessor = (int32_t) std::distance(scores,
@@ -2955,6 +2968,9 @@ bool common_speculative_draft_ranks_full_output(const std::string & path) {
     }
     if (gguf_find_tensor(gguf_ctx.get(), "markov_w1.weight") >= 0) {
         ranks_full_output = true; // DSpark
+    }
+    if (gguf_find_tensor(gguf_ctx.get(), "dspine_codebook.weight") >= 0) {
+        ranks_full_output = true; // [TAG_DSPINE] its candidates are the top-k of the full head
     }
     if (!ranks_full_output) {
         return false;

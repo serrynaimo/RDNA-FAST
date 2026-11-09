@@ -3645,6 +3645,11 @@ int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
     return model->hparams.dflash_selector_top_k;
 }
 
+// [TAG_DSPINE]
+int32_t llama_model_dflash_dspine_top_k(const llama_model * model) {
+    return model->hparams.dflash_dspine_top_k;
+}
+
 int32_t llama_model_n_head(const llama_model * model) {
     return model->hparams.n_head();
 }

@@ -283,6 +283,8 @@ struct llama_hparams {
     uint32_t dflash_conv_group_size  = 0;
     uint32_t dflash_selector_rank    = 0;
     uint32_t dflash_selector_top_k   = 0;
+    uint32_t dflash_dspine_top_k     = 0;     // [TAG_DSPINE] refinement width K (0: not a DSpine draft)
+    float    dflash_dspine_eps       = 1e-6f; // [TAG_DSPINE] code-bridge read / code epsilon
     uint32_t lilicorr_hidden_size    = 0;
     uint32_t lilicorr_candidate_topk = 0;
     uint32_t lilicorr_num_heads      = 0;
