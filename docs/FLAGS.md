@@ -44,15 +44,17 @@ Beyond the ones in the quick start:
 
 ## Block drafters
 
-For cards with 24 GB or more, instead of MTP: a separate small model drafts a whole block of tokens per pass. It
-keeps features of the main model for the whole context: two slots at 32k took 22.6 GB with Swift 1.5 IQ4_XS.
-Both kinds run with `-md FILE --spec-type draft-dflash --spec-draft-n-max 15`; which one a file is, the server
-reads from the GGUF.
+For cards with 24 GB or more, instead of MTP: a separate small model drafts a whole block of tokens per pass. Both
+kinds run with `-md FILE --spec-type draft-dflash`; which one a file is, the server reads from the GGUF. The drafter
+sees the main model's context through a sliding window, so its cache stays at 80-200 MiB at any context length. Its
+VRAM goes to its weights (~2 GB) and to a compute buffer for full-vocabulary scores: ~2 GB at the default draft batch,
+~250 MiB with `--spec-draft-n-ubatch 256`. Above temperature 0, `--spec-draft-sampling probabilistic` samples the draft
+and has the main model verify it by rejection sampling.
 
-| drafter | what it does | where it helps |
-|---|---|---|
-| DFlash2, e.g. Anbeeld/Qwen3.8-27B-DFlash2-GGUF (Q8_0, 2.06 GB) | a block-diffusion drafter: all positions of the block in one pass, then the best chain through each position's candidates | code-heavy work: at 8k with one slot, code 76 t/s median and 95 peak (MTP + n-gram at 32k: 76, 86), prose 43 (MTP 51) |
-| DSpine, tencent/Qwen3.8-27B-DSpine-b16 (Q8_0, 2.16 GB) | DFlash with a code bridge: each position of the block passes a code of its predicted token to the next one, and the candidates are rescored against the position before. Convert with `convert_hf_to_gguf.py DIR --target-model-dir QWEN3.8-27B-DIR --outtype q8_0` | on the CPU, with the stock Qwen3.8-27B and Swift 1.5: as many accepted tokens per pass as DFlash2 (more on math, fewer on lists), drafting twice as many; at temperature 0 the output is identical to the main model alone. Not run on a GPU yet |
+| drafter | flags | what it does | where it helps |
+|---|---|---|---|
+| DFlash2, e.g. Anbeeld/Qwen3.8-27B-DFlash2-GGUF (Q8_0, 2.06 GB) | `--spec-draft-n-max 7` | a block-diffusion drafter: a block of 8 positions in one pass, then the best chain through each position's candidates; a 2,048-token window | code-heavy work: at 8k with one slot, code 76 t/s median and 95 peak (MTP + n-gram at 32k: 76, 86), prose 43 (MTP 51) |
+| DSpine, tencent/Qwen3.8-27B-DSpine-b16 (Q8_0, 2.16 GB) | `--spec-draft-n-max 15` | DFlash with a code bridge: a block of 16 positions, each passing a code of its predicted token to the next, and the candidates rescored against the position before; an 8,192-token window. Convert with `convert_hf_to_gguf.py DIR --target-model-dir QWEN3.8-27B-DIR --outtype q8_0` (the target's json and tokenizer files are enough) | on the CPU, with the stock Qwen3.8-27B and Swift 1.5: as many accepted tokens per pass as DFlash2 (more on math, fewer on lists), drafting twice as many; at temperature 0 the output is identical to the main model alone. Not run on a GPU yet |
 
 ## Expert handoff
 

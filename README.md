@@ -275,15 +275,14 @@ switch in [Environment variables](docs/FLAGS.md#environment-variables).
   their scales once per tile. Both come from rdna-boosts; they build for
   gfx1201 and the attention passes against the CPU when forced on the RX 7900
   XT, but neither has run on an RDNA4 card here.
-- **Cards with 24 GB or more: DFlash2.** A block-diffusion drafter (`-md`, e.g.
-  the Qwen3.8-27B DFlash2 GGUF, Q8_0 2.06 GB) drafts 15 tokens per pass:
-  `--spec-type draft-dflash --spec-draft-n-max 15`. It keeps features of the
-  main model for the whole context: two slots at 32k took 22.6 GB with Swift
-  1.5 IQ4_XS. On the RX 7900 XT at 8k, one slot (1.1 GB still paged out): code
-  76 t/s median, 95 peak (MTP + n-gram at 32k: 76, 86), prose 43 (MTP 51). MTP
-  stays the default; DFlash2 is for code-heavy work on a bigger card.
-  Tencent's DSpine drafter for Qwen3.8-27B loads the same way: on the CPU it
-  accepts as many tokens per pass as DFlash2; it has not run on a GPU yet.
+- **Cards with 24 GB or more: DFlash2 and DSpine.** A block drafter (`-md`,
+  e.g. the Qwen3.8-27B DFlash2 GGUF, Q8_0 2.06 GB) drafts a whole block of
+  tokens per pass, for about 3-5 GB of memory on top of the model. On the
+  RX 7900 XT at 8k, one slot (1.1 GB still paged out), DFlash2: code 76 t/s
+  median, 95 peak (MTP + n-gram at 32k: 76, 86), prose 43 (MTP 51). MTP stays
+  the default; DFlash2 is for code-heavy work on a bigger card. Tencent's
+  DSpine drafter for Qwen3.8-27B loads the same way: on the CPU it accepts as
+  many tokens per pass as DFlash2; it has not run on a GPU yet.
   [Flags](docs/FLAGS.md#block-drafters)
 - **Settings.** `-c`, `-ub 2048` and the VRAM split in this README are sized
   for 20 GB of VRAM. The speed tables are for the RX 7900 XT.
