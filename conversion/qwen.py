@@ -908,6 +908,106 @@ class DFlashModel(Qwen3Model):
             head_dim = self.hparams.get("head_dim") or self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
             self.gguf_writer.add_rope_dimension_sections([head_dim // 2, 0, 0, 0])
 
+        if (dspine := self._dspine_config()) is not None:
+            self.gguf_writer.add_dspine_top_k(dspine["top_k"])
+            self.gguf_writer.add_dspine_eps(dspine["eps"])
+
+    # [TAG_DSPINE] tencent/DSpine: a DFlash draft (causal block attention) with a code bridge after each active
+    # layer and a refinement of the last write over the top-k candidates of each block row. The checks follow
+    # sglang_dspine/models/dspine.py: only the serving layout it supports converts.
+    def _dspine_config(self) -> dict[str, Any] | None:
+        dflash_config = self.hparams.get("dflash_config", {})
+        bridge = dflash_config.get("selected_prefix_code_bridge")
+        if not bridge:
+            return None
+        if getattr(self, "_dspine", None) is not None:
+            return self._dspine
+
+        n_layer = int(self.hparams["num_hidden_layers"])
+        if dflash_config.get("selected_prefix_terminal", True):
+            raise ValueError("DSpine: only terminal-disabled code bridges are supported")
+        if dflash_config.get("selected_prefix_feature_write_mode") != "independent" or \
+                dflash_config.get("selected_prefix_feature_writes") is not True:
+            raise ValueError("DSpine: the code bridge must use independent learned writes")
+        if not dflash_config.get("draft_block_causal"):
+            raise ValueError("DSpine: the draft must use causal block attention (draft_block_causal)")
+        if dflash_config.get("selected_prefix_feature_reliability") is not None or \
+                dflash_config.get("selected_prefix_feature_next_token_rows", False):
+            raise ValueError("DSpine: reliability probes / next-token rows are not part of the DSpine layout")
+        if dflash_config.get("selected_prefix_terminal_residual_rank", 0):
+            raise ValueError("DSpine: the terminal token residual is not supported")
+        if dflash_config.get("conv_kernel_size") or dflash_config.get("selector_rank"):
+            raise ValueError("DSpine: drafts carry no DFlash2 convolutions or selector")
+
+        top_k: set[int] = set()
+        if (second := self.hparams.get("code_bridge_second_pass")) is not None:
+            if second.get("mode") != "serial_table" or int(second.get("first_exact", -1)) != n_layer - 1:
+                raise ValueError(f"DSpine: unsupported code_bridge_second_pass {second!r}")
+            top_k.add(int(second["head_topk"]))
+        if (refine := dflash_config.get("selected_prefix_last_write_refine")) is not None:
+            if refine.get("kind") != "exact_sender" or int(refine.get("version", 1)) != 1:
+                raise ValueError(f"DSpine: unsupported selected_prefix_last_write_refine {refine!r}")
+            top_k.add(int(refine["head_topk"]))
+        if len(top_k) != 1:
+            raise ValueError(f"DSpine: the checkpoint names no single refinement width: {sorted(top_k)}")
+        k = top_k.pop()
+        if k & (k - 1) or not 2 <= k <= 64:
+            raise ValueError(f"DSpine: head_topk must be a power of two in [2, 64], got {k}")
+
+        layers = sorted(int(i) - 1 for i in dflash_config["selected_prefix_feature_layers"])
+        if not layers or layers[0] < 0 or layers[-1] != n_layer - 1:
+            raise ValueError(f"DSpine: the active layers must include the last layer: {layers}")
+
+        self._dspine = {
+            "top_k":     k,
+            "eps":       float(bridge["eps"]),
+            "code_size": int(bridge["code_size"]),
+            "rank":      int(bridge["rank"]),
+            "layers":    layers,
+        }
+        logger.info(f"DSpine: code bridge on layers {layers}, code_size {self._dspine['code_size']}, "
+                    f"rank {self._dspine['rank']}, refinement top-k {k}")
+        return self._dspine
+
+    def _dspine_tensors(self, data_torch: Tensor, name: str) -> Iterable[tuple[str, Tensor]]:
+        dspine = self._dspine_config()
+        assert dspine is not None
+        short = name.removeprefix("model.")
+        if short in ("draft_block_causal_version", "last_write_refine_version",
+                     "selected_prefix_bridge.independent_write_version",
+                     "selected_prefix_bridge.terminal_disabled_version"):
+            if int(LazyTorchTensor.to_eager(data_torch).item()) != 1:
+                raise ValueError(f"DSpine: unsupported {short}")
+            return
+        short = short.removeprefix("selected_prefix_bridge.")
+        if short == "out.weight":
+            # the terminal projection of a terminal-disabled bridge is all zeros and never used
+            if LazyTorchTensor.to_eager(data_torch).count_nonzero().item():
+                raise ValueError("DSpine: a terminal-disabled checkpoint has a nonzero terminal projection")
+            return
+        simple = {
+            "codebook":                self.format_tensor_name(gguf.MODEL_TENSOR.DSPINE_CODEBOOK),
+            "gate.weight":             self.format_tensor_name(gguf.MODEL_TENSOR.DSPINE_GATE),
+            "gate.bias":               self.format_tensor_name(gguf.MODEL_TENSOR.DSPINE_GATE, suffix=".bias"),
+            "predecessor_gate.weight": self.format_tensor_name(gguf.MODEL_TENSOR.DSPINE_PRED_GATE),
+            "prev.weight":             self.format_tensor_name(gguf.MODEL_TENSOR.DSPINE_PREV),
+        }
+        if short in simple:
+            yield simple[short], data_torch
+            return
+        last = int(self.hparams["num_hidden_layers"]) - 1
+        if short == "read_weight":
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.DSPINE_READ, last), data_torch
+            return
+        if short in ("early_read_weights", "feature_write_weights"):
+            data = LazyTorchTensor.to_eager(data_torch)
+            key = gguf.MODEL_TENSOR.DSPINE_READ if short == "early_read_weights" else gguf.MODEL_TENSOR.DSPINE_WRITE
+            for il in dspine["layers"]:
+                if il < data.shape[0]:
+                    yield self.format_tensor_name(key, il), data[il].contiguous()
+            return
+        raise ValueError(f"DSpine: unexpected code-bridge tensor {name!r}")
+
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         yield from super().generate_extra_tensors()
 
@@ -991,6 +1091,11 @@ class DFlashModel(Qwen3Model):
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         if name == "model.embed_tokens.weight" and not self.hparams.get("has_embed_tokens", True):
+            return
+
+        if self._dspine_config() is not None and (name.startswith("model.selected_prefix_bridge.") or
+                name.endswith("_version")):
+            yield from self._dspine_tensors(data_torch, name)
             return
 
         # interleaved-rope checkpoints (rope_is_neox_style = false) -> NeoX layout: per head, even dims first then odd
