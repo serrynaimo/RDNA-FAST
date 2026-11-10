@@ -723,11 +723,24 @@ static uint16_t * mmb_cache_insert(ggml_backend_cuda_context & ctx, const ggml_t
     cache.push_back({mmb_root(t), t->data, n, buf});
     return buf->get();
 }
+// [TAG_MMB_BF16_WRITTEN] a tensor stored as BF16 only in an earlier split of the scheduled graph: the per-split slots
+// and cache no longer know it (begin_graph), the graph-wide record does; its F32 data was never written
+static const uint16_t * mmb_written_lookup(ggml_cuda_mmb_state & st, const ggml_tensor * t) {
+    const ggml_tensor * root = mmb_root(t);
+    for (const ggml_tensor * k : { t, root }) {
+        const auto it = st.bf16_written.find(k);
+        if (it == st.bf16_written.end() || it->second == nullptr) continue;
+        const ptrdiff_t off = (const char *) t->data - (const char *) k->data;   // a view into it: same element offset
+        return off >= 0 && off % (ptrdiff_t) sizeof(float) == 0 ? it->second + off / (ptrdiff_t) sizeof(float) : nullptr;
+    }
+    return nullptr;
+}
 static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t n, cudaStream_t stream) {
     const ggml_tensor * root = mmb_root(src1);
     auto & st = mmb_state(ctx);
     for (auto & e : st.slots) if (e.buf && e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
     for (auto & e : st.cache) if (e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
+    if (const uint16_t * w = mmb_written_lookup(st, src1)) return w;
     uint16_t * buf = mmb_cache_insert(ctx, src1, n);
     mmb_cvt_f32_bf16<<<(unsigned)((n / 8 + 255) / 256), 256, 0, stream>>>((const float *) src1->data, buf, n);
     return buf;
@@ -840,7 +853,7 @@ const uint16_t * ggml_cuda_mmb_cache_lookup(ggml_backend_cuda_context & ctx, con
     const ggml_tensor * root = mmb_root(t);
     for (auto & e : ctx.mmb_state->slots) if (e.buf && e.root == root && e.data == t->data) return e.buf->get();
     for (auto & e : ctx.mmb_state->cache) if (e.root == root && e.data == t->data) return e.buf->get();
-    return nullptr;
+    return mmb_written_lookup(*ctx.mmb_state, t);
 }
 uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot, const ggml_tensor * t, size_t n) {
     auto & st = mmb_state(ctx);
@@ -852,7 +865,10 @@ uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot,
 }
 void ggml_cuda_mmb_marks_clear(ggml_backend_cuda_context & ctx) { if (ctx.mmb_state) ctx.mmb_state->bf16_only.clear(); }
 size_t ggml_cuda_mmb_marks_count(ggml_backend_cuda_context & ctx) { return ctx.mmb_state ? ctx.mmb_state->bf16_only.size() : 0; }
-void ggml_cuda_mmb_mark_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t) { mmb_state(ctx).bf16_only.insert(t); }
+void ggml_cuda_mmb_mark_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
+    static const bool no_marks = getenv("GGML_CUDA_MMB_NO_MARKS") != nullptr;   // WIP test switch: fusions without the marks
+    if (!no_marks) mmb_state(ctx).bf16_only.insert(t);
+}
 bool ggml_cuda_mmb_is_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t) { return ctx.mmb_state && ctx.mmb_state->bf16_only.count(t) > 0; }
 void ggml_cuda_mmb_note_bf16_written(ggml_backend_cuda_context & ctx, const ggml_tensor * t, const uint16_t * bf16) { mmb_state(ctx).bf16_written[t] = bf16; }
 const uint16_t * ggml_cuda_mmb_bf16_written(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
