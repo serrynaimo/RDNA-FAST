@@ -697,6 +697,7 @@ struct ggml_cuda_mmb_state {
     mmb_cache_entry slots[4] = {};                       // producer slots: 0 = HC normalized stream xn, 1 = HC gate
     size_t slot_cap[4] = {0, 0, 0, 0};
     std::unordered_set<const ggml_tensor *> bf16_only;   // tensors whose consumers read only the BF16 copy
+    bool hc_float_weights = false;                       // [TAG_HC16_FLOAT_WEIGHTS] sticky for the context
 };
 
 namespace {
@@ -853,6 +854,8 @@ void ggml_cuda_mmb_marks_clear(ggml_backend_cuda_context & ctx) { if (ctx.mmb_st
 size_t ggml_cuda_mmb_marks_count(ggml_backend_cuda_context & ctx) { return ctx.mmb_state ? ctx.mmb_state->bf16_only.size() : 0; }
 void ggml_cuda_mmb_mark_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t) { mmb_state(ctx).bf16_only.insert(t); }
 bool ggml_cuda_mmb_is_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t) { return ctx.mmb_state && ctx.mmb_state->bf16_only.count(t) > 0; }
+bool ggml_cuda_mmb_hc_float_weights(ggml_backend_cuda_context & ctx) { return ctx.mmb_state && ctx.mmb_state->hc_float_weights; }
+void ggml_cuda_mmb_set_hc_float_weights(ggml_backend_cuda_context & ctx) { mmb_state(ctx).hc_float_weights = true; }
 void ggml_cuda_mmb_begin_graph(ggml_backend_cuda_context & ctx) {
     if (!ctx.mmb_state) return;
     for (auto & e : ctx.mmb_state->cache) delete e.buf;
@@ -1165,6 +1168,8 @@ void ggml_cuda_mmb_marks_clear(ggml_backend_cuda_context &) {}
 size_t ggml_cuda_mmb_marks_count(ggml_backend_cuda_context &) { return 0; }
 void ggml_cuda_mmb_mark_bf16_only(ggml_backend_cuda_context &, const ggml_tensor *) {}
 bool ggml_cuda_mmb_is_bf16_only(ggml_backend_cuda_context &, const ggml_tensor *) { return false; }
+bool ggml_cuda_mmb_hc_float_weights(ggml_backend_cuda_context &) { return false; }
+void ggml_cuda_mmb_set_hc_float_weights(ggml_backend_cuda_context &) {}
 bool ggml_cuda_mmb_gatemix() { return false; }
 bool ggml_cuda_mmb_down16() { return false; }
 bool ggml_cuda_mmb_res16() { return false; }

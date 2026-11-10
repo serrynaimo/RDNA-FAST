@@ -17,6 +17,9 @@ void ggml_cuda_mmb_marks_clear(ggml_backend_cuda_context & ctx);
 size_t ggml_cuda_mmb_marks_count(ggml_backend_cuda_context & ctx);
 void ggml_cuda_mmb_mark_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t);
 bool ggml_cuda_mmb_is_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t);
+// [TAG_HC16_FLOAT_WEIGHTS] the model's hyper-connection weights are float (BF16, F16, F32): no HC BF16-only marks
+bool ggml_cuda_mmb_hc_float_weights(ggml_backend_cuda_context & ctx);
+void ggml_cuda_mmb_set_hc_float_weights(ggml_backend_cuda_context & ctx);
 bool ggml_cuda_mmb_gatemix();
 bool ggml_cuda_mmb_down16();
 bool ggml_cuda_mmb_res16();

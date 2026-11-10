@@ -6226,6 +6226,27 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             cuda_ctx->mmb_marks_after_compute = false;
         }
     }
+    // [TAG_HC16_FLOAT_WEIGHTS] The HC BF16-only marks below (qwen4exp on RDNA3.5) were written and validated for packs
+    // with quantized hyper-connection weights. With float ones (BF16 in Swift 1.5 Flash-Next's Q2_0 pack) a fused
+    // consumer can be refused at run time while its input was stored as BF16 only: Flash-Next aborted at batches of 512
+    // rows and more ("DSV4_HC_POST(l_last-0) reads BF16-only tensor hc_combine-0"), reproduced on the RX 7900 XT with the
+    // RDNA3.5 fusions admitted there, where the same fusions without the marks gave the reference output (KL divergence
+    // 0.0083). Such a model keeps the fusions and skips these marks. Sticky per context; a split that finds float HC
+    // weights after earlier splits were marked drops every mark (no split of the graph has run yet).
+    if (!ggml_cuda_mmb_hc_float_weights(*cuda_ctx)) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * t = cgraph->nodes[i];
+            if (t->op != GGML_OP_MUL_MAT || t->src[0] == nullptr) {
+                continue;
+            }
+            const ggml_tensor * w = t->src[0]->view_src ? t->src[0]->view_src : t->src[0];
+            if (strstr(w->name, ".hc_") != nullptr && !ggml_is_quantized(w->type)) {
+                ggml_cuda_mmb_set_hc_float_weights(*cuda_ctx);
+                ggml_cuda_mmb_marks_clear(*cuda_ctx);
+                break;
+            }
+        }
+    }
     // the BF16-only marks assume the fused kernels run, so they must not be set when fusion is disabled
     const bool disable_fusion = ggml_cuda_fusion_disabled();
     if (!disable_fusion) {
@@ -6254,7 +6275,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
     {   // HC16 step 2: mark HC normalized-stream (xn) and gate tensors whose consumers all read the BF16 copies
         static const int hc16 = 2;
-        if (hc16 >= 2 && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        if (hc16 >= 2 && !ggml_cuda_mmb_hc_float_weights(*cuda_ctx) && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
             auto reads = [](const ggml_tensor * t, const ggml_tensor * x) { for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (t->src[s] == x || t->src[s]->view_src == x) return true; return false; };
             for (int i = 0; i < cgraph->n_nodes; ++i) {
                 ggml_cuda_hc_combine_norm_args ca;
