@@ -19,31 +19,31 @@ machine and model.
 
 RX 7900 XT 20 GB, Ryzen 9 7900 (12 cores), 32 GB DDR5, Windows 11, ROCm 10.1, through `llama-server`.
 
-**Qwen3.8-Flash-Next Q2_0** (Swift 1.5 Flash-Next, 66.5 GB): 36% of its experts fit in VRAM, about 14 GB of the
-other 20 GB fit in the RAM this machine leaves free, and the rest is read from the SSD
+**Qwen3.8-Flash-Next Q2_0** (Swift 1.5 Flash-Next, 66.5 GB): 37% of its experts fit in VRAM (29% next to the MTP
+draft), about 15 GB of the other 20 GB fit in the RAM this machine leaves free, and the rest is read from the SSD
 ([Streaming from the SSD](#streaming-from-the-ssd)). Sampling at temperature 1,
-2026-11-08:
+2026-11-10:
 
 | | Default | With MTP drafting |
 | --- | ---: | ---: |
-| Decode, first answer after a load | 26.9 t/s | 26.8 t/s |
-| Decode, short answers | **28.5-31.2 t/s** | 27.1-28.7 t/s |
-| Decode, copying a 1,200-token text | **44.3 t/s** | 42.1 t/s |
-| Decode, after a 4k-token prompt | 20.1 t/s | 20.5 t/s |
-| 700-token prompt | 6.4 s | 7.1 s |
-| 3.8k-token prompt | 181 t/s | 200 t/s |
-| 15k-token prompt | **281 t/s** | 232 t/s |
+| Decode, first answer after a load | 26.9 t/s | **37.1 t/s** |
+| Decode, short answers | 30.0-32.6 t/s | **33.3-37.5 t/s** |
+| Decode, copying a 1,200-token text | 46.9 t/s | **64.8 t/s** |
+| Decode, after a 4k-token prompt | 24.3 t/s | **30.6 t/s** |
+| 700-token prompt | 4.9 s | **4.6 s** |
+| 3.8k-token prompt | 248 t/s | **261 t/s** |
+| 15k-token prompt | **373 t/s** | 284 t/s |
 
 The same model in an agent session: the two-agent session of the [README's speed test](../README.md#speed) (an
 orchestrator that grows from 4k to 41k tokens, a 10k-token worker), with MTP drafting, the better of two sessions:
 
 | | |
 | --- | ---: |
-| Cold 4k-token prompt | 276 t/s |
-| 4.3k new tokens at 17k depth | 274 t/s |
-| 4.0k new tokens at 41k depth | 236 t/s |
-| Decode at 4k / 17k / 41k depth | 29.3 / 30.9 / 28.3 t/s |
-| Code edit that copies the prompt | 45.8 t/s |
+| Cold 4k-token prompt | 326 t/s |
+| 4.3k new tokens at 17k depth | 368 t/s |
+| 4.0k new tokens at 41k depth | 364 t/s |
+| Decode at 4k / 17k / 41k depth | 35.1 / 37.4 / 37.2 t/s |
+| Code edit that copies the prompt | 53.3 t/s |
 
 **Qwen3.6-35B-A3B UD-Q4_K_S** (20 GB of weights, more than the card holds next to its context), greedy, 2026-11-06:
 
@@ -89,11 +89,11 @@ VRAM, Gemma 4 with half its experts on the CPU has a KL divergence of about 0.08
   20 GB card has about 20 GB of experts outside VRAM, so it runs best with 40 GB of RAM or more.
 - **Save a profile for your work.** Without one, the cache starts with an even share of every layer's experts and the
   first answers are slower until it has learned. See [Profiles](#profiles).
-- **Drafting: MTP or none, not n-gram.** The MTP draft (`-md mtp-Qwen3.8-Flash-Next-Q4_0.gguf --spec-type draft-mtp
-  --spec-draft-n-max 3 --spec-draft-p-min 0.5`) takes VRAM that the expert cache then lacks: on the 20 GB card it
-  comes out about even on answers and slower on long prompts (see Results). On a card with VRAM to spare it pays off.
-  N-gram drafting (`--spec-type ngram-*`) halved the speed of copied text: every draft it checks costs the CPU more
-  than it saves.
+- **Drafting: MTP, not n-gram.** The MTP draft (`-md mtp-Qwen3.8-Flash-Next-Q4_0.gguf --spec-type draft-mtp
+  --spec-draft-n-max 3 --spec-draft-p-min 0.5`) makes answers 12-38% faster on the 20 GB card. It takes VRAM that the
+  expert cache then lacks, so prompts of 15k tokens and more are about a quarter slower (see Results); on a card with
+  VRAM to spare that cost goes away. N-gram drafting (`--spec-type ngram-*`) halved the speed of copied text: every
+  draft it checks costs the CPU more than it saves.
 - **Keep the default batch size.** `-ub 4096` makes the compute buffers larger, which leaves fewer experts in VRAM: on
   the 20 GB card prompts and answers both got slower.
 - **Workers.** Lower `--pool-workers` only if other CPU-heavy programs share the machine.
@@ -192,7 +192,7 @@ RAM. The experts live in three places, fastest first:
 
 1. **The VRAM cache:** the most used experts, chosen by the profile and then by the conversation.
 2. **The RAM copy:** the next most used ones, copied from the model file once at load (up to eight readers in
-   parallel, Flash-Next's 14.6 GiB in about 10 s) into RAM that is locked, so the system never pages it out.
+   parallel, Flash-Next's 14.9 GiB in about 10 s) into RAM that is locked, so the system never pages it out.
 3. **The model file:** everything else stays memory-mapped. The system reads it from the SSD when the CPU or an upload
    touches it and keeps it in its file cache while RAM allows.
 
