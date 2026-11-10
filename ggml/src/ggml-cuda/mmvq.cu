@@ -673,16 +673,18 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 // [TAG_HC_SKINNY] RDNA3.0 and RDNA4 at one column on short rows: the types that take 8 warps per row there leave most
 // lanes idle when a row has fewer blocks than 8 warps read in one pass (K = 320 in Q8_0 is 10 blocks of the 64), and
 // spend the time on one block and a shared-memory reduction per row (the hyper-connection up-projections of qwen4exp:
-// 20480 rows of 320). Rows that keep only one warp busy (fewer blocks than two warps read in one pass: K < 512 in Q8_0,
-// K < 1024 in the 4- and 5-bit types; see should_use_small_k) take one warp per block and four rows per block instead.
-// RX 7900 XT (2026-11-09), Q8_0 at one column: 20480 x 320 42.2 -> 6.4 us, 10240 x 320 16.8 -> 4.5 us (2 rows 7.3 /
-// 4.9, 8 rows 6.3 / 4.9, the generic 8 warps x 8 rows 14.9 / 8.2); the synthetic Qwen4-27B decodes 25.0 -> 27.7 t/s at
-// 8k. RDNA4 not measured here: it has the same 8-warp table, and llama.cpp PR #20831 measured fewer warps for narrow
-// matrices as a gain on the R9700 (gfx1201) and the W7900 (gfx1100). RDNA3.5 already runs one warp per row for these
-// types (more were measured slower on the Radeon 8060S, PR #19478), so it keeps its table.
+// 20480 rows of 320). Rows shorter than one pass of those 8 warps (K < 2048 in Q8_0, K < 4096 in the 4- and 5-bit
+// types; see should_use_small_k) take one warp per block and four rows per block instead. RX 7900 XT, one column:
+// Q8_0 20480 x 320 42.2 -> 6.4 us (2 rows 7.3, 8 rows 6.3, the generic 8 warps x 8 rows 14.9); over K at 10240 rows
+// (2026-11-10, cache-hot) Q4_0 K 256-2560 17.2-24.7 -> 4.0-9.6 us, IQ4_NL alike, Q8_0 K 256-1024 16.3-21.3 -> 3.8-7.4
+// us, never slower; a limit of two one-warp passes (K < 512 / 1024) gave up 3-4.5x between them. The synthetic
+// Qwen4-27B decodes 25.0 -> 27.7 t/s at 8k. RDNA4 not measured here: it has the same 8-warp table, and llama.cpp PR
+// #20831 measured fewer warps for narrow matrices as a gain on the R9700 (gfx1201) and the W7900 (gfx1100). RDNA3.5
+// already runs one warp per row for these types (more were measured slower on the Radeon 8060S, PR #19478), so it
+// keeps its table.
 #define GGML_CUDA_RDNA_SHORT_ROW_NWARPS 1
 #define GGML_CUDA_RDNA_SHORT_ROW_RPB    4
-#define GGML_CUDA_RDNA_SHORT_ROW_PASSES 2   // rows shorter than what this many warps read in one pass
+#define GGML_CUDA_RDNA_SHORT_ROW_PASSES 8   // rows shorter than what this many warps read in one pass
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {

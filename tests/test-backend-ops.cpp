@@ -12188,10 +12188,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  1030, n,  320, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  2048, n, 1024, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  2048, n, 1056, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
-            // the edges of the one-warp rule: Q8_0 below / at 512, the 4- and 5-bit types below / at 1024
+            // the edges of the short-row rule on RDNA3.0 / RDNA4: Q8_0 below / at 2048, the 4- and 5-bit types below / at 4096
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  2048, n,  480, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
-            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  2048, n,  512, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
-            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  2048, n,  992, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  2048, n, 2016, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  2048, n, 2048, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  2048, n, 4064, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  2048, n, 4096, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
         }
     }
 
