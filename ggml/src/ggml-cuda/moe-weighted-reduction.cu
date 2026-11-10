@@ -181,7 +181,9 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
     const float * mrg = merge ? (const float *) merge->data : nullptr;
     if (ggml_cuda_mmb_blk16() && ggml_cuda_mmb_is_bf16_only(ctx, dst)) {
         GGML_ASSERT(n_embd % 4 == 0);
-        const bool ein = ggml_cuda_mmb_is_bf16_only(ctx, experts);
+        // [TAG_MMB_BF16_WRITTEN] the experts as BF16 only if their producer stored them so, not because they are marked
+        const bool ein = ggml_cuda_mmb_bf16_written(ctx, experts) != nullptr;
+        ggml_cuda_mmb_note_bf16_written(ctx, dst, (const uint16_t *) dst->data);
         constexpr int threads = 256;
         const dim3 blocks(n_tokens, (n_embd / 4 + threads - 1) / threads, 1);
         if (ein) moe_weighted_reduction_bf16_v4_out<<<blocks, threads, 0, stream>>>((const uint16_t *) experts->data,
@@ -194,7 +196,7 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
         return;
     }
     GGML_ASSERT(merge == nullptr && "shared-expert merge is only fused on the BF16 output path");
-    if (ggml_cuda_mmb_down16() && ggml_cuda_mmb_is_bf16_only(ctx, experts)) {
+    if (ggml_cuda_mmb_down16() && ggml_cuda_mmb_bf16_written(ctx, experts) != nullptr) {   // [TAG_MMB_BF16_WRITTEN]
         GGML_ASSERT(n_embd % 4 == 0 && ((uintptr_t) experts->data % 16) == 0 && ((uintptr_t) dst->data % 16) == 0);
         constexpr int threads = 256;
         const dim3 blocks(n_tokens, (n_embd / 4 + threads - 1) / threads, 1);

@@ -2627,16 +2627,7 @@ static bool ggml_cuda_hc_combine_rows_ok(const ggml_cuda_hc_combine_norm_args & 
     return ggml_nrows(args.out_xn) >= ggml_cuda_hc_combine_min_rows();
 }
 
-static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
-    if (ggml_cuda_mmb_marks_count(ctx) > 0 && dst->op != GGML_OP_MUL_MAT && dst->op != GGML_OP_MUL_MAT_ID && dst->op != GGML_OP_VIEW &&
-            dst->op != GGML_OP_RESHAPE && dst->op != GGML_OP_PERMUTE && dst->op != GGML_OP_TRANSPOSE && dst->op != GGML_OP_NONE) {
-        for (int s = 0; s < GGML_MAX_SRC && dst->src[s]; ++s) {
-            const ggml_tensor * src = dst->src[s];
-            if (ggml_cuda_mmb_is_bf16_only(ctx, src) || (src->view_src && ggml_cuda_mmb_is_bf16_only(ctx, src->view_src))) {
-                GGML_ABORT("MMB: %s(%s) reads BF16-only tensor %s through the unfused path", ggml_op_name(dst->op), dst->name, src->name);
-            }
-        }
-    }
+static bool ggml_cuda_compute_forward_op(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -3005,6 +2996,61 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     }
 
     return true;
+}
+
+// [TAG_MMB_BF16_WRITTEN] An op that runs unfused on a tensor marked BF16-only. graph_optimize sets the marks from the
+// graph's structure before buffers are assigned, so a fusion refused at run time (buffer aliasing, an earlier fusion
+// taking its first node) breaks the promise. That used to abort: on RDNA3.5, where the qwen4exp fusions run, Flash-Next
+// with BF16 hyper-connection weights at batches of 512 rows and more ("DSV4_HC_POST(l_last-0) reads BF16-only tensor
+// hc_combine-0", reproduced on the RX 7900 XT with those fusions admitted). Now the op reads the tensor in F32 either
+// way: if its producer stored it as BF16 only, the BF16 copy (cached, or in the tensor's own buffer) is expanded into a
+// temporary F32 buffer for this op; otherwise the producer wrote F32 after all and the op reads it as it is.
+static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    if (ggml_cuda_mmb_marks_count(ctx) == 0 || dst->op == GGML_OP_MUL_MAT || dst->op == GGML_OP_MUL_MAT_ID || dst->op == GGML_OP_VIEW ||
+            dst->op == GGML_OP_RESHAPE || dst->op == GGML_OP_PERMUTE || dst->op == GGML_OP_TRANSPOSE || dst->op == GGML_OP_NONE) {
+        return ggml_cuda_compute_forward_op(ctx, dst);
+    }
+    std::unique_ptr<ggml_cuda_pool_alloc<float>> f32[GGML_MAX_SRC];   // freed in reverse order of allocation
+    size_t offs[GGML_MAX_SRC] = {};
+    bool any = false;
+    for (int s = 0; s < GGML_MAX_SRC && dst->src[s]; ++s) {   // decide and expand with every pointer still original
+        const ggml_tensor * src = dst->src[s];
+        const ggml_tensor * m = ggml_cuda_mmb_is_bf16_only(ctx, src) ? src :
+            (src->view_src && ggml_cuda_mmb_is_bf16_only(ctx, src->view_src) ? src->view_src : nullptr);
+        const uint16_t * h = m ? ggml_cuda_mmb_bf16_written(ctx, m) : nullptr;   // where its producer stored it
+        if (h == nullptr) {
+            continue;
+        }
+        GGML_ASSERT(m->type == GGML_TYPE_F32 && ggml_is_contiguous(m));
+        const int64_t n = ggml_nelements(m);
+        f32[s] = std::make_unique<ggml_cuda_pool_alloc<float>>(ctx.pool(), n);
+        ggml_get_to_fp32_cuda(GGML_TYPE_BF16)(h, f32[s]->get(), n, ctx.stream());
+        offs[s] = (size_t) ((const char *) src->data - (const char *) m->data);
+        any = true;
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("%s: %s(%s) reads %s, stored as BF16 only, through the unfused path: expanded to F32 (logged once)\n",
+                          __func__, ggml_op_name(dst->op), dst->name, m->name);
+        }
+    }
+    if (!any) {
+        return ggml_cuda_compute_forward_op(ctx, dst);
+    }
+    void * saved[GGML_MAX_SRC] = {};
+    for (int s = 0; s < GGML_MAX_SRC && dst->src[s]; ++s) {
+        if (f32[s]) {
+            saved[s] = dst->src[s]->data;
+            dst->src[s]->data = (char *) f32[s]->get() + offs[s];
+        }
+    }
+    const bool ok = ggml_cuda_compute_forward_op(ctx, dst);
+    for (int s = GGML_MAX_SRC - 1; s >= 0; --s) {   // reverse: a tensor that is two sources gets its first pointer back
+        if (f32[s]) {
+            dst->src[s]->data = saved[s];
+        }
+    }
+    return ok;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -4718,23 +4764,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         // while prefill (>= 512 rows, where its BF16/Q8 side copies pay off) stayed bit-identical. Keep it for
         // prefill-sized batches only (ggml_cuda_hc_combine_rows_ok, shared with the BF16-only marks in graph_optimize).
         const bool rows_ok = skip > 0 && ggml_cuda_hc_combine_rows_ok(args);
-        if (skip > 0 && rows_ok && !ggml_cuda_hc_combine_norm_alias_ok(args) && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, args.out_xn)) {
-            GGML_ABORT("hc_combine_norm: output %s is marked BF16-only but the fused kernel was refused (buffer aliasing)", args.out_xn->name);
-        }
+        // [TAG_MMB_BF16_WRITTEN] a refused fusion (buffer aliasing) used to abort when out_xn was marked BF16-only; the
+        // unfused nodes below now write it in F32, and its readers see it was not stored as BF16
         if (skip > 0 && rows_ok && ggml_cuda_hc_combine_norm_alias_ok(args)) {
             args.out_xn_bf16 = ggml_cuda_mmb_cache_reserve(*cuda_ctx, args.out_xn, (size_t) ggml_nelements(args.out_xn));
             args.store_xn_f32 = !(args.out_xn_bf16 && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, args.out_xn));
+            if (!args.store_xn_f32) ggml_cuda_mmb_note_bf16_written(*cuda_ctx, args.out_xn, args.out_xn_bf16);
             if (ggml_cuda_mmb_res16()) {   // 16-bit residual stream, in place over each tensor's own buffer
                 const ggml_tensor * rin  = args.residual->view_src ? args.residual->view_src : args.residual;
                 const ggml_tensor * rout = args.out_res->view_src  ? args.out_res->view_src  : args.out_res;
-                const bool in16  = ggml_cuda_mmb_is_bf16_only(*cuda_ctx, rin)  && args.residual->view_offs == 0;
-                const bool out16 = ggml_cuda_mmb_is_bf16_only(*cuda_ctx, rout) && args.out_res->view_offs == 0;
+                // read BF16 only where the producer stored BF16; write BF16 where the output is marked
+                const bool in16  = ggml_cuda_mmb_bf16_written(*cuda_ctx, rin) != nullptr && args.residual->view_offs == 0;
+                bool       out16 = ggml_cuda_mmb_is_bf16_only(*cuda_ctx, rout) && args.out_res->view_offs == 0;
                 if (args.out_res->data == args.residual->data && in16 != out16) {
-                    GGML_ABORT("hc_combine_norm: in-place residual with mismatched BF16 marks (%s); the graph_optimize "
-                               "allocation dependency should have separated them", args.out_res->name);
+                    if (in16) {
+                        GGML_ABORT("hc_combine_norm: in-place residual with mismatched BF16 marks (%s); the graph_optimize "
+                                   "allocation dependency should have separated them", args.out_res->name);
+                    }
+                    out16 = false;   // the residual came in F32 (its producer ran unfused): keep the stream in F32 in place
                 }
+                if (out16) ggml_cuda_mmb_note_bf16_written(*cuda_ctx, rout, (const uint16_t *) args.out_res->data);
                 const ggml_tensor * rblk = args.block_out->view_src ? args.block_out->view_src : args.block_out;
-                args.blk_in_bf16 = (ggml_cuda_mmb_blk16() && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, rblk) && args.block_out->view_offs == 0)
+                args.blk_in_bf16 = (ggml_cuda_mmb_blk16() && ggml_cuda_mmb_bf16_written(*cuda_ctx, rblk) != nullptr && args.block_out->view_offs == 0)
                                  ? (const uint16_t *) args.block_out->data : nullptr;
                 args.res_in_bf16  = in16  ? (const uint16_t *) args.residual->data : nullptr;
                 args.res_out_bf16 = out16 ? (uint16_t *) args.out_res->data : nullptr;
@@ -6102,6 +6153,10 @@ char * ggml_cuda_mmvq_q8_cache_get(ggml_backend_cuda_context & ctx, const ggml_t
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    // [TAG_MMB_BF16_WRITTEN] the record of what was stored as BF16 lives as long as the marks: the whole scheduled graph
+    if (cgraph->n_nodes > 0 && cgraph->nodes[0] == cuda_ctx->mmb_marks_first_split) {
+        ggml_cuda_mmb_written_clear(*cuda_ctx);
+    }
     ggml_cuda_mmb_begin_graph(*cuda_ctx);
     ggml_cuda_q8_mmq_cache_begin_graph(*cuda_ctx);
     ggml_cuda_mmvq_q8_cache_begin_graph(*cuda_ctx);

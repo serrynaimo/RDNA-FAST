@@ -697,6 +697,7 @@ struct ggml_cuda_mmb_state {
     mmb_cache_entry slots[4] = {};                       // producer slots: 0 = HC normalized stream xn, 1 = HC gate
     size_t slot_cap[4] = {0, 0, 0, 0};
     std::unordered_set<const ggml_tensor *> bf16_only;   // tensors whose consumers read only the BF16 copy
+    std::unordered_map<const ggml_tensor *, const uint16_t *> bf16_written; // [TAG_MMB_BF16_WRITTEN] of those, the ones stored as BF16 only, and where
 };
 
 namespace {
@@ -853,6 +854,13 @@ void ggml_cuda_mmb_marks_clear(ggml_backend_cuda_context & ctx) { if (ctx.mmb_st
 size_t ggml_cuda_mmb_marks_count(ggml_backend_cuda_context & ctx) { return ctx.mmb_state ? ctx.mmb_state->bf16_only.size() : 0; }
 void ggml_cuda_mmb_mark_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t) { mmb_state(ctx).bf16_only.insert(t); }
 bool ggml_cuda_mmb_is_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t) { return ctx.mmb_state && ctx.mmb_state->bf16_only.count(t) > 0; }
+void ggml_cuda_mmb_note_bf16_written(ggml_backend_cuda_context & ctx, const ggml_tensor * t, const uint16_t * bf16) { mmb_state(ctx).bf16_written[t] = bf16; }
+const uint16_t * ggml_cuda_mmb_bf16_written(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
+    if (!ctx.mmb_state) return nullptr;
+    const auto it = ctx.mmb_state->bf16_written.find(t);
+    return it == ctx.mmb_state->bf16_written.end() ? nullptr : it->second;
+}
+void ggml_cuda_mmb_written_clear(ggml_backend_cuda_context & ctx) { if (ctx.mmb_state) ctx.mmb_state->bf16_written.clear(); }
 void ggml_cuda_mmb_begin_graph(ggml_backend_cuda_context & ctx) {
     if (!ctx.mmb_state) return;
     for (auto & e : ctx.mmb_state->cache) delete e.buf;
@@ -965,6 +973,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     if (ggml_cuda_mmb_blk16() && !Dh && ggml_cuda_mmb_is_bf16_only(ctx, dst) && (M & 7) == 0) {
         Dh = (uint16_t *) dst->data; store_f32 = false;
     }
+    if (!store_f32) ggml_cuda_mmb_note_bf16_written(ctx, dst, Dh);   // [TAG_MMB_BF16_WRITTEN]
     dim3 grid((M + 127) / 128, big ? (T + 255) / 256 : (T + 127) / 128);
     const uint16_t * shadow = shadow_pre;
 
@@ -1006,6 +1015,7 @@ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const uint16_t * lo16 = mmb_bf16_activation(ctx, lo, (size_t) T * K, stream);
     uint16_t * outh = ggml_cuda_mmb_slot_reserve(ctx, 3, dst, (size_t) T * E);
     const bool store_f32 = !(outh && ggml_cuda_mmb_is_bf16_only(ctx, dst));
+    if (!store_f32) ggml_cuda_mmb_note_bf16_written(ctx, dst, outh);   // [TAG_MMB_BF16_WRITTEN]
     dim3 grid(E / 32, (T + 127) / 128);
     mmb_dispatch_quant(w->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
@@ -1044,6 +1054,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data; const size_t eb = (size_t) src0->nb[2];
     uint16_t * Dh = (mmb_down16_flag() && ggml_cuda_mmb_is_bf16_only(ctx, dst)) ? (uint16_t *) dst->data : nullptr;
     const bool store_f32 = Dh == nullptr;
+    if (!store_f32) ggml_cuda_mmb_note_bf16_written(ctx, dst, Dh);   // [TAG_MMB_BF16_WRITTEN]
     dim3 gbig((M + 127) / 128, nbig_max), gsmall((M + 127) / 128, nsmall_max);
     mmb_dispatch_quant(src0->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
@@ -1090,6 +1101,7 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), desc_big.get(), desc_small.get(), E, nbig_max, nsmall_max, BN, BN_SMALL, THRESH);
     uint16_t * Dh = ggml_cuda_mmb_slot_reserve(ctx, 2, glu, (size_t) n_rows * M);
     const bool store_f32 = !ggml_cuda_mmb_is_bf16_only(ctx, glu);
+    if (!store_f32) ggml_cuda_mmb_note_bf16_written(ctx, glu, Dh);   // [TAG_MMB_BF16_WRITTEN]
     const uint8_t * Wg = (const uint8_t *) gw->data, * Wu = (const uint8_t *) uw->data; float * D = (float *) glu->data; const size_t eb = (size_t) gw->nb[2];
     dim3 gbig((M + 63) / 64, nbig_max), gsmall((M + 63) / 64, nsmall_max);
     mmb_dispatch_quant(gw->type, [&](auto tag) {
@@ -1165,6 +1177,9 @@ void ggml_cuda_mmb_marks_clear(ggml_backend_cuda_context &) {}
 size_t ggml_cuda_mmb_marks_count(ggml_backend_cuda_context &) { return 0; }
 void ggml_cuda_mmb_mark_bf16_only(ggml_backend_cuda_context &, const ggml_tensor *) {}
 bool ggml_cuda_mmb_is_bf16_only(ggml_backend_cuda_context &, const ggml_tensor *) { return false; }
+void ggml_cuda_mmb_note_bf16_written(ggml_backend_cuda_context &, const ggml_tensor *, const uint16_t *) {}
+const uint16_t * ggml_cuda_mmb_bf16_written(ggml_backend_cuda_context &, const ggml_tensor *) { return nullptr; }
+void ggml_cuda_mmb_written_clear(ggml_backend_cuda_context &) {}
 bool ggml_cuda_mmb_gatemix() { return false; }
 bool ggml_cuda_mmb_down16() { return false; }
 bool ggml_cuda_mmb_res16() { return false; }

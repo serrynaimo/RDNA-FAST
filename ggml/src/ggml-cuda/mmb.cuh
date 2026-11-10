@@ -17,6 +17,13 @@ void ggml_cuda_mmb_marks_clear(ggml_backend_cuda_context & ctx);
 size_t ggml_cuda_mmb_marks_count(ggml_backend_cuda_context & ctx);
 void ggml_cuda_mmb_mark_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t);
 bool ggml_cuda_mmb_is_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t);
+// [TAG_MMB_BF16_WRITTEN] a mark is a promise made from the graph's structure before buffers are assigned; these record
+// which marked tensors a producer actually stored as BF16 only, and where (a fusion refused at run time leaves its output
+// in F32). Like the marks they live for the whole scheduled graph, across its splits (the per-split cache and slot
+// lookups do not). Readers that take a tensor's own buffer as BF16 ask this, not the mark.
+void ggml_cuda_mmb_note_bf16_written(ggml_backend_cuda_context & ctx, const ggml_tensor * t, const uint16_t * bf16);
+const uint16_t * ggml_cuda_mmb_bf16_written(ggml_backend_cuda_context & ctx, const ggml_tensor * t);   // nullptr: not stored as BF16 only
+void ggml_cuda_mmb_written_clear(ggml_backend_cuda_context & ctx);
 bool ggml_cuda_mmb_gatemix();
 bool ggml_cuda_mmb_down16();
 bool ggml_cuda_mmb_res16();
