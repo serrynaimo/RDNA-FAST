@@ -45,23 +45,23 @@ orchestrator that grows from 4k to 41k tokens, a 10k-token worker), with MTP dra
 | Decode at 4k / 17k / 41k depth | 35.1 / 37.4 / 37.2 t/s |
 | Code edit that copies the prompt | 53.3 t/s |
 
-**Qwen3.6-35B-A3B UD-Q4_K_S** (20 GB of weights, more than the card holds next to its context), greedy, 2026-11-06:
+**Qwen3.6-35B-A3B UD-Q4_K_S** (20 GB of weights, more than the card holds next to its context), greedy, 2026-11-10:
 
 | | Decode | 4k-token prompt |
 | --- | ---: | ---: |
-| `--n-cpu-moe 8` (8 layers' experts on the CPU) | 66-71 t/s | 3178 t/s |
-| Expert handoff, `--expert-cache auto` | **103-105 t/s** | 2737 t/s |
+| `--n-cpu-moe 8` (8 layers' experts on the CPU) | 68-73 t/s | 3656 t/s |
+| Expert handoff, `--expert-cache auto` | **107-108 t/s** | **4718 t/s** |
 
-The cache holds 92% of the experts and serves 99.9% of the ones the model routes to.
+The cache holds 95% of the experts and serves 99.9% of the ones the model routes to.
 
 **Gemma 4 26B-A4B Q4_0** with only half or a quarter of its experts in VRAM, as on a smaller card (whole in 20 GB:
-101-102 t/s), greedy, 2026-11-06:
+106 t/s), greedy, 2026-11-10:
 
 | Experts in VRAM, cache starts from | Cache stays as it started | Cache follows the conversation |
 | --- | ---: | ---: |
-| Half, an even share of each layer | 53-59 t/s | **71-78 t/s** |
-| Half, a saved profile | 66-74 t/s | 60-78 t/s |
-| A quarter, a saved profile | 56-61 t/s | **60-69 t/s** |
+| Half, an even share of each layer | 60-61 t/s | **69-82 t/s** |
+| Half, a saved profile | 73-86 t/s | 70-83 t/s |
+| A quarter, a saved profile | 58-64 t/s | **61-68 t/s** |
 
 **Quality.** The CPU computes its experts in a different order and precision than the GPU would, so greedy answers
 match the all-GPU answers for a while and then diverge into different but coherent text. Against the model fully in
