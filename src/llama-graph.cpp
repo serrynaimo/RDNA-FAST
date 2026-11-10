@@ -156,6 +156,12 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
     }
 
+    if (h_rows) {
+        GGML_ASSERT(ubatch->data && ubatch->data->embd_state_row.size() == (size_t) n_tokens);
+        ggml_backend_tensor_set(h_rows, ubatch->data->embd_state_row.data(), 0, n_tokens*ggml_element_size(h_rows));
+        return;
+    }
+
     GGML_ASSERT(ubatch->embd_state && "this graph requires a state embedding, see llama_batch_ext_set_embd_state()");
     GGML_ASSERT(n_embd_state == h->ne[0]);
 
@@ -169,7 +175,27 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     res &= (!params.ubatch.embd)       || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd_state) || (h      && h->ne[1]      == params.ubatch.n_tokens);
 
+    const bool has_rows = params.ubatch.data && !params.ubatch.data->embd_state_row.empty();
+    res &= has_rows == (h_rows != nullptr);
+    res &= !has_rows || h_rows->ne[0] == params.ubatch.n_tokens;
+
     return res;
+}
+
+void llm_graph_input_batch_idxs::set_input(const llama_ubatch * ubatch) {
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    GGML_ASSERT(ubatch->data && ubatch->data->batch_idxs.size() == (size_t) n_tokens);
+
+    llama_host_write(idxs);
+    int64_t * data = (int64_t *) idxs->data;
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        data[i] = ubatch->data->batch_idxs[i];
+    }
+}
+
+bool llm_graph_input_batch_idxs::can_reuse(const llm_graph_params & params) {
+    return idxs->ne[0] == params.ubatch.n_tokens;
 }
 
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
@@ -1515,6 +1541,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     expert_handoff   (params.expert_handoff),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
+    h_nextn_dev      (params.h_nextn_dev),
+    h_nextn_src      (params.h_nextn_src),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2800,6 +2828,24 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     ggml_build_forward_expand(gf, cur);
 
     return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_embd_state(llm_graph_input_embd_h * inp, int64_t n_embd_state) const {
+    if (ubatch.data && !ubatch.data->embd_state_row.empty()) {
+        GGML_ASSERT(h_nextn_src != nullptr && h_nextn_src->ne[0] == n_embd_state);
+
+        inp->h_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp->h_rows);
+        ggml_set_name(inp->h_rows, "mtp_h_rows");
+
+        return ggml_get_rows(ctx0, h_nextn_src, inp->h_rows);
+    }
+
+    ggml_tensor * h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_state, n_tokens);
+    ggml_set_input(h);
+    ggml_set_name(h, "mtp_h_input");
+
+    return h;
 }
 
 ggml_tensor * llm_graph_context::build_inp_pos() const {
@@ -4303,6 +4349,29 @@ void llm_graph_context::build_logits() const {
     if (res->t_logits != nullptr) {
         ggml_build_forward_expand(gf, res->t_logits);
     }
+}
+
+void llm_graph_context::build_h_nextn_dev() const {
+    ggml_tensor * src = res->t_h_nextn;
+    if (h_nextn_dev == nullptr || src == nullptr) {
+        return;
+    }
+
+    // the device buffer is only enabled for the unmasked extraction, which has a row per batch token
+    // [TAG_MTP_DEV_ROWS] a row is n_embd_out wide: qwen4exp hands over its hc-wide residual as [n_embd, hc, n_tokens]
+    GGML_ASSERT(ggml_nelements(src) == h_nextn_dev->ne[0]*n_tokens);
+    if (!ggml_is_contiguous(src)) {
+        src = ggml_cont(ctx0, src);
+    }
+
+    auto inp = std::make_unique<llm_graph_input_batch_idxs>();
+
+    inp->idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
+    ggml_set_input(inp->idxs);
+
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, h_nextn_dev, ggml_reshape_2d(ctx0, src, h_nextn_dev->ne[0], n_tokens), inp->idxs));
+
+    res->add_input(std::move(inp));
 }
 
 void llm_graph_context::build_sampling() const {

@@ -1542,6 +1542,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // target h rows on the device (llama_set_embeddings_nextn_dev): the catch-up in process() reads row k - 1 of the last
+    // target decode in place, and row n_batch_tgt + seq_id for the first token of seq_id, uploaded from pending_h
+    // pending_h stays on the host: process() and accept() fetch it before the next target decode overwrites the rows
+    bool    dev_rows    = false;
+    int32_t n_batch_tgt = 0;
+    std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, -1 when verify_h holds the rows
+    std::vector<float>   rows_host;   // [TAG_MTP_DEV_ROWS] staging for the one-copy row transfers in process()
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1624,10 +1632,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
         draft_score_row.assign(n_seq, -2);
+
+        n_batch_tgt = (int32_t) llama_n_batch(ctx_tgt);
+        verify_row0.assign(n_seq, -1);
+
+        // shared memory and chained heads keep the host rows
+        if (!is_mem_shared && !chain_heads) {
+            dev_rows = llama_set_embeddings_nextn_dev(ctx_tgt, true) && llama_set_embd_state_src(ctx_dft, ctx_tgt);
+            if (!dev_rows) {
+                llama_set_embd_state_src(ctx_dft, nullptr);
+                llama_set_embeddings_nextn_dev(ctx_tgt, false);
+            }
+        }
+        SPC_INF("MTP target h rows on the device: %s\n", dev_rows ? "yes" : "no");
     }
 
     ~common_speculative_impl_draft_mtp() override {
         auto * ctx_dft = this->params.ctx_dft;
+        if (dev_rows) {
+            llama_set_embd_state_src(ctx_dft, nullptr);
+            llama_set_embeddings_nextn_dev(this->params.ctx_tgt, false);
+        }
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
                 continue;
@@ -1708,7 +1733,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            if (dev_rows) {
+                GGML_ASSERT(n_tokens <= n_batch_tgt && "the target batch exceeds the h_nextn device buffer");
+                // [TAG_MTP_DEV_ROWS] the pending rows of all sequences in one upload: rows n_batch_tgt + seq_id are
+                // contiguous, and a row of a sequence that is not in this batch is not read
+                rows_host.resize((size_t) n_seq * n_embd);
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    std::memcpy(rows_host.data() + (size_t) seq_id * n_embd, pending_h[seq_id].data(), row_bytes);
+                }
+                if (!llama_set_embeddings_nextn_rows(ctx_tgt, n_batch_tgt, n_seq, rows_host.data())) {
+                    SPC_ERR("%s", "failed to upload the pending rows to the h_nextn device buffer\n");
+                    return false;
+                }
+            }
+
+            const float * h_tgt = dev_rows ? nullptr : llama_get_embeddings_nextn(ctx_tgt);
 
             for (int k = 0; k < n_tokens; ++k) {
                 const auto & t = batch_in.tokens[k];
@@ -1719,6 +1758,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const int32_t idx = t.id != LLAMA_TOKEN_NULL
                     ? batch.add(t.id, t.pos[0], seq_id, false)
                     : batch.add_embd(t.embd, t.pos.data(), seq_id, false);
+
+                if (dev_rows) {
+                    batch.set_embd_state_row(idx, k == i_batch_beg[seq_id] ? n_batch_tgt + seq_id : k - 1);
+                    continue;
+                }
 
                 const float * h_row = k == i_batch_beg[seq_id]
                     ? pending_h[seq_id].data()
@@ -1759,26 +1803,73 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_batch_end[seq_id] < 0) {
-                continue;
+        // [TAG_MTP_KV_ONLY] accept() reads row min(n_accepted, n_rows - 1): the host keeps the rows a verification can
+        // address instead of every row of a prompt batch
+        const int32_t n_keep_max = std::max<int32_t>(16, this->params.n_max + 1);
+
+        if (dev_rows) {
+            // [TAG_MTP_DEV_ROWS] when every sequence of the batch has at most n_keep_max rows (a verification pass), the
+            // host takes all rows of the batch in one read and accept() picks its row on the host. Of a longer batch it
+            // takes only the last row of each sequence (the next pending row); accept() reads any other row from the
+            // device, before the next target decode overwrites it.
+            bool all_short = true;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_end[seq_id] >= 0 && i_batch_end[seq_id] - i_batch_beg[seq_id] + 1 > n_keep_max) {
+                    all_short = false;
+                }
             }
 
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
-            verify_h_rows[seq_id] = n_rows;
-
-            // [TAG_MTP_KV_ONLY] accept() reads row min(n_accepted, n_rows - 1): keep the rows a verification can
-            // address instead of every row of a prompt batch
-            const int32_t n_keep = std::min<int32_t>(n_rows, std::max<int32_t>(16, this->params.n_max + 1));
-            verify_h[seq_id].resize((size_t) n_keep * n_embd);
-
-            for (int32_t i = 0; i < n_keep; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+            if (all_short) {
+                rows_host.resize((size_t) n_tokens * n_embd);
+                if (!llama_get_embeddings_nextn_rows(ctx_tgt, 0, n_tokens, rows_host.data())) {
+                    SPC_ERR("%s", "failed to read the h_nextn rows of the target batch\n");
+                    return false;
+                }
             }
 
-            std::memcpy(pending_h[seq_id].data(),
-                    llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + n_rows - 1), row_bytes);
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_end[seq_id] < 0) {
+                    continue;
+                }
+
+                const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+                verify_h_rows[seq_id] = n_rows;
+
+                if (all_short) {
+                    const float * rows = rows_host.data() + (size_t) i_batch_beg[seq_id] * n_embd;
+                    verify_row0[seq_id] = -1;
+                    verify_h[seq_id].assign(rows, rows + (size_t) n_rows * n_embd);
+                    std::memcpy(pending_h[seq_id].data(), rows + (size_t) (n_rows - 1) * n_embd, row_bytes);
+                    continue;
+                }
+
+                verify_row0[seq_id] = i_batch_beg[seq_id];
+                verify_h[seq_id].clear();
+                if (!llama_get_embeddings_nextn_rows(ctx_tgt, i_batch_end[seq_id], 1, pending_h[seq_id].data())) {
+                    SPC_ERR("%s", "failed to read the last h_nextn row of a sequence\n");
+                    return false;
+                }
+            }
+        } else {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_end[seq_id] < 0) {
+                    continue;
+                }
+
+                const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+                verify_h_rows[seq_id] = n_rows;
+
+                const int32_t n_keep = std::min<int32_t>(n_rows, n_keep_max);
+                verify_h[seq_id].resize((size_t) n_keep * n_embd);
+
+                for (int32_t i = 0; i < n_keep; ++i) {
+                    const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                    std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+                }
+
+                std::memcpy(pending_h[seq_id].data(),
+                        llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + n_rows - 1), row_bytes);
+            }
         }
 
         // the next candidates of a sequence come from its last row in this batch when that row has logits
@@ -2061,6 +2152,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         draft_score_row[seq_id] = i_batch_beg[seq_id] + i_h;
+        if (dev_rows && verify_row0[seq_id] >= 0) {
+            // [TAG_MTP_DEV_ROWS] a longer batch left its rows on the device, process() already fetched the last one
+            if (i_h != n_rows - 1) {
+                llama_get_embeddings_nextn_rows(params.ctx_tgt, verify_row0[seq_id] + i_h, 1, pending_h[seq_id].data());
+            }
+            return;
+        }
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         if ((size_t) (i_h + 1) * n_embd > verify_h[seq_id].size()) {
             // not a row that process() kept (see [TAG_MTP_KV_ONLY] there): pending_h already holds the last row
@@ -2095,6 +2193,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         verify_h[seq_id].clear();
         verify_h_rows[seq_id] = 0;
+        verify_row0[seq_id] = -1;
         i_last[seq_id] = -1;
         if (chain_heads) {
             chain_h[seq_id].clear();

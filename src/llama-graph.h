@@ -164,10 +164,24 @@ public:
 
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
-    ggml_tensor * h      = nullptr; // F32 [n_embd_state, n_batch]
+    ggml_tensor * h      = nullptr; // F32 [n_embd_state, n_batch], the host input or the rows gathered with h_rows
+    ggml_tensor * h_rows = nullptr; // I32 [n_batch], rows of the h_nextn device buffer of ctx_state_src, nullptr on the host path
 
     const int64_t n_embd       = 0;
     const int64_t n_embd_state = 0;
+};
+
+// the batch index of each ubatch row, see llm_graph_context::build_h_nextn_dev()
+class llm_graph_input_batch_idxs : public llm_graph_input_i {
+public:
+    llm_graph_input_batch_idxs() = default;
+    virtual ~llm_graph_input_batch_idxs() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * idxs = nullptr; // I64 [n_batch]
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -831,6 +845,9 @@ struct llm_graph_params {
 
     const llama_hadamard * hdmd = nullptr;
 
+    ggml_tensor * h_nextn_dev   = nullptr; // own h_nextn device buffer (write)
+    ggml_tensor * h_nextn_src   = nullptr; // ctx_state_src's h_nextn device buffer (read)
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -922,6 +939,8 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            h_nextn_dev == other.h_nextn_dev &&
+            h_nextn_src == other.h_nextn_src &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1089,6 +1108,9 @@ struct llm_graph_context {
 
     const llama_hadamard * hdmd;
 
+    ggml_tensor * h_nextn_dev;
+    ggml_tensor * h_nextn_src;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
@@ -1254,6 +1276,11 @@ struct llm_graph_context {
 
     // tok_scale: applied to token rows only
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
+
+    // the state input of an MTP graph: rows of the h_nextn device buffer of ctx_state_src (see llama_set_embd_state_src()),
+    // or uploaded from ubatch.embd_state
+    ggml_tensor * build_inp_embd_state(llm_graph_input_embd_h * inp, int64_t n_embd_state) const;
+
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
@@ -1487,6 +1514,9 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+
+    // write the unmasked h_nextn rows into h_nextn_dev at their batch rows
+    void build_h_nextn_dev() const;
 
     //
     // dense (out)

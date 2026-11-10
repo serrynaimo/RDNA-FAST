@@ -395,6 +395,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM, false);
     }
 
+    // [TAG_MTP_DEV_ROWS] one MTP block after the trunk, as in the Qwen3.8 dense models
+    if (mtp && arch == LLM_ARCH_QWEN35) {
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+    }
+
     // MSA requires one indexer head per GQA (KV) head, unlike the DSA archs where the
     // indexer head count is independent of the main attention head count.
     if (arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_GLM5_NEXT) {
@@ -772,6 +777,161 @@ static int test_qwen4exp_split_ple(const size_t seed, const float stdev) {
             }
         }
         std::printf("PASS MTP target hidden extraction and draft decode on %s\n", ggml_backend_dev_name(dev));
+    }
+    return 0;
+}
+
+// [TAG_MTP_DEV_ROWS] the MTP draft fed from the target's h_nextn device buffer (state rows, upstream #31927) against the
+// host rows: the target rows of a two-ubatch prompt, the catch-up (K/V only, and with outputs) and the next draft step
+// must match. On the CPU device the buffer is host memory and the path runs without events.
+static int test_mtp_dev_rows(const llm_arch arch, const size_t seed, const float stdev) {
+    const bool qwen4 = arch == LLM_ARCH_QWEN4EXP;
+    auto gguf = get_gguf_ctx(arch, qwen4, qwen4, true);
+
+    const uint32_t n_vocab  = 128;
+    const uint32_t n_prompt = 100; // the test contexts run ubatches of 64: two ubatches
+    const auto tokens = get_tokens(n_prompt + 1, n_vocab, seed);
+
+    struct run_result {
+        std::vector<float> h;           // [n_prompt, n_embd] target rows
+        std::vector<float> logits_all;  // [n_prompt, n_vocab] catch-up logits, empty for the K/V-only catch-up
+        std::vector<float> logits_step; // [n_vocab] the draft step after the catch-up
+    };
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+
+        // one model with its MTP block and two contexts on it, as the server runs draft-mtp: the MTP draft context comes
+        // with the model, the target context is a default one
+        auto draft = get_model_and_ctx(gguf.get(), nullptr, seed, stdev, {dev}, LLAMA_SPLIT_MODE_LAYER, false, nullptr, 0, true);
+        llama_context_params tparams = llama_context_default_params();
+        tparams.n_ctx           = 0;
+        tparams.n_threads       = 4;
+        tparams.n_threads_batch = 4;
+        tparams.n_ubatch        = 64;
+        llama_context_ptr target_ctx(llama_init_from_model(draft.first.get(), tparams));
+        if (!target_ctx) {
+            throw std::runtime_error("MTP device rows: failed to create the target context");
+        }
+        llama_context * ctx_tgt = target_ctx.get();
+        llama_context * ctx_dft = draft.second.get();
+        llama_set_embeddings_nextn(ctx_tgt, true, false);
+        llama_set_embeddings_nextn(ctx_dft, true, true);
+
+        const int32_t n_embd  = llama_model_n_embd_out(draft.first.get());
+        const int32_t n_batch = (int32_t) llama_n_batch(ctx_tgt);
+
+        // the pending row of the sequence (the last row of an earlier batch in the server)
+        std::vector<float> pending(n_embd);
+        for (int32_t j = 0; j < n_embd; ++j) {
+            pending[j] = 0.01f * (float) ((j * 37) % 101 - 50);
+        }
+
+        auto run = [&](bool dev_rows, bool outputs) {
+            run_result r;
+            llama_memory_clear(llama_get_memory(ctx_tgt), true);
+            llama_memory_clear(llama_get_memory(ctx_dft), true);
+
+            common_batch bt(ctx_tgt);
+            for (uint32_t p = 0; p < n_prompt; ++p) {
+                bt.add(tokens[p], p, 0, p == n_prompt - 1);
+            }
+            if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, bt.get()) != 0) {
+                throw std::runtime_error("MTP device rows: target decode failed");
+            }
+
+            r.h.resize((size_t) n_prompt * n_embd);
+            if (dev_rows) {
+                if (!llama_get_embeddings_nextn_rows(ctx_tgt, 0, n_prompt, r.h.data()) ||
+                    !llama_set_embeddings_nextn_rows(ctx_tgt, n_batch, 1, pending.data())) {
+                    throw std::runtime_error("MTP device rows: row copy failed");
+                }
+            } else {
+                for (uint32_t p = 0; p < n_prompt; ++p) {
+                    std::memcpy(r.h.data() + (size_t) p * n_embd, llama_get_embeddings_nextn_ith(ctx_tgt, p), n_embd * sizeof(float));
+                }
+            }
+
+            // the catch-up of process(): token k with the target row of position k - 1, the first with the pending row
+            common_batch bd(ctx_dft);
+            for (uint32_t k = 0; k < n_prompt; ++k) {
+                const int32_t idx = bd.add(tokens[k], k, 0, outputs);
+                if (dev_rows) {
+                    bd.set_embd_state_row(idx, k == 0 ? n_batch : (int32_t) k - 1);
+                } else {
+                    const float * row = k == 0 ? pending.data() : r.h.data() + (size_t) (k - 1) * n_embd;
+                    bd.set_embd_state(idx, { row, 1, (size_t) n_embd });
+                }
+            }
+            if (llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, bd.get()) != 0) {
+                throw std::runtime_error("MTP device rows: catch-up decode failed");
+            }
+            if (outputs) {
+                for (uint32_t k = 0; k < n_prompt; ++k) {
+                    const float * logits = llama_get_logits_ith(ctx_dft, k);
+                    r.logits_all.insert(r.logits_all.end(), logits, logits + n_vocab);
+                }
+            }
+
+            // the first draft step of draft(): the next token with the last target row, a host state as in the server
+            common_batch bs(ctx_dft);
+            const int32_t idx = bs.add(tokens[n_prompt], n_prompt, 0, true);
+            bs.set_embd_state(idx, { r.h.data() + (size_t) (n_prompt - 1) * n_embd, 1, (size_t) n_embd });
+            if (llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, bs.get()) != 0) {
+                throw std::runtime_error("MTP device rows: draft step failed");
+            }
+            const float * logits = llama_get_logits_ith(ctx_dft, 0);
+            r.logits_step.assign(logits, logits + n_vocab);
+            return r;
+        };
+
+        const run_result host_kv  = run(false, false);
+        const run_result host_out = run(false, true);
+
+        if (!llama_set_embeddings_nextn_dev(ctx_tgt, true) || !llama_set_embd_state_src(ctx_dft, ctx_tgt)) {
+            llama_set_embd_state_src(ctx_dft, nullptr);
+            llama_set_embeddings_nextn_dev(ctx_tgt, false);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                std::fprintf(stderr, "FAIL MTP device rows (%s) on %s: the device buffer is not available\n", llm_arch_name(arch), ggml_backend_dev_name(dev));
+                return 1;
+            }
+            std::printf("SKIP MTP device rows (%s) on %s: the device buffer is not available\n", llm_arch_name(arch), ggml_backend_dev_name(dev));
+            continue;
+        }
+        const run_result dev_kv  = run(true, false);
+        const run_result dev_out = run(true, true);
+
+        llama_set_embd_state_src(ctx_dft, nullptr);
+        llama_set_embeddings_nextn_dev(ctx_tgt, false);
+        const run_result host_again = run(false, true);
+
+        const struct { const char * what; const std::vector<float> & a; const std::vector<float> & b; } checks[] = {
+            { "target rows",                              host_kv.h,            dev_kv.h               },
+            { "draft step after a K/V-only catch-up",     host_kv.logits_step,  dev_kv.logits_step     },
+            { "catch-up logits",                          host_out.logits_all,  dev_out.logits_all     },
+            { "draft step after a catch-up with outputs", host_out.logits_step, dev_out.logits_step    },
+            { "host rows after turning it off",           host_out.logits_step, host_again.logits_step },
+        };
+        for (const auto & c : checks) {
+            if (c.a.empty() || c.a.size() != c.b.size()) {
+                std::fprintf(stderr, "FAIL MTP device rows (%s) on %s: %s: size %zu vs %zu\n", llm_arch_name(arch), ggml_backend_dev_name(dev), c.what, c.a.size(), c.b.size());
+                return 1;
+            }
+            bool finite = true;
+            for (float v : c.a) {
+                finite = finite && std::isfinite(v);
+            }
+            const double error = nmse(c.a, c.b);
+            if (!finite || !(error <= 1e-12)) {
+                std::fprintf(stderr, "FAIL MTP device rows (%s) on %s: %s: NMSE=%g, finite=%d\n", llm_arch_name(arch), ggml_backend_dev_name(dev), c.what, error, finite);
+                return 1;
+            }
+        }
+        std::printf("PASS MTP device rows (%s) on %s: target rows, K/V-only and full catch-up, draft step match the host rows\n",
+                llm_arch_name(arch), ggml_backend_dev_name(dev));
     }
     return 0;
 }
@@ -1440,9 +1600,15 @@ int main(int argc, char ** argv) {
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
         }
-        const int result = test_backends(arch_filter, seed, stdev, verbosity, target_backend);
+        int result = test_backends(arch_filter, seed, stdev, verbosity, target_backend);
         if (result == 0 && !arch_filter.empty() && arch_matches(arch_filter, LLM_ARCH_QWEN4EXP)) {
-            return test_qwen4exp_split_ple(seed, stdev);
+            result = test_qwen4exp_split_ple(seed, stdev);
+        }
+        // [TAG_MTP_DEV_ROWS]
+        for (const llm_arch arch : { LLM_ARCH_QWEN35, LLM_ARCH_QWEN4EXP }) {
+            if (result == 0 && !arch_filter.empty() && arch_matches(arch_filter, arch)) {
+                result = test_mtp_dev_rows(arch, seed, stdev);
+            }
         }
         return result;
     } catch (const std::exception & err) {
