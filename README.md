@@ -83,10 +83,10 @@ grows from 4k to 41k tokens, a 10k-token worker is called twice in between):
 
 <sub>October and November 2026. Both run Swift 1.5 IQ4_XS at `-c 98304` with MTP drafting,
 flash attention, a q4_0 KV cache and two sessions, the best run for each value
-(LM Studio: best of two runs, this runtime: best of seven runs, all on ROCm 10.1). LM Studio is its
+(LM Studio: best of two runs, this runtime: best of nine runs, all on ROCm 10.1). LM Studio is its
 ROCm llama.cpp runtime 2.69.0 with batch 2048 / 1024; this runtime runs the quick
 start below on ROCm 10.1.
-The edit row is the text copy boost, n-gram drafting, the best of the twenty-one edits in those runs;
+The edit row is the text copy boost, n-gram drafting, the best of the twenty-four edits in those runs;
 LM Studio cannot run it, as its API does not switch Swift 1.5's thinking
 off.</sub>
 
@@ -96,13 +96,13 @@ The same session with each quant we tested:
 |---|---:|---:|---:|---:|---:|---:|
 | [Q4_K_M](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf)\* | 17.4 GB | 146.8 s | 1,211 s (spill) | 408 / 548 / 431 | 50.6 / 50.8 / 48.2 | 238 |
 | [Q4_K_S](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-Q4_K_S.gguf) | 16.4 GB | 112.6 s | 1,139 s (spill) | 889 / 769 / 616 | 49.2 / 51.7 / 48.8 | 247 |
-| [IQ4_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf) | 15.5 GB | 92.6 s | 130.1 s | 1,035 / 916 / 710 | 70.1 / 66.7 / 65.3 | 315 |
+| [IQ4_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf) | 15.5 GB | 92.5 s | 130.1 s | 1,035 / 916 / 710 | 70.1 / 66.7 / 65.3 | 315 |
 
 <sub>\* At 64k (`-c 65536`) and `-ub 512`: the smaller context and prompt
 batches keep Q4_K_M's spill into system RAM down while staying above Hermes'
 64,000-token minimum. The other quants ran at 96k with `-ub 1024`, IQ4_XS at
 `-ub 2048` since. Prefill and decode are this runtime's, in the session above;
-the better of two runs (IQ4_XS: best of seven runs, Q4_K_M: one). LM Studio's Q4_K_S and Q4_K_M (runtime 2.64.0) sit at the edge of
+the better of two runs (IQ4_XS: best of nine runs, Q4_K_M: one). LM Studio's Q4_K_S and Q4_K_M (runtime 2.64.0) sit at the edge of
 the card's memory and read every prompt again in full.</sub>
 
 **On AMD cards, prefer IQ quants.** When VRAM is the limit, the IQ quants
