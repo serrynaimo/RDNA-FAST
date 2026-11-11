@@ -1,7 +1,22 @@
 <svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <path d="M244.95 8C215.233 8 187.774 23.8591 172.923 49.5999L95.6009 183.625C60.2162 244.959 104.481 321.6 175.29 321.6H208L316.977 132.708C348.959 77.2719 308.95 8 244.95 8ZM208 321.6H351.947C415.982 321.6 456.013 390.91 424.013 446.377C409.155 472.132 381.681 488 351.947 488H271.29C200.481 488 156.216 411.359 191.601 350.026L208 321.6Z" fill="currentColor"/>
-    <path d="M208 321.6H16L106.462 164.8L208 321.6Z" fill="currentColor"/>
-    <path d="M388.923 8L208 321.6L253.6 8H388.923Z" fill="currentColor"/>
-    <path d="M304 488H112L202.462 331.2L304 488Z" fill="currentColor"/>
-    <path d="M496 321.6H208L419.399 454.4L496 321.6Z" fill="currentColor"/>
+    <!-- RDNA-FAST app icon: dark tile, the brand line along its top, the RF mark (src/lib/components/app/rdna/RdnaMark.svelte) -->
+    <defs>
+        <linearGradient id="rf-tile" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#1c1c20"/><stop offset="1" stop-color="#09090b"/></linearGradient>
+        <linearGradient id="rf-line" x1="0" x2="1" y1="0" y2="0"><stop offset="0" stop-color="#ed1c24"/><stop offset="1" stop-color="#ff6a3d"/></linearGradient>
+        <linearGradient id="rf-silver" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#ffffff"/><stop offset="0.45" stop-color="#e4e6ea"/><stop offset="0.55" stop-color="#a7acb4"/><stop offset="1" stop-color="#dadde2"/></linearGradient>
+        <linearGradient id="rf-red" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#ff4a3d"/><stop offset="0.55" stop-color="#ed1c24"/><stop offset="1" stop-color="#b8121a"/></linearGradient>
+    </defs>
+    <rect width="512" height="512" rx="112" fill="url(#rf-tile)"/>
+    <rect x="2" y="2" width="508" height="508" rx="110" stroke="#2a2a2e" stroke-width="4"/>
+    <path d="M112 0H400A112 112 0 0 1 454.2 14H57.8A112 112 0 0 1 112 0Z" fill="url(#rf-line)"/>
+    <svg x="56" y="56" width="400" height="400" viewBox="-128.2 -958.7 1313.3 1313.3">
+        <g stroke-linejoin="round" stroke-width="62">
+            <path d="M387 -700Q483 -700 547 -680Q611 -660 639 -612.5Q667 -565 656 -482Q651 -443 635.5 -409.5Q620 -376 588 -354Q556 -332 500 -326L499 -319Q516 -317 535.5 -306.5Q555 -296 570.5 -273Q586 -250 590 -208L616 0H392L374 -209Q373 -238 365 -245Q357 -252 334 -252Q257 -253 209 -253Q161 -253 128.5 -254Q96 -255 65 -257L81 -405H355Q385 -405 401.5 -411Q418 -417 426.5 -434.5Q435 -452 440 -484Q444 -508 440 -522Q436 -536 423 -541.5Q410 -547 385 -547Q278 -547 206.5 -545.5Q135 -544 110 -541L108 -690Q153 -695 192.5 -697Q232 -699 278 -699.5Q324 -700 387 -700ZM320 -690 223 0H11L108 -690Z" stroke="#6b7079"/>
+            <path d="M387 -700Q483 -700 547 -680Q611 -660 639 -612.5Q667 -565 656 -482Q651 -443 635.5 -409.5Q620 -376 588 -354Q556 -332 500 -326L499 -319Q516 -317 535.5 -306.5Q555 -296 570.5 -273Q586 -250 590 -208L616 0H392L374 -209Q373 -238 365 -245Q357 -252 334 -252Q257 -253 209 -253Q161 -253 128.5 -254Q96 -255 65 -257L81 -405H355Q385 -405 401.5 -411Q418 -417 426.5 -434.5Q435 -452 440 -484Q444 -508 440 -522Q436 -536 423 -541.5Q410 -547 385 -547Q278 -547 206.5 -545.5Q135 -544 110 -541L108 -690Q153 -695 192.5 -697Q232 -699 278 -699.5Q324 -700 387 -700ZM320 -690 223 0H11L108 -690Z" fill="url(#rf-silver)"/>
+            <g transform="translate(514 140)">
+                <path d="M261 -694Q350 -694 442 -692Q534 -690 603 -679L579 -528H349Q322 -528 310 -519.5Q298 -511 295 -488L227 0H9L85 -541Q95 -612 143 -653Q191 -694 261 -694ZM85 -411H525L507 -267H64Z" stroke="#7a0a10"/>
+                <path d="M261 -694Q350 -694 442 -692Q534 -690 603 -679L579 -528H349Q322 -528 310 -519.5Q298 -511 295 -488L227 0H9L85 -541Q95 -612 143 -653Q191 -694 261 -694ZM85 -411H525L507 -267H64Z" fill="url(#rf-red)"/>
+            </g>
+        </g>
+    </svg>
 </svg>
