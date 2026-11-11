@@ -1,4 +1,4 @@
-import { SIDEBAR_FOOTER_ITEMS } from '$lib/constants/ui.constants';
+import { SIDEBAR_ACTIONS_ITEMS, SIDEBAR_FOOTER_ITEMS } from '$lib/constants/ui.constants';
 import { BENCH_PRIORITY, heldText, othersOnModel } from '$lib/rdna/bench/runner.svelte';
 import { CARD_EMPTY_LINE, cardFigures, cardFooter, cardSource } from '$lib/rdna/card';
 import { depthBuckets } from '$lib/rdna/depth';
@@ -535,12 +535,11 @@ describe('bench at priority xhigh', () => {
 });
 
 describe('sidebar', () => {
-	it('lists the Status page before Settings, in the footer (upstream #32022)', () => {
-		const tips = SIDEBAR_FOOTER_ITEMS.map((i) => i.tooltip);
-		const status = SIDEBAR_FOOTER_ITEMS.find((i) => i.tooltip === 'Status');
+	// the server status card is the footer group's last item and links to the status page itself
+	it('has no Status menu item: the status card, last in the footer group, opens the page', () => {
+		const tips = [...SIDEBAR_ACTIONS_ITEMS, ...SIDEBAR_FOOTER_ITEMS].map((i) => i.tooltip);
 
-		expect(tips.indexOf('Status')).toBe(tips.indexOf('Settings') - 1);
-		expect(status?.route).toBe('#/status');
-		expect(status?.activeRouteId).toBe('/status');
+		expect(tips).not.toContain('Status');
+		expect(SIDEBAR_FOOTER_ITEMS.map((i) => i.tooltip)).toEqual(['Models', 'MCP', 'Settings']);
 	});
 });

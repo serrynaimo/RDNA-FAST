@@ -9,7 +9,6 @@ import { MCP_SERVERS_ROUTE_ID, MODELS_ROUTE_ID, SETTINGS_ROUTE_ID } from './rout
 import { Search, Settings, SquarePen } from '@lucide/svelte';
 import McpLogo from '$lib/components/app/mcp/McpLogo.svelte';
 import { SidebarAction, ToolSource } from '$lib/enums';
-import { RDNA_SIDEBAR_STATUS_ITEM } from '$lib/rdna/sidebar';
 import type { DesktopIconStripItem } from '$lib/types';
 
 /** Delay before a copied affordance resets from its check to the copy icon. */
@@ -184,8 +183,6 @@ export const SIDEBAR_FOOTER_ITEMS: DesktopIconStripItem[] = [
 		icon: McpLogo,
 		tooltip: 'MCP'
 	},
-	// RDNA-FAST: the live status page
-	RDNA_SIDEBAR_STATUS_ITEM,
 	{
 		action: SidebarAction.SETTINGS,
 		activeRouteId: SETTINGS_ROUTE_ID,

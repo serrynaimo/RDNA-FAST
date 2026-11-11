@@ -13,7 +13,7 @@
 	import { deviceStore } from '$lib/stores';
 	import type { DesktopIconStripItem } from '$lib/types';
 	import { hapticTap } from '$lib/utils';
-	import type { Component } from 'svelte';
+	import type { Component, Snippet } from 'svelte';
 	import { onMount } from 'svelte';
 	import { circIn } from 'svelte/easing';
 	import { fade } from 'svelte/transition';
@@ -25,9 +25,17 @@
 		onAction?: (action: SidebarAction) => void;
 		/** Follows a route item, so a phone can open its page behind the sidebar and then close it. */
 		onNavigate?: (go: () => Promise<unknown>) => void;
+		/** [RDNA-FAST] after the items, inside the group (the footer's server status card) */
+		children?: Snippet;
 	}
 
-	let { class: className, items = SIDEBAR_ACTIONS_ITEMS, onAction, onNavigate }: Props = $props();
+	let {
+		children,
+		class: className,
+		items = SIDEBAR_ACTIONS_ITEMS,
+		onAction,
+		onNavigate
+	}: Props = $props();
 
 	// the models manager stays desktop-only: a phone picks its models in the selector; a phone
 	// reaches search from the round key at the top of the sidebar instead
@@ -137,4 +145,6 @@
 			</div>
 		{/if}
 	{/each}
+
+	{@render children?.()}
 </div>
