@@ -18,8 +18,8 @@ formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
   instead of 130 s. [Numbers](#speed)
 
 - **Fast Multi-token prediction.** The model's own MTP head drafts tokens
-  ahead: up to 61 t/s on prose and 96 t/s on code. When an answer repeats text
-  from the prompt, as code edits do, n-gram drafting copies it at up to 315 t/s.
+  ahead. When an answer repeats text from the prompt, as code edits do, n-gram
+  drafting copies it up to 5x faster.
   DFlash2 and DSpine drafters are supported too. [More](#other-cards)
 
 - **Prompts on the matrix cores.** Prompt processing runs on RDNA3's WMMA units
@@ -38,7 +38,7 @@ formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
   computes the rest beside the GPU. [More](docs/expert-handoff.md)
 
 - **Switching conversations costs seconds, not minutes.** Conversations are
-  saved to SSD and restored when they come back, in about 3 s instead of a
+  saved to SSD and restored when they come back, in seconds instead of a
   minute or more of re-reading, even after a restart. New conversations pick up
   from the system prompt and tools they share with earlier ones.
   [More](#the-ssd-prompt-cache)
@@ -46,8 +46,6 @@ formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
 - **Several agents on one GPU.** Two conversations share one memory pool, so a
   second agent runs beside the first, and an idle one costs nothing.
   [More](#several-slots-on-one-gpu)
-
-- **Vision** for screenshots and photos.
 
 - **A decision classifier on the same port**: yes/no, choice and score answers
   with calibrated probabilities, from a small model on the CPU.
