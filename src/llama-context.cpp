@@ -244,8 +244,10 @@ llama_context::llama_context(
         // -ub 1024 and -c 106496 for a graph that never runs. Reserve the two real shapes. A ubatch with outputs
         // that is larger than a draft step still runs (the scheduler grows the buffer to fit it) and is logged once.
         // Chained heads (more than one MTP block) draft several rows per sequence and keep the stock reserve.
-        // ROCMFPX_MTP_LEAN_RESERVE=0 restores the stock reserve.
-        if (model.arch == LLM_ARCH_QWEN35 && hparams.n_layer_nextn == 1 && hparams.router_layer < 0) {
+        // ROCMFPX_MTP_LEAN_RESERVE=0 restores the stock reserve. Qwen3.8-Flash-Next (qwen4exp) too: its catch-up of
+        // more than 8 rows is K/V-only, a verification's few rows run the full block (small, grown on demand).
+        if ((model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN4EXP) && hparams.n_layer_nextn == 1 &&
+                hparams.router_layer < 0) {
             const char * env = getenv("ROCMFPX_MTP_LEAN_RESERVE");
             mtp_lean_reserve = !(env && atoi(env) == 0);
             if (mtp_lean_reserve) {

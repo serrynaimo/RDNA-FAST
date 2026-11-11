@@ -854,7 +854,6 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res->add_input(std::move(inp));
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     // the MTP context is a hybrid-idx memory, so the draft head can use the same sparse
     // attention path as the trunk (this is what Halogen does: one sparse attention call per target chunk)
@@ -944,6 +943,23 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(Qcur, "mtp_Qcur", il);
     cb(Kcur, "mtp_Kcur", il);
+
+    // [TAG_MTP_KV_ONLY] as in qwen35: a ubatch without output rows is the catch-up over prompt rows. Nothing reads the
+    // block's output for them; later draft steps attend to their K and V and score their indexer keys. So store K, V
+    // and the indexer keys, and leave out Q, the attention over the history (sparse: scoring every block), the output
+    // projection and the FFN. The catch-up of a verification (a few rows) keeps the full block: its sparse path also
+    // brings the pooled-key cache up to date, which the next draft steps read; after a catch-up without it the next
+    // draft step pools every block once.
+    if (n_outputs == 0 && n_tokens > 8) {
+        if (mctx_hyb && hparams.dsv4_compress_ratios[il] > 0) {
+            build_qsa_store_k(mctx_hyb, cur, il);
+        }
+        build_attn_kv_store(inp_attn, Kcur, Vcur, il);
+        return;
+    }
+
+    // [TAG_MTP_KV_ONLY] created here, not at the top: an input the graph does not use is never allocated
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
