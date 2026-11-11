@@ -406,8 +406,7 @@ Hooks are the thin view-layer between components and stores: they own UI concern
 | `use-chat-message-edit-context` | Message edit context (content + extras)                                                         |
 | `use-chat-screen-drag-and-drop` | Drag-and-drop state machine                                                                     |
 | `use-chat-screen-file-upload`   | File upload queue + capability validation                                                       |
-| `use-chat-screen-scroll`        | Scroll container binding + navigation guard                                                     |
-| `use-auto-scroll`               | Auto-scroll controller for streaming                                                            |
+| `use-stick-to-bottom`           | Follows new content while the reader sits at the bottom of a scroller                           |
 | `use-marquee-selection`         | Shift+click / marquee range selection                                                           |
 | `use-keyboard-shortcuts`        | Global keyboard shortcuts                                                                       |
 | `use-settings-navigation`       | Settings section navigation                                                                     |
@@ -684,6 +683,19 @@ llama-server serves the UI with `Cross-Origin-Embedder-Policy: require-corp` and
 - **Hub metadata** is fetched with `fetch()`, which is a CORS request by default, and only while the Hub setting is on
 - **MCP server icons and web-search result favicons** have no CORS guarantee, so they go through the server's `/cors-proxy` when the user started llama-server with `--ui-mcp-proxy`; without it they fall back to the bundled glyph
 - **Per-row Hub lookups** wait until the row is near the viewport (the `nearViewport` action), so a long model list does not fire one request per row on mount
+
+### 10. Nested Surfaces
+
+The sidebar stacks four surfaces, outermost first:
+
+| Layer | Example                            | Corners                            |
+| ----- | ---------------------------------- | ---------------------------------- |
+| Page  | the body background                | none                               |
+| Panel | the sidebar                        | `rounded-2xl`                      |
+| Group | the sidebar's footer, inset in it  | `rounded-(--surface-group-radius)` |
+| Row   | Models, MCP or Settings in a group | `rounded-(--surface-row-radius)`   |
+
+A row keeps its corners concentric with its group's: its radius is the group's less the padding between their edges, so the curves run parallel instead of pinching at the corners. `app.css` holds the three tokens (`--surface-group-radius`, `--surface-group-padding` and the derived `--surface-row-radius`); change the group's radius or padding there and the rows follow. A group pads its rows with `p-(--surface-group-padding)`. `SidebarNavigationActions` rounds every row from the token, so the actions at the top of the sidebar (New chat, Search) match the footer's rows; a phone sizes its rows for a thumb instead. A selected row is raised and edged (`bg-background`, `shadow-sm`, `ring-1`), where a hovered one is only tinted, so the two never look alike. The group's hairline border is left out of the sum. `tests/client/nested-surfaces.svelte.test.ts` checks the rule on the rendered footer.
 
 ---
 

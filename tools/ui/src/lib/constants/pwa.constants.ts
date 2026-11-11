@@ -6,6 +6,7 @@
 import { APP_NAME } from './app.constants';
 
 export const MEDIA_QUERIES = {
+	COARSE_POINTER: '(pointer: coarse)',
 	DISPLAY_MODE_STANDALONE: '(display-mode: standalone)',
 	PREFERS_DARK: '(prefers-color-scheme: dark)',
 	PREFERS_LIGHT: '(prefers-color-scheme: light)'
@@ -18,6 +19,8 @@ export const THEME_COLORS = {
 	BACKGROUND_LIGHT: 'white',
 	DARK: '#0d0d0d',
 	LIGHT: '#ffffff',
+	// RDNA-FAST: the app icon tile's ground (src/lib/assets/logo.svg), behind the Apple touch and maskable icons
+	RDNA_ICON_TILE: '#09090b',
 	TITLE_UPDATE_ALERT: {
 		BG_DARK: 'zinc-800',
 		BG_LIGHT: 'white',

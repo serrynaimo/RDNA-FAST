@@ -12,10 +12,12 @@ import {
 	FAVORITE_MODELS_LOCALSTORAGE_KEY,
 	HIDDEN_MODELS_LOCALSTORAGE_KEY,
 	MODEL_GROUP_OPEN_LOCALSTORAGE_KEY,
+	MODEL_REMOVE_BLOCKED_FALLBACK,
+	MODEL_REMOVE_BLOCKED_REASONS,
 	RECENT_MODEL_LIMIT,
 	RECENT_MODELS_LOCALSTORAGE_KEY
 } from '$lib/constants';
-import { ServerModelStatus } from '$lib/enums';
+import { ReasoningEffort, ServerModelSource, ServerModelStatus } from '$lib/enums';
 import { HuggingFaceService } from '$lib/services/huggingface.service';
 import { ModelsService } from '$lib/services/models.service';
 // direct imports between stores, not via the barrel, to avoid circular deps
@@ -23,6 +25,7 @@ import { conversationsStore } from '$lib/stores/conversations/index.svelte';
 import { type ModelPropsHost, ModelPropsManager } from '$lib/stores/models/props.svelte';
 import { type ModelStatusHost, ModelStatusManager } from '$lib/stores/models/status.svelte';
 import { serverStore } from '$lib/stores/server.svelte';
+import type { ApiModelDataEntry } from '$lib/types';
 import type { ParsedModelId } from '$lib/types/models';
 import { getConversationModel } from '$lib/utils/conversation-utils';
 import { repoOf } from '$lib/utils/model-names';
@@ -425,6 +428,23 @@ class ModelsStore implements ModelPropsHost, ModelStatusHost {
 	}
 
 	/**
+	 * Why the router would refuse to delete a model from disk, or null when it can.
+	 * Only a model from the HF cache is removable; a server that does not report
+	 * `can_remove` is let through and answers for itself.
+	 */
+	removeBlockedReason(modelId: string): string | null {
+		const model = this.routerModels.find((m) => m.id === modelId);
+
+		if (!model || model.can_remove !== false) return null;
+
+		if (model.source && model.source !== ServerModelSource.CACHE) {
+			return MODEL_REMOVE_BLOCKED_REASONS[model.source];
+		}
+
+		return MODEL_REMOVE_BLOCKED_FALLBACK;
+	}
+
+	/**
 	 * Select a model. `recordRecent` keeps automatic picks out of the recency list.
 	 */
 	async selectModelById(modelId: string, options?: { recordRecent?: boolean }): Promise<void> {
@@ -448,6 +468,13 @@ class ModelsStore implements ModelPropsHost, ModelStatusHost {
 			this.selectedModelName = option.model;
 
 			if (options?.recordRecent) this.recordRecentModel(modelId);
+
+			// reasoning levels belong to the model that answered: another model in the chat starts at Default
+			const conversationModel = getConversationModel(conversationsStore.activeMessages);
+
+			if (conversationModel && conversationModel !== option.model) {
+				void conversationsStore.preferences.setReasoningEffort(ReasoningEffort.DEFAULT);
+			}
 		} finally {
 			this.updating = false;
 		}

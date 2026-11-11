@@ -1,4 +1,4 @@
-import { SIDEBAR_ACTIONS_ITEMS } from '$lib/constants/ui.constants';
+import { SIDEBAR_FOOTER_ITEMS } from '$lib/constants/ui.constants';
 import { BENCH_PRIORITY, heldText, othersOnModel } from '$lib/rdna/bench/runner.svelte';
 import { CARD_EMPTY_LINE, cardFigures, cardFooter, cardSource } from '$lib/rdna/card';
 import { depthBuckets } from '$lib/rdna/depth';
@@ -535,9 +535,9 @@ describe('bench at priority xhigh', () => {
 });
 
 describe('sidebar', () => {
-	it('lists the Status page before Settings', () => {
-		const tips = SIDEBAR_ACTIONS_ITEMS.map((i) => i.tooltip);
-		const status = SIDEBAR_ACTIONS_ITEMS.find((i) => i.tooltip === 'Status');
+	it('lists the Status page before Settings, in the footer (upstream #32022)', () => {
+		const tips = SIDEBAR_FOOTER_ITEMS.map((i) => i.tooltip);
+		const status = SIDEBAR_FOOTER_ITEMS.find((i) => i.tooltip === 'Status');
 
 		expect(tips.indexOf('Status')).toBe(tips.indexOf('Settings') - 1);
 		expect(status?.route).toBe('#/status');

@@ -26,6 +26,24 @@ export default defineConfig({
 	preset: combinePresetAndAppleSplashScreens(
 		{
 			...minimal2023Preset,
+			// RDNA-FAST: the source is already a full tile (src/lib/assets/logo.svg): iOS gets it edge to edge and
+			// Android's maskable icon keeps its safe zone, both on the tile's own dark ground instead of white
+			apple: {
+				...minimal2023Preset.apple,
+				padding: 0,
+				resizeOptions: {
+					background: THEME_COLORS.RDNA_ICON_TILE,
+					fit: PWA_ASSET_GENERATOR.FIT_MODE
+				}
+			},
+			maskable: {
+				...minimal2023Preset.maskable,
+				padding: 0.1,
+				resizeOptions: {
+					background: THEME_COLORS.RDNA_ICON_TILE,
+					fit: PWA_ASSET_GENERATOR.FIT_MODE
+				}
+			},
 			// tiny margin so favicon.ico / pwa-*.png breathe inside the canvas
 			transparent: {
 				...minimal2023Preset.transparent,
