@@ -40,6 +40,7 @@ Beyond the ones in the quick start:
 | `--models-default NAME` | none | router mode: the model that serves requests without a known `"model"` | clients that send no model name, or another server's |
 | `--models-api-loopback-only` | off | router mode: loading and unloading models is accepted only from this machine; other addresses get 403 | a router port reachable from a LAN or the internet |
 | `--spec-mtp-strict-qwen` | off | MTP verification that keeps greedy output exact at draft boundaries (from the ROCmFPX project) | reproducible temperature-0 runs with MTP on Qwen3.5/3.8 and Qwen3.8-Flash-Next, one slot only |
+| `-ctk f8_e4m3 -ctv f8_e4m3` | f16 | an 8-bit float KV cache (OCP FP8 E4M3, one byte per value) on the GPU; a model that ships FP8 KV scales has them applied | f16's quality at half its size: Swift 27B, chief26 KLD 0.0570 (f16 0.0574, q8_0 0.0577, q4_0 0.0620). On an RX 7900 XT (no FP8 hardware) decode is ~1% behind a q8_0 cache at 16-32k, prompts level |
 | `--cache-disk-min-tokens`, `--cache-disk-prefix-step` | 2048, 4096 | see [The SSD prompt cache](../README.md#the-ssd-prompt-cache) | |
 
 ## Block drafters

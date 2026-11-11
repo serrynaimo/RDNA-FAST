@@ -6757,6 +6757,7 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    F8_E4M3 = 43
 
     # Stable ROCmFPX GGUF tensor type IDs (mirrors ggml_type in ggml.h).
     Q4_0_ROCMFP4      = 100
@@ -6827,6 +6828,7 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
+    MOSTLY_F8_E4M3       = 42  # except 1d tensors
 
     # Stable ROCmFPX GGUF file type IDs (mirrors llama_ftype in llama.h).
     MOSTLY_Q4_0_ROCMFP4          = 100
@@ -7026,6 +7028,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.F8_E4M3: (1, 1),
     GGMLQuantizationType.Q4_0_ROCMFP4:      (32, 2 + 16),
     GGMLQuantizationType.Q4_0_ROCMFP4_FAST: (32, 1 + 16),
     GGMLQuantizationType.Q6_0_ROCMFPX:      (32, 24 + 2),

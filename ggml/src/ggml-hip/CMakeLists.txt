@@ -84,7 +84,8 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS}
     ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo3_0.cu
     ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo4_0.cu
     ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-q8_0.cu
-    ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-q8_0.cu)
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-q8_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-f8_e4m3.cu)
 
 ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}

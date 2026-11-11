@@ -129,12 +129,13 @@ static __global__ void flash_attn_ext_vec(
 #ifdef GGML_USE_HIP
     // Turbo K is consumed in its FWHT domain by a float/half dot helper. Q is
     // transformed before VEC dispatch, so retain the fp-like Q register path.
-    constexpr bool K_is_fp_like = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 ||
+    // [TAG_FP8_KV] FP8 E4M3 is read like f16 (vec_dot_fattn_vec_KQ_f8_e4m3), with Q in the f16 registers
+    constexpr bool K_is_fp_like = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 || type_K == GGML_TYPE_F8_E4M3 ||
                                    type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0);
 #else
-    constexpr bool K_is_fp_like = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16);
+    constexpr bool K_is_fp_like = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 || type_K == GGML_TYPE_F8_E4M3);
 #endif
-    constexpr bool V_is_fp_like = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16);
+    constexpr bool V_is_fp_like = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16 || type_V == GGML_TYPE_F8_E4M3);
 
     constexpr int nthreads_KQ = K_is_fp_like ? 128 / cpy_nb : nthreads_KQ_q;
     constexpr int nthreads_V  = V_is_fp_like ? 128 / cpy_nb : nthreads_V_q;
@@ -142,7 +143,7 @@ static __global__ void flash_attn_ext_vec(
     static_assert(WARP_SIZE % nthreads_KQ == 0, "bad nthreads_K");
     static_assert(WARP_SIZE % nthreads_V  == 0, "bad nthreads_V");
 
-    constexpr int V_rows_per_thread = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 2*cpy_ne : V_rows_per_thread_q;
+    constexpr int V_rows_per_thread = V_is_fp_like ? 2*cpy_ne : V_rows_per_thread_q;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
     // ROCmFPX [TAG_FATTN_VEC_Q5V_UNROLL]: with a q5_0 / q5_1 V cache, clang 24 (ROCm 10.1) fully unrolls the V loop below
     // (one iteration per KV row of the warp, 32 at head 128 / 256), hoists every row's V loads and spills: head 256 with
@@ -687,6 +688,17 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
+
+// [TAG_FP8_KV] FP8 E4M3 caches: both, or one of K / V with the other f16 (fattn-vec-instance-f8_e4m3.cu)
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3);
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F8_E4M3, GGML_TYPE_F16);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_F8_E4M3, GGML_TYPE_F16);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_F8_E4M3, GGML_TYPE_F16);
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F16, GGML_TYPE_F8_E4M3);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_F16, GGML_TYPE_F8_E4M3);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16, GGML_TYPE_F8_E4M3);
 
 extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q4_0_ROCMFP4,      GGML_TYPE_Q4_0_ROCMFP4);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q4_0_ROCMFP4,      GGML_TYPE_Q4_0_ROCMFP4);
