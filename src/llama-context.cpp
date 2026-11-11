@@ -483,6 +483,16 @@ llama_context::llama_context(
                 __func__, cparams.n_ctx_seq, hparams.n_ctx_train);
     }
 
+    {
+        const int64_t max_nodes = graph_max_nodes();
+
+        gf_res_reserve = std::make_unique<llm_graph_result>(max_nodes);
+        // [TAG_GRAPH_ARENAS] the general arenas (with and without outputs); the ones per small batch size are created
+        // on first use (get_gf_res_prev), each holds a full graph's metadata
+        gf_res_prev[0] = std::make_unique<llm_graph_result>(max_nodes);
+        gf_res_prev[1] = std::make_unique<llm_graph_result>(max_nodes);
+    }
+
     if (!hparams.vocab_only) {
         // GPU backends
         for (const auto & dev : model.devices) {
@@ -914,11 +924,16 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
-    for (auto & res : gf_res_prev) {
-        res.reset();
-    }
-    gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
+
+    gf_res_reserve->set_max_nodes(max_nodes);
+    gf_res_reserve->reset();
+    for (auto & res : gf_res_prev) {
+        if (res) {
+            res->set_max_nodes(max_nodes);
+            res->reset();
+        }
+    }
 
     sched_new({
         /*.max_nodes  =*/ max_nodes,
