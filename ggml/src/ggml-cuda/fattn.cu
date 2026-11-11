@@ -530,6 +530,11 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_CUSTOM_ALL_D(GGML_TYPE_Q6_0_ROCMFPX,      GGML_TYPE_Q6_0_ROCMFPX)
     FATTN_VEC_CASES_CUSTOM_ALL_D(GGML_TYPE_Q8_0_ROCMFPX,      GGML_TYPE_Q8_0_ROCMFPX)
 
+    // [TAG_FP8_KV] fattn-vec-instance-f8_e4m3.cu
+    FATTN_VEC_CASES_CUSTOM_ALL_D(GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3)
+    FATTN_VEC_CASES_CUSTOM_ALL_D(GGML_TYPE_F8_E4M3, GGML_TYPE_F16)
+    FATTN_VEC_CASES_CUSTOM_ALL_D(GGML_TYPE_F16,     GGML_TYPE_F8_E4M3)
+
     FATTN_VEC_CASES_CUSTOM_TURBO(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_CUSTOM_TURBO(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
     FATTN_VEC_CASES_CUSTOM_TURBO(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0)
@@ -692,6 +697,9 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
+            return true;
+        // ROCmFPX [TAG_FP8_KV] FP8 E4M3 caches: vector kernels for F8/F8, F8/F16 and F16/F8, f16 copies elsewhere
+        case GGML_TYPE_F8_E4M3:
             return true;
         // ROCmFPX [TAG_FATTN_ROCMFP_KV] the ROCmFP KV caches have vector kernels for same-type K/V pairs (the
         // ROCmFP branch of ggml_cuda_get_best_fattn_kernel picks them). This list came from upstream (#24403) in the
@@ -859,7 +867,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
 
-    if ((ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) && can_use_vector_kernel && Q->ne[1] <= 8) {
+    // [TAG_FP8_KV] an FP8 cache decodes like a quantized one: the vector kernel reads its bytes, where the f16 kernels
+    // would first copy the whole cache to f16 for each step
+    const bool kv_f8 = K->type == GGML_TYPE_F8_E4M3 || V->type == GGML_TYPE_F8_E4M3;
+    if ((ggml_is_quantized(K->type) || ggml_is_quantized(V->type) ||
+            (kv_f8 && ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) != nullptr)) &&
+            can_use_vector_kernel && Q->ne[1] <= 8) {
         return BEST_FATTN_KERNEL_VEC;
     }
 #endif // GGML_USE_HIP

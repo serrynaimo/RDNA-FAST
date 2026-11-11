@@ -1233,6 +1233,38 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
             ggml_cpy_scalar_cuda<nv_bfloat16, float>
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
         }
+    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F8_E4M3) { // [TAG_FP8_KV] FP8 E4M3 casts: an FP8 cache's K shift
+        if (contiguous_srcs) {
+            ggml_cpy_scalar_contiguous_cuda<float, ggml_fp8_e4m3_t>
+                (src0_ddc, src1_ddc, ne, main_stream);
+        } else {
+            ggml_cpy_scalar_cuda<float, ggml_fp8_e4m3_t>
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        }
+    } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F8_E4M3) {
+        if (contiguous_srcs) {
+            ggml_cpy_scalar_contiguous_cuda<half, ggml_fp8_e4m3_t>
+                (src0_ddc, src1_ddc, ne, main_stream);
+        } else {
+            ggml_cpy_scalar_cuda<half, ggml_fp8_e4m3_t>
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        }
+    } else if (src0->type == GGML_TYPE_F8_E4M3 && src1->type == GGML_TYPE_F32) {
+        if (contiguous_srcs) {
+            ggml_cpy_scalar_contiguous_cuda<ggml_fp8_e4m3_t, float>
+                (src0_ddc, src1_ddc, ne, main_stream);
+        } else {
+            ggml_cpy_scalar_cuda<ggml_fp8_e4m3_t, float>
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        }
+    } else if (src0->type == GGML_TYPE_F8_E4M3 && src1->type == GGML_TYPE_F16) {
+        if (contiguous_srcs) {
+            ggml_cpy_scalar_contiguous_cuda<ggml_fp8_e4m3_t, half>
+                (src0_ddc, src1_ddc, ne, main_stream);
+        } else {
+            ggml_cpy_scalar_cuda<ggml_fp8_e4m3_t, half>
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        }
     } else if (src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32) {
         if (!capture_scalar_copy && can_be_transposed) {
             ggml_cpy_scalar_cuda<int32_t, int32_t, true>
