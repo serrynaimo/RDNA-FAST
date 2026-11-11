@@ -502,10 +502,14 @@ struct llama_expert_handoff::impl {
                 ggml_upload_engine_params up = {};
                 // test-expert-handoff --upload-bench, RX 7900 XT under Windows, 450 KiB pieces from pageable RAM:
                 // 2/4/8/16/32 MiB per DMA moved 7.0/10.4/13.5/15.4/16.0 GB/s (each DMA costs ~0.2 ms here), plain
-                // pageable uploads of the pieces 2.8 GB/s. A 512 MiB ring measured the same as 128 (Flash-Next prompts).
-                up.ring_bytes  = (size_t) 128 << 20;
+                // pageable uploads of the pieces 2.8 GB/s. Ring and staging depth, Flash-Next Q2_0 without MTP with
+                // [TAG_EH_RAM_COVER] (2026-11-11; one layer's uncached experts are ~440 MB, so a 128 MiB ring let the
+                // copies run only a third of a layer ahead of the graph): 128 MiB / 8 buffers 690/3.8k/15k-token
+                // prompts 263/395-404/408-419 t/s, 512 MiB / 16 309/437/451-452, 1 GiB / 32 319/419/428-446; decode
+                // unchanged. (On 11-08, with experts still coming from the mapping, 512 MiB had measured no gain.)
+                up.ring_bytes  = (size_t) 512 << 20;
                 up.stage_bytes = (size_t) 16 << 20;
-                up.n_stage     = 8;
+                up.n_stage     = 16;
                 // Flash-Next, 2026-11-08: 16 threads (copying single experts) read the experts outside the RAM copy
                 // from the SSD fast enough for a cold ~700-token prompt in 8.2 s (4 threads: 12.6 s); from RAM alone 4
                 // are ~4% faster (3.8k tokens 269 vs 257 t/s)
