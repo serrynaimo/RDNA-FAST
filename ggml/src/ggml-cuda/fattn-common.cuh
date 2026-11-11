@@ -115,37 +115,55 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
     return sum;
 }
 
-// [TAG_FP8_KV] K as OCP FP8 E4M3: the f16 loop with each half2 read as two E4M3 bytes (convert.cuh); Q in the
-// registers the f16 path uses (half2 with V_DOT2, else float2).
+// [TAG_FP8_KV] K as OCP FP8 E4M3: the f16 loop with each half2 read as two E4M3 bytes; Q in the registers the f16
+// path uses (half2 with V_DOT2, else float2). Four codes per byte permute, decoded as value * 2^-8 (convert.cuh), and
+// the dot product times 256 once at the end: a power of two, so the result is the same as decoding every value.
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f8_e4m3(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v) {
 
-    const uint16_t * K_f8x2 = (const uint16_t *) K_c;
     GGML_UNUSED(Q_q8);
     GGML_UNUSED(Q_ds_v);
 
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
-    constexpr int cpy_ne = cpy_nb / 4;
+    constexpr int cpy_ne = cpy_nb / 4; // half2 per thread and step, as in the f16 loop: 2*cpy_ne codes
 
-    float sum = 0.0f;
+    float sum = 0.0f; // of value * 2^-8 products
 
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
-        __align__(8) uint16_t tmp[cpy_ne];
-        ggml_cuda_memcpy_1<sizeof(tmp)>(tmp, K_f8x2 + k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne);
+        const int k_KQ_t = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne;
+        if constexpr (cpy_ne % 2 == 0) {
+            __align__(8) uint32_t tmp[cpy_ne/2];
+            ggml_cuda_memcpy_1<sizeof(tmp)>(tmp, (const uint8_t *) K_c + 2*k_KQ_t);
 #pragma unroll
-        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
-            const half2 k2 = ggml_cuda_fp8x2_e4m3_to_half2(tmp[k_KQ_1]);
+            for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne/2; ++k_KQ_1) {
+                half2 k_lo, k_hi;
+                ggml_cuda_fp8x4_e4m3_to_half2x2_div256(tmp[k_KQ_1], k_lo, k_hi);
 #ifdef V_DOT2_F32_F16_AVAILABLE
-            ggml_cuda_mad(sum,                k2 , ((const half2  *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+                ggml_cuda_mad(sum, k_lo, ((const half2  *) Q_v)[k_KQ_0/nthreads + 2*k_KQ_1 + 0]);
+                ggml_cuda_mad(sum, k_hi, ((const half2  *) Q_v)[k_KQ_0/nthreads + 2*k_KQ_1 + 1]);
 #else
-            ggml_cuda_mad(sum, __half22float2(k2), ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+                ggml_cuda_mad(sum, __half22float2(k_lo), ((const float2 *) Q_v)[k_KQ_0/nthreads + 2*k_KQ_1 + 0]);
+                ggml_cuda_mad(sum, __half22float2(k_hi), ((const float2 *) Q_v)[k_KQ_0/nthreads + 2*k_KQ_1 + 1]);
 #endif // V_DOT2_F32_F16_AVAILABLE
+            }
+        } else {
+            __align__(4) uint16_t tmp[cpy_ne];
+            ggml_cuda_memcpy_1<sizeof(tmp)>(tmp, (const uint8_t *) K_c + 2*k_KQ_t);
+#pragma unroll
+            for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
+                const half2 k2 = __hmul2(ggml_cuda_fp8x2_e4m3_to_half2(tmp[k_KQ_1]), make_half2(0.00390625f, 0.00390625f));
+#ifdef V_DOT2_F32_F16_AVAILABLE
+                ggml_cuda_mad(sum,                k2 , ((const half2  *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+#else
+                ggml_cuda_mad(sum, __half22float2(k2), ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+#endif // V_DOT2_F32_F16_AVAILABLE
+            }
         }
     }
 
-    return sum;
+    return sum * 256.0f;
 }
 
 template <int D, int nthreads>
@@ -626,19 +644,34 @@ static __device__ __forceinline__ void dequantize_V_f16(const void * __restrict_
     }
 }
 
-// [TAG_FP8_KV] V as OCP FP8 E4M3: ne bytes, two at a time to half2 (convert.cuh)
+// [TAG_FP8_KV] V as OCP FP8 E4M3: ne codes, four per byte permute (convert.cuh), each half2 times 256
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_f8_e4m3(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     static_assert(ne % 2 == 0, "bad ne");
-    __align__(8) uint16_t tmp[ne/2];
-    ggml_cuda_memcpy_1<ne>(tmp, (const uint8_t *) vx + i0);
+    half2 h[ne/2];
+    if constexpr (ne % 4 == 0) {
+        __align__(8) uint32_t tmp[ne/4];
+        ggml_cuda_memcpy_1<ne>(tmp, (const uint8_t *) vx + i0);
+#pragma unroll
+        for (int l = 0; l < ne/4; ++l) {
+            ggml_cuda_fp8x4_e4m3_to_half2x2_div256(tmp[l], h[2*l + 0], h[2*l + 1]);
+            h[2*l + 0] = __hmul2(h[2*l + 0], make_half2(256.0f, 256.0f));
+            h[2*l + 1] = __hmul2(h[2*l + 1], make_half2(256.0f, 256.0f));
+        }
+    } else {
+        __align__(4) uint16_t tmp[ne/2];
+        ggml_cuda_memcpy_1<ne>(tmp, (const uint8_t *) vx + i0);
+#pragma unroll
+        for (int l = 0; l < ne/2; ++l) {
+            h[l] = ggml_cuda_fp8x2_e4m3_to_half2(tmp[l]);
+        }
+    }
 #pragma unroll
     for (int l = 0; l < ne/2; ++l) {
-        const half2 h = ggml_cuda_fp8x2_e4m3_to_half2(tmp[l]);
         if constexpr (std::is_same_v<T, half>) {
-            ((half2 *) dst)[l] = h;
+            ((half2 *) dst)[l] = h[l];
         } else if constexpr (std::is_same_v<T, float>) {
-            ((float2 *) dst)[l] = __half22float2(h);
+            ((float2 *) dst)[l] = __half22float2(h[l]);
         } else {
             static_assert(std::is_same_v<T, void>, "unsupported type");
         }

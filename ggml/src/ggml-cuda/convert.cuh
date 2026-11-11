@@ -84,9 +84,26 @@ static __host__ __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_fp8_e4m3(fl
     return sign | (uint8_t) (encoded_exp << 3) | (uint8_t) encoded_man;
 }
 
-// Two E4M3 codes (the low byte first) to a half2, for the attention kernels: a code's magnitude moved into an f16's
-// exponent and mantissa fields reads as its value * 2^-8 (bias 15 vs 7), normal and subnormal alike, so one packed
-// multiply by 256 restores both exactly (every E4M3 value is an f16 value).
+// Four E4M3 codes (the low byte first) to two half2 holding their values * 2^-8, for the attention kernels: a code's
+// magnitude moved into an f16's exponent and mantissa fields reads as its value * 2^-8 (bias 15 vs 7), normal and
+// subnormal alike, exactly (every E4M3 value is an f16 value). On AMD one byte permute puts two codes into the high
+// bytes of the two f16 lanes; the sign stays at bit 15, the magnitude moves down one bit. The caller applies the 256
+// (once per dot product for K, see vec_dot_fattn_vec_KQ_f8_e4m3).
+static __device__ __forceinline__ void ggml_cuda_fp8x4_e4m3_to_half2x2_div256(const uint32_t v, half2 & lo, half2 & hi) {
+#ifdef GGML_USE_HIP
+    const uint32_t x0 = __builtin_amdgcn_perm(0u, v, 0x010C000Cu); // bytes: 0, code0, 0, code1
+    const uint32_t x1 = __builtin_amdgcn_perm(0u, v, 0x030C020Cu); // bytes: 0, code2, 0, code3
+#else
+    const uint32_t x0 = ((v & 0x000000FFu) << 8) | ((v & 0x0000FF00u) << 16);
+    const uint32_t x1 = ((v & 0x00FF0000u) >> 8) | (v & 0xFF000000u);
+#endif // GGML_USE_HIP
+    const uint32_t b0 = (x0 & 0x80008000u) | ((x0 >> 1) & 0x3F803F80u);
+    const uint32_t b1 = (x1 & 0x80008000u) | ((x1 >> 1) & 0x3F803F80u);
+    memcpy(&lo, &b0, sizeof(lo));
+    memcpy(&hi, &b1, sizeof(hi));
+}
+
+// Two E4M3 codes (the low byte first) to a half2 of their values: the magnitude in an f16's fields times 256.
 static __device__ __forceinline__ half2 ggml_cuda_fp8x2_e4m3_to_half2(const uint32_t v) {
     const uint32_t bits = ((v & 0x0080u) << 8) | ((v & 0x007Fu) << 7) | ((v & 0x8000u) << 16) | ((v & 0x7F00u) << 15);
     half2 h;
