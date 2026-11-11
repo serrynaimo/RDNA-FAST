@@ -195,11 +195,13 @@
 
 <Story
 	asChild
-	name="SidebarStatusItem"
+	name="SidebarStatusCard"
 	play={async ({ canvas }) => {
-		const item = canvas.getByText('Status');
+		// the server status card is the footer group's last item and opens the status page; no Status menu item
+		const card = await canvas.findByText('Server status');
 
-		await expect(item.closest('a')).toHaveAttribute('href', '#/status');
+		await expect(card.closest('a')).toHaveAttribute('href', '#/status');
+		await expect(canvas.queryByText('Status', { exact: true })).not.toBeInTheDocument();
 	}}
 >
 	<div class="flex-column h-screen w-72 bg-background">

@@ -7,8 +7,12 @@
 	 * both together against the two peaks added up. A decode reading above that decode peak (a text
 	 * copy) makes the bar glow for a few seconds, like the status page's records. It polls /slots of
 	 * the chat's model once a second while it is shown, and only when that model is loaded.
+	 * 2026-11-11 (owner): on a desktop the card is the last item of the sidebar's footer group (inGroup:
+	 * its corners concentric with the group's), the Status page's gauge in front of its title, and the
+	 * GitHub link sits under the group (github / card pick the parts).
 	 */
 	import '$lib/rdna/rdna.css';
+	import { Gauge } from '@lucide/svelte';
 	import { modelQuery, rdnaGet } from '$lib/rdna/api';
 	import {
 		POLL_SLOTS_MS,
@@ -23,6 +27,14 @@
 	import type { PeakMap, RdnaSlot } from '$lib/rdna/types';
 	import { modelsStore, serverStore } from '$lib/stores';
 	import { onDestroy, onMount } from 'svelte';
+
+	interface Props {
+		card?: boolean;
+		github?: boolean;
+		inGroup?: boolean;
+	}
+
+	let { card = true, github = true, inGroup = false }: Props = $props();
 
 	let live = $state.raw<SlotLive[]>([]);
 	let reachable = $state(true);
@@ -135,68 +147,75 @@
 	});
 </script>
 
-<div class="rf-side-status">
-	<a class="rf-side-card" href={RDNA_ROUTE_STATUS}>
-		<span class="rf-side-row">
-			<span class="rf-side-title">Server status</span>
+<div class:rf-side-in-group={inGroup} class="rf-side-status">
+	{#if card}
+		<a class="rf-side-card" href={RDNA_ROUTE_STATUS}>
+			<span class="rf-side-row">
+				<span class="rf-side-title"
+					><Gauge aria-hidden="true" class="rf-side-icon" />Server status</span
+				>
 
-			<span class="rf-side-busy">
-				<span
-					aria-hidden="true"
-					class="rf-side-dot"
-					style="background: {!reachable
-						? 'var(--rf-red)'
+				<span class="rf-side-busy">
+					<span
+						aria-hidden="true"
+						class="rf-side-dot"
+						style="background: {!reachable
+							? 'var(--rf-red)'
+							: busy > 0
+								? 'var(--rf-green)'
+								: 'var(--rf-grey-bar)'};"
+					></span>
+					{!reachable
+						? 'offline'
 						: busy > 0
-							? 'var(--rf-green)'
-							: 'var(--rf-grey-bar)'};"
-				></span>
-				{!reachable
-					? 'offline'
-					: busy > 0
-						? `${busy} ${busy === 1 ? 'slot' : 'slots'} busy`
-						: 'idle'}
-			</span>
-		</span>
-
-		<span class="rf-side-row rf-side-figures">
-			<span class="rf-side-figure">
-				<span class:rf-side-none={prefillNow === null} class="rf-side-num rf-num"
-					>{prefillNow !== null ? fmtRate(prefillNow, 0) : '–'}</span
-				>
-
-				<span class="rf-side-unit">prefill</span>
+							? `${busy} ${busy === 1 ? 'slot' : 'slots'} busy`
+							: 'idle'}
+				</span>
 			</span>
 
-			<span class="rf-side-figure">
-				<span class="rf-side-unit">decode</span>
+			<span class="rf-side-row rf-side-figures">
+				<span class="rf-side-figure">
+					<span class:rf-side-none={prefillNow === null} class="rf-side-num rf-num"
+						>{prefillNow !== null ? fmtRate(prefillNow, 0) : '–'}</span
+					>
 
-				<span class:rf-side-none={decodeNow === null} class="rf-side-num rf-num"
-					>{decodeNow !== null ? fmtRate(decodeNow, 1) : '–'}</span
-				>
+					<span class="rf-side-unit">prefill</span>
+				</span>
+
+				<span class="rf-side-figure">
+					<span class="rf-side-unit">decode</span>
+
+					<span class:rf-side-none={decodeNow === null} class="rf-side-num rf-num"
+						>{decodeNow !== null ? fmtRate(decodeNow, 1) : '–'}</span
+					>
+				</span>
 			</span>
-		</span>
 
-		<span aria-hidden="true" class="rf-side-track"
-			><span class:rf-record-bar={glowing} class="rf-side-fill" style="width: {pct}%;"></span></span
-		>
-	</a>
+			<span aria-hidden="true" class="rf-side-track"
+				><span class:rf-record-bar={glowing} class="rf-side-fill" style="width: {pct}%;"
+				></span></span
+			>
+		</a>
+	{/if}
 
-	<a class="rf-side-gh" href={RDNA_GITHUB_URL} rel="noopener noreferrer" target="_blank">
-		<svg
-			aria-hidden="true"
-			fill="none"
-			height="16"
-			stroke="currentColor"
-			stroke-linecap="round"
-			stroke-linejoin="round"
-			stroke-width="2"
-			viewBox="0 0 24 24"
-			width="16"
-			><path
-				d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.4 5.4 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4"
-			/><path d="M9 18c-4.51 2-5-2-7-2" /></svg
-		>RDNA-FAST on GitHub
-	</a>
+	{#if github}
+		<a class="rf-side-gh" href={RDNA_GITHUB_URL} rel="noopener noreferrer" target="_blank">
+			<svg
+				aria-hidden="true"
+				fill="none"
+				height="16"
+				stroke="currentColor"
+				stroke-linecap="round"
+				stroke-linejoin="round"
+				stroke-width="2"
+				viewBox="0 0 24 24"
+				width="16"
+				><path
+					d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.4 5.4 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4"
+				/><path d="M9 18c-4.51 2-5-2-7-2" /></svg
+			>RDNA-FAST on GitHub
+		</a>
+	{/if}
 </div>
 
 <style>
@@ -237,8 +256,26 @@
 	}
 
 	.rf-side-title {
+		display: inline-flex;
+		align-items: center;
+		gap: 8px;
 		font-size: 13px;
 		font-weight: 700;
+	}
+
+	.rf-side-title :global(.rf-side-icon) {
+		width: 16px;
+		height: 16px;
+		flex-shrink: 0;
+	}
+
+	/* inside the footer group: no own padding around it, corners concentric with the group's */
+	.rf-side-in-group {
+		padding: 0;
+	}
+
+	.rf-side-in-group .rf-side-card {
+		border-radius: var(--surface-row-radius);
 	}
 
 	.rf-side-busy {

@@ -722,14 +722,24 @@
 					/>
 				</div>
 
-				{#if uiStore.isSidebarExpanded}
+				<!-- [RDNA-FAST] a phone has no footer group (its items join the actions above): the server status
+				     card and the GitHub link sit under the list there -->
+				{#if uiStore.isSidebarExpanded && isOnMobile}
 					<div class="px-2 pb-2"><RdnaSidebarStatus /></div>
 				{/if}
 
 				<!-- the footer, at the bottom of the sidebar and of its collapsed strip alike (a
 				     phone lists its items with the actions above) -->
 				{#if !isOnMobile}
-					<SidebarNavigationFooter onAction={handleSidebarAction} />
+					<!-- [RDNA-FAST] the server status card is the group's last item, the GitHub link under it -->
+					<SidebarNavigationFooter
+						onAction={handleSidebarAction}
+						showStatus={uiStore.isSidebarExpanded}
+					/>
+
+					{#if uiStore.isSidebarExpanded}
+						<div class="px-2 pb-2"><RdnaSidebarStatus card={false} /></div>
+					{/if}
 				{/if}
 			</div>
 		</div>
