@@ -270,7 +270,7 @@ public:
         return expert_handoff ? expert_handoff.get() : expert_handoff_shared;
     }
 
-    uint32_t graph_max_nodes(uint32_t n_tokens) const;
+    uint32_t graph_max_nodes() const;
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
