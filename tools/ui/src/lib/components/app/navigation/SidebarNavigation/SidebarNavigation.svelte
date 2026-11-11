@@ -644,7 +644,7 @@
 									? PanelLeftClose
 									: PanelLeftOpen
 								: Logo}
-							iconSize="size-4.5 md:size-4"
+							iconSize={isLogoToggle && logoHovered ? 'size-4.5 md:size-4' : 'size-7'}
 							onclick={!uiStore.isSidebarExpanded || isLogoToggle ? toggleExpandedMode : undefined}
 							size="lg"
 							tooltip={!uiStore.isSidebarExpanded

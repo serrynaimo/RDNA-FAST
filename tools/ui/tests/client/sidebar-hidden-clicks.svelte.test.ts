@@ -6,7 +6,8 @@
 
 import '../../src/app.css';
 import SidebarNavigationHarness from './components/SidebarNavigationHarness.svelte';
-import { uiStore } from '$lib/stores';
+import { SETTINGS_KEYS } from '$lib/constants';
+import { settingsStore, uiStore } from '$lib/stores';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { page } from 'vitest/browser';
 import { render } from 'vitest-browser-svelte';
@@ -32,14 +33,19 @@ function hitTargetsInSidebar(aside: HTMLElement): Element[] {
 
 describe('hidden sidebar', () => {
 	let wasExpanded: boolean;
+	let wasAlwaysShown: boolean;
 
 	beforeEach(async () => {
 		await page.viewport(1280, 900);
 		wasExpanded = uiStore.isSidebarExpanded;
+		// [RDNA-FAST] the sidebar stays open on desktop by default here (settings.constants.ts); this is about the hidden one
+		wasAlwaysShown = settingsStore.config[SETTINGS_KEYS.ALWAYS_SHOW_SIDEBAR_ON_DESKTOP] as boolean;
+		settingsStore.updateConfig(SETTINGS_KEYS.ALWAYS_SHOW_SIDEBAR_ON_DESKTOP, false);
 	});
 
 	afterEach(() => {
 		uiStore.isSidebarExpanded = wasExpanded;
+		settingsStore.updateConfig(SETTINGS_KEYS.ALWAYS_SHOW_SIDEBAR_ON_DESKTOP, wasAlwaysShown);
 	});
 
 	it('lets clicks over its strip through to the page', async () => {
