@@ -31,58 +31,8 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type);
 to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type);
 to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type);
 
-// [TAG_FP8_KV] OCP FP8 E4M3 (#27512) on the GPU: 1 sign, 4 exponent (bias 7), 3 mantissa bits, max 448, no inf.
-// The encoder is the CPU's (ggml_fp32_to_f8_e4m3: round to nearest even, saturating to +-448, NaN -> 0x7F), so a
-// cache written here holds the same bytes as one written on the CPU. Decoding is exact for every finite code; the
-// NaN codes (0x7F / 0xFF, never written from finite values) decode as +-480.
-static __host__ __device__ __forceinline__ float ggml_cuda_fp8_e4m3_to_float(const uint8_t b) {
-    const uint32_t mag = b & 0x7Fu;
-    float v;
-    if (mag < 8u) {
-        // subnormal: M * 2^-9, kept out of f32 subnormals (a GPU may flush those to zero)
-        v = (float) mag * 0.001953125f;
-    } else {
-        // normal: exponent E - 7 + 127 = E + 120, the 3 mantissa bits on top of the f32 mantissa
-        const uint32_t bits = (mag + (120u << 3)) << 20;
-        memcpy(&v, &bits, sizeof(v));
-    }
-    return b & 0x80u ? -v : v;
-}
-
-static __host__ __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_fp8_e4m3(float x) {
-    const uint8_t sign = signbit(x) ? 0x80 : 0;
-    x = fabsf(x);
-    if (isnan(x)) {
-        return 0x7F;
-    }
-    if (x == 0.0f) {
-        return sign;
-    }
-    if (isinf(x) || x >= 448.0f) {
-        return sign | 0x7E;
-    }
-    const auto round_even = [](float y) -> int {
-        const int value = (int) floorf(y);
-        const float fraction = y - value;
-        return fraction > 0.5f || (fraction == 0.5f && (value & 1)) ? value + 1 : value;
-    };
-    if (x < 0.015625f) {
-        // subnormal: M * 2^-9; a carry to 8 is the smallest normal, 0x08
-        return sign | (uint8_t) round_even(x * 512.0f);
-    }
-    int exp;
-    const float mantissa = frexpf(x, &exp) * 2.0f;
-    int encoded_exp = exp + 6;
-    int encoded_man = round_even((mantissa - 1.0f) * 8.0f);
-    if (encoded_man == 8) {
-        encoded_man = 0;
-        encoded_exp++;
-    }
-    if (encoded_exp > 15 || (encoded_exp == 15 && encoded_man > 6)) {
-        return sign | 0x7E;
-    }
-    return sign | (uint8_t) (encoded_exp << 3) | (uint8_t) encoded_man;
-}
+// [TAG_FP8_KV] OCP FP8 E4M3: the scalar conversions are upstream's (common.cuh, through ggml_cuda_cast, the
+// same bytes as the CPU for every finite value); the packed decoders below serve the attention kernels.
 
 // Four E4M3 codes (the low byte first) to two half2 holding their values * 2^-8, for the attention kernels: a code's
 // magnitude moved into an f16's exponent and mantissa fields reads as its value * 2^-8 (bias 15 vs 7), normal and
@@ -115,23 +65,36 @@ template<typename dst_t, typename src_t>
  __host__ __device__ inline dst_t ggml_cuda_cast(src_t x) {
     if constexpr (std::is_same_v<dst_t, src_t>) {
         return x;
-    } else if constexpr(std::is_same_v<src_t, ggml_fp8_e4m3_t>) {
-        const float f = ggml_cuda_fp8_e4m3_to_float(x.bits);
+    } else if constexpr (std::is_same_v<dst_t, ggml_fp8_e4m3_t>) {
+        return { ggml_cuda_fp32_to_f8_e4m3(ggml_cuda_cast<float>(x)) };
+    } else if constexpr (std::is_same_v<src_t, ggml_fp8_e4m3_t>) {
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if CUDART_VERSION >= 13040
         if constexpr (std::is_same_v<dst_t, nv_bfloat16>) {
-            return __float2bfloat16(f);
-        } else if constexpr (std::is_same_v<dst_t, half>) {
-            return __float2half(f);
-        } else {
-            return dst_t(f);
+            return static_cast<nv_bfloat16>(__nv_cvt_fp8_to_bf16raw(x.bits, __NV_E4M3));
         }
-    } else if constexpr(std::is_same_v<dst_t, ggml_fp8_e4m3_t>) {
-        ggml_fp8_e4m3_t r;
-        if constexpr (std::is_same_v<src_t, nv_bfloat16>) {
-            r.bits = ggml_cuda_fp32_to_fp8_e4m3(__bfloat162float(x));
-        } else {
-            r.bits = ggml_cuda_fp32_to_fp8_e4m3(float(x));
+#endif
+        if constexpr (std::is_same_v<dst_t, half>) {
+            return static_cast<half>(__nv_cvt_fp8_to_halfraw(x.bits, __NV_E4M3));
         }
-        return r;
+#endif
+        return ggml_cuda_cast<dst_t>(ggml_cuda_f8_e4m3_to_fp32(x.bits));
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    } else if constexpr (std::is_same_v<src_t, __nv_fp8x2_e4m3> && std::is_same_v<dst_t, nv_bfloat162>) {
+#if CUDART_VERSION >= 13040
+        return static_cast<nv_bfloat162>(__nv_cvt_fp8x2_to_bf162raw(x.__x, __NV_E4M3));
+#else
+        return make_bfloat162(
+            ggml_cuda_cast<nv_bfloat16>(ggml_cuda_f8_e4m3_to_fp32(x.__x & 0xFF)),
+            ggml_cuda_cast<nv_bfloat16>(ggml_cuda_f8_e4m3_to_fp32(x.__x >> 8)));
+#endif
+    } else if constexpr (std::is_same_v<src_t, __nv_fp8x2_e4m3> && std::is_same_v<dst_t, float2>) {
+#if CUDART_VERSION >= 13040
+        return ggml_cuda_cast<float2>(ggml_cuda_cast<nv_bfloat162>(x));
+#else
+        return __half22float2(static_cast<half2>(__nv_cvt_fp8x2_to_halfraw2(x.__x, __NV_E4M3)));
+#endif
+#endif
     } else if constexpr(std::is_same_v<dst_t, nv_bfloat16>) {
         return __float2bfloat16(float(x));
     } else if constexpr(std::is_same_v<src_t, nv_bfloat16>) {

@@ -460,6 +460,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q5_1, F16)
     FATTN_VEC_CASES_ALL_D(Q8_0, F16)
     FATTN_VEC_CASES_ALL_D(BF16, F16)
+    FATTN_VEC_CASES_ALL_D(F8_E4M3, F16)
 
     FATTN_VEC_CASES_ALL_D(F16,  Q4_0)
     FATTN_VEC_CASES_ALL_D(Q4_0, Q4_0)
@@ -468,6 +469,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q5_1, Q4_0)
     FATTN_VEC_CASES_ALL_D(Q8_0, Q4_0)
     FATTN_VEC_CASES_ALL_D(BF16, Q4_0)
+    FATTN_VEC_CASES_ALL_D(F8_E4M3, Q4_0)
 
     FATTN_VEC_CASES_ALL_D(F16,  Q4_1)
     FATTN_VEC_CASES_ALL_D(Q4_0, Q4_1)
@@ -476,6 +478,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q5_1, Q4_1)
     FATTN_VEC_CASES_ALL_D(Q8_0, Q4_1)
     FATTN_VEC_CASES_ALL_D(BF16, Q4_1)
+    FATTN_VEC_CASES_ALL_D(F8_E4M3, Q4_1)
 
     FATTN_VEC_CASES_ALL_D(F16,  Q5_0)
     FATTN_VEC_CASES_ALL_D(Q4_0, Q5_0)
@@ -484,6 +487,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q5_1, Q5_0)
     FATTN_VEC_CASES_ALL_D(Q8_0, Q5_0)
     FATTN_VEC_CASES_ALL_D(BF16, Q5_0)
+    FATTN_VEC_CASES_ALL_D(F8_E4M3, Q5_0)
 
     FATTN_VEC_CASES_ALL_D(F16,  Q5_1)
     FATTN_VEC_CASES_ALL_D(Q4_0, Q5_1)
@@ -492,6 +496,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q5_1, Q5_1)
     FATTN_VEC_CASES_ALL_D(Q8_0, Q5_1)
     FATTN_VEC_CASES_ALL_D(BF16, Q5_1)
+    FATTN_VEC_CASES_ALL_D(F8_E4M3, Q5_1)
 
     FATTN_VEC_CASES_ALL_D(F16,  Q8_0)
     FATTN_VEC_CASES_ALL_D(Q4_0, Q8_0)
@@ -500,6 +505,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q5_1, Q8_0)
     FATTN_VEC_CASES_ALL_D(Q8_0, Q8_0)
     FATTN_VEC_CASES_ALL_D(BF16, Q8_0)
+    FATTN_VEC_CASES_ALL_D(F8_E4M3, Q8_0)
 
     FATTN_VEC_CASES_ALL_D(F16,  BF16)
     FATTN_VEC_CASES_ALL_D(Q4_0, BF16)
@@ -508,6 +514,16 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q5_1, BF16)
     FATTN_VEC_CASES_ALL_D(Q8_0, BF16)
     FATTN_VEC_CASES_ALL_D(BF16, BF16)
+    FATTN_VEC_CASES_ALL_D(F8_E4M3, BF16)
+
+    FATTN_VEC_CASES_ALL_D(F16, F8_E4M3)
+    FATTN_VEC_CASES_ALL_D(Q4_0, F8_E4M3)
+    FATTN_VEC_CASES_ALL_D(Q4_1, F8_E4M3)
+    FATTN_VEC_CASES_ALL_D(Q5_0, F8_E4M3)
+    FATTN_VEC_CASES_ALL_D(Q5_1, F8_E4M3)
+    FATTN_VEC_CASES_ALL_D(Q8_0, F8_E4M3)
+    FATTN_VEC_CASES_ALL_D(BF16, F8_E4M3)
+    FATTN_VEC_CASES_ALL_D(F8_E4M3, F8_E4M3)
 
 #define FATTN_VEC_CASE_CUSTOM(D, type_K_enum, type_V_enum) \
     if (head_size == (D) && type_K == (type_K_enum) && type_V == (type_V_enum)) { \
@@ -529,11 +545,6 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_CUSTOM_ALL_D(GGML_TYPE_Q3_0_ROCMFPX,      GGML_TYPE_Q3_0_ROCMFPX)
     FATTN_VEC_CASES_CUSTOM_ALL_D(GGML_TYPE_Q6_0_ROCMFPX,      GGML_TYPE_Q6_0_ROCMFPX)
     FATTN_VEC_CASES_CUSTOM_ALL_D(GGML_TYPE_Q8_0_ROCMFPX,      GGML_TYPE_Q8_0_ROCMFPX)
-
-    // [TAG_FP8_KV] fattn-vec-instance-f8_e4m3.cu
-    FATTN_VEC_CASES_CUSTOM_ALL_D(GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3)
-    FATTN_VEC_CASES_CUSTOM_ALL_D(GGML_TYPE_F8_E4M3, GGML_TYPE_F16)
-    FATTN_VEC_CASES_CUSTOM_ALL_D(GGML_TYPE_F16,     GGML_TYPE_F8_E4M3)
 
     FATTN_VEC_CASES_CUSTOM_TURBO(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_CUSTOM_TURBO(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
@@ -697,8 +708,6 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
-            return true;
-        // ROCmFPX [TAG_FP8_KV] FP8 E4M3 caches: vector kernels for F8/F8, F8/F16 and F16/F8, f16 copies elsewhere
         case GGML_TYPE_F8_E4M3:
             return true;
         // ROCmFPX [TAG_FATTN_ROCMFP_KV] the ROCmFP KV caches have vector kernels for same-type K/V pairs (the

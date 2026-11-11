@@ -658,9 +658,8 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_F8_E4M3) {
-        // [TAG_FP8_KV] an FP8 E4M3 cache: the CPU's rounding, per element (convert.cuh)
         set_rows_cuda(
-            src0_d, src1_d, (ggml_fp8_e4m3_t*)dst->data,
+            src0_d, src1_d, (ggml_fp8_e4m3_t *) dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
             nb01, nb02, nb03,
