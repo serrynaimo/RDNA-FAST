@@ -129,12 +129,9 @@ class ToolsStore {
 			buildGetDatetimeToolDefinition(),
 			// [RDNA-FAST] Keenable web search and page reading, keyless, on by default
 			buildWebSearchToolDefinition(),
-			buildWebFetchToolDefinition()
+			buildWebFetchToolDefinition(),
+			buildSandboxToolDefinition(!!settingsStore.config.symbolicMathEnabled)
 		];
-
-		if (settingsStore.config.jsSandboxEnabled) {
-			tools.push(buildSandboxToolDefinition(!!settingsStore.config.symbolicMathEnabled));
-		}
 
 		const readMedia = this.readMediaTool();
 
