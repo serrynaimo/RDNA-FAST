@@ -550,7 +550,9 @@
 			out:fade={{ duration: 200 }}
 			class="mt-2 flex min-h-0 flex-1 flex-col gap-4 md:gap-1 {deviceStore.isMobile
 				? 'transition-[opacity,height] duration-200 ease-out'
-				: ''} {deviceStore.isMobile && !uiStore.isSidebarExpanded ? 'opacity-0 invisible !h-0' : ''}"
+				: ''} {deviceStore.isMobile && !uiStore.isSidebarExpanded
+				? 'opacity-0 invisible !h-0'
+				: ''}"
 		>
 			<SidebarNavigationActions
 				class="px-2"

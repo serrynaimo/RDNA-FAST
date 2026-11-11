@@ -26,8 +26,8 @@
 	import { useChatScreenDragAndDrop } from '$lib/hooks/use-chat-screen-drag-and-drop.svelte';
 	import { useChatScreenFileUpload } from '$lib/hooks/use-chat-screen-file-upload.svelte';
 	import { useKeyboardShortcuts } from '$lib/hooks/use-keyboard-shortcuts.svelte';
-	import { ENTRANCE_CHAT_INPUT, playEntrance } from '$lib/rdna/entrance';
 	import { createStickToBottom } from '$lib/hooks/use-stick-to-bottom.svelte';
+	import { ENTRANCE_CHAT_INPUT, playEntrance } from '$lib/rdna/entrance';
 	import {
 		chatStore,
 		conversationsStore,

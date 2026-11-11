@@ -44,13 +44,14 @@
 
 	// [RDNA-FAST] "Make it RDNA-FAST!": a new chat in which the model that runs picks the quant, downloads it and saves
 	// its recipe (src/lib/rdna/make-fast.ts)
-	function makeItFast(): void {
+	async function makeItFast(): Promise<void> {
 		const repo = (details.id || modelId).split(':')[0];
 		const quants = quantsOfFiles((details.siblings ?? []).map((s) => s.rfilename));
 
 		uiStore.discoverModelsOpen = false;
-		uiStore.manageModelsOpen = false;
-		void startRdnaChat(makeItFastPrompt(repo, quants));
+		// the models manager is a page since upstream #30988: leave it for the chat
+		await uiStore.closeModelsManager();
+		await startRdnaChat(makeItFastPrompt(repo, quants));
 	}
 </script>
 

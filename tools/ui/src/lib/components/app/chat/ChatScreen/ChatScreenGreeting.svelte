@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { ensureRdnaFonts } from '$lib/rdna/fonts';
 	import { CHAT_GREETING_ENTER_DELAY_MS } from '$lib/constants';
+	import { ensureRdnaFonts } from '$lib/rdna/fonts';
 	import { serverStore } from '$lib/stores';
 
 	ensureRdnaFonts(); // [RDNA-FAST] the greeting in the brand's display font
