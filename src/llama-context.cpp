@@ -898,12 +898,21 @@ uint32_t llama_context::reserve_n_outputs_pp(uint32_t n_tokens) const {
     return mtp_lean_reserve ? 0 : std::min(n_tokens, cparams.n_outputs_max);
 }
 
-void llama_context::sched_new(size_t max_nodes, bool parallel) {
+void llama_context::sched_new(const sched_params & params) {
+    // reusing the scheduler avoids reallocating its buffers (incl. the compute buffers)
+    if (sched && params.can_reuse(sched_params_cur)) {
+        LLAMA_LOG_DEBUG("%s: reusing scheduler: max_nodes = %zu (current max_nodes = %zu)\n",
+                __func__, params.max_nodes, sched_params_cur.max_nodes);
+        return;
+    }
+
     sched.reset(ggml_backend_sched_new(
-            backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
+            backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), params.max_nodes, params.parallel, params.op_offload));
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+
+    sched_params_cur = params;
 }
 
 void llama_context::sched_reserve() {
@@ -932,7 +941,11 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
-    sched_new(max_nodes, cparams.pipeline_parallel);
+    sched_new({
+        /*.max_nodes  =*/ max_nodes,
+        /*.parallel   =*/ cparams.pipeline_parallel,
+        /*.op_offload =*/ cparams.op_offload,
+    });
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -971,7 +984,11 @@ void llama_context::sched_reserve() {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
-                sched_new(max_nodes, false);
+                sched_new({
+                    /*.max_nodes  =*/ max_nodes,
+                    /*.parallel   =*/ false,
+                    /*.op_offload =*/ cparams.op_offload,
+                });
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
