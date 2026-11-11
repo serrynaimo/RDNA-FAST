@@ -20,7 +20,7 @@ machine and model.
 RX 7900 XT 20 GB, Ryzen 9 7900 (12 cores), 32 GB DDR5, Windows 11, ROCm 10.1, through `llama-server`.
 
 **Qwen3.8-Flash-Next Q2_0** (Swift 1.5 Flash-Next, 66.5 GB): 36% of its experts fit in VRAM (28% next to the MTP
-draft). With 24-25 GB of RAM free, the RAM copy held all 20 GB of the others (21 of 23 GB next to the draft); what
+draft). With 24-25 GiB of RAM free, the RAM copy held all 20 GiB of the others (21 of 23 GiB next to the draft); what
 doesn't fit there is read from the SSD ([Streaming from the SSD](#streaming-from-the-ssd)). Sampling at temperature 1,
 2026-11-11:
 
@@ -34,8 +34,9 @@ doesn't fit there is read from the SSD ([Streaming from the SSD](#streaming-from
 | 3.8k-token prompt | **429 t/s** | 416 t/s |
 | 15k-token prompt | **452-455 t/s** | 427-435 t/s |
 
-The same model in an agent session: the two-agent session of the [README's speed test](../README.md#speed) (an
-orchestrator that grows from 4k to 41k tokens, a 10k-token worker), with MTP drafting, the better of two sessions:
+The same model in an agent session, on the build of 2026-11-10: the two-agent session of the
+[README's speed test](../README.md#speed) (an orchestrator that grows from 4k to 41k tokens, a 10k-token worker), with
+MTP drafting, the better of two sessions:
 
 | | |
 | --- | ---: |
@@ -92,8 +93,8 @@ VRAM, Gemma 4 with half its experts on the CPU has a KL divergence of about 0.08
 - **Drafting: MTP, not n-gram.** The MTP draft (`-md mtp-Qwen3.8-Flash-Next-Q4_0.gguf --spec-type draft-mtp
   --spec-draft-n-max 3 --spec-draft-p-min 0.5`) makes copied text about 40% faster on the 20 GB card and short answers
   up to 14% faster. It takes VRAM that the expert cache then lacks, so long prompts are about 5% slower (see Results);
-  on a card with VRAM to spare that cost goes away. N-gram drafting (`--spec-type ngram-*`) halved the speed of copied text: every
-  draft it checks costs the CPU more than it saves.
+  on a card with VRAM to spare that cost goes away. N-gram drafting (`--spec-type ngram-*`) halved the speed of copied
+  text: every draft it checks costs the CPU more than it saves.
 - **Keep the default batch size.** `-ub 4096` makes the compute buffers larger, which leaves fewer experts in VRAM: on
   the 20 GB card prompts and answers both got slower.
 - **Workers.** Lower `--pool-workers` only if other CPU-heavy programs share the machine.
@@ -188,12 +189,12 @@ Scale a file first if its share of the mix should be smaller than its raw counts
 
 ## Streaming from the SSD
 
-A model can be bigger than VRAM and RAM together: Flash-Next Q2_0 is 62 GB, run here on a 20 GB card with 32 GB of
+A model can be bigger than VRAM and RAM together: Flash-Next Q2_0 is 66.5 GB, run here on a 20 GB card with 32 GB of
 RAM. The experts live in three places, fastest first:
 
 1. **The VRAM cache:** the most used experts, chosen by the profile and then by the conversation.
 2. **The RAM copy:** the next most used ones, copied from the model file once at load (up to eight readers in
-   parallel, Flash-Next's 14.9 GiB in about 10 s) into RAM that is locked, so the system never pages it out.
+   parallel, Flash-Next's 20.2 GiB in about 20 s) into RAM that is locked, so the system never pages it out.
 3. **The model file:** everything else stays memory-mapped. The system reads it from the SSD when the CPU or an upload
    touches it and keeps it in its file cache while RAM allows.
 
@@ -203,8 +204,9 @@ What streams from the SSD, and when:
   stays in the file cache, and the RAM copy swaps in the experts the CPU keeps going back to.
 - **Prompts.** Every batch of a long prompt sends the experts the VRAM cache misses to the GPU. Sixteen copy threads
   read them from the RAM copy, or else from the file with many SSD reads in flight, into pinned buffers that go to the
-  GPU while earlier layers compute; a 512 MiB ring in VRAM lets them run more than a layer ahead. A cold 700-token
-  prompt on Flash-Next took 8.2 s this way, 12.6 s with four threads.
+  GPU while earlier layers compute; a 512 MiB ring in VRAM lets them run more than a layer ahead. When Flash-Next's
+  experts had to come from the file, its first 700-token prompt after a load took 8.2 s this way (12.6 s with four
+  threads); from the whole RAM copy it took 2.2 s.
 - **Per-layer token embeddings.** Flash-Next's 28.8 GB table (`-ot per_layer_token_embd=CPU`) is never loaded. For each
   batch the server reads ahead the rows of the whole prompt, then reads exactly those rows with parallel reads in file
   order, each row once. Compared with letting the system fault the table in page by page, this took a 700-token prompt
@@ -216,8 +218,9 @@ What helps:
   capped reads at 143 MB/s on this machine.
 - **RAM.** Every expert in the RAM copy is one the SSD doesn't have to deliver. Memory-mapped experts the system has
   pushed out of the process cost the CPU about 5x as long each (175 vs 35 µs on Flash-Next).
-- **Patience after a load.** The first requests read from the SSD until the file cache has the experts again; the
-  first answers on Flash-Next came at 12.5 t/s before reaching their usual speed.
+- **Patience after a load.** Experts outside the RAM copy come from the SSD until the file cache has them again:
+  before the RAM copy, the first answers on Flash-Next came at 12.5 t/s. With every expert outside VRAM in the RAM
+  copy, as in [Results](#results), the first answer after a load ran at 43.9 t/s.
 
 ## Limits
 
