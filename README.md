@@ -57,8 +57,9 @@ formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
   a client can fall back to another server.
 
 Measured on one machine: RX 7900 XT 20 GB, Ryzen 9 7900, 32 GB RAM,
-Windows 11, ROCm 10.1, one NVMe for models and cache. Nothing here has
-been measured on an XTX.
+Windows 11, ROCm 10.1, one NVMe for models and cache. Performance reports
+from other cards, filed as [Issues](https://github.com/serrynaimo/RDNA-FAST/issues),
+are appreciated.
 
 ## Speed
 
