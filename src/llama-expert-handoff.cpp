@@ -1553,7 +1553,7 @@ struct llama_expert_handoff::impl {
             };
             for (size_t ig = 0; ig < groups.size(); ++ig) {
                 const group & g = groups[ig];
-                std::vector<std::tuple<float, int32_t, int32_t>> rin, rout; // usage, il, e
+                std::vector<std::tuple<float, int32_t, int32_t>> rin, rout, rcold; // usage, il, e
                 for (int32_t il : g.layers) {
                     const layer & l = layers[il];
                     if (il >= il_nextn || l.state != 1 || l.res.empty()) {
@@ -1564,17 +1564,35 @@ struct llama_expert_handoff::impl {
                         const bool vram = l.slots[e] < g.n_slots;
                         if (in_ram(l, e)) {
                             rout.emplace_back(vram ? -1.0f : u[e], il, e);
-                        } else if (!vram && u[e] >= 2.0f) {
-                            rin.emplace_back(u[e], il, e);
+                        } else if (!vram) {
+                            (u[e] >= 2.0f ? rin : rcold).emplace_back(u[e], il, e);
                         }
                     }
                 }
                 const size_t n = std::min({ rin.size(), rout.size(), (size_t) params.adapt_swaps });
                 std::partial_sort(rin.begin(),  rin.begin()  + n, rin.end(),  [](const auto & a, const auto & b) { return std::get<0>(a) > std::get<0>(b); });
                 std::partial_sort(rout.begin(), rout.begin() + n, rout.end(), [](const auto & a, const auto & b) { return std::get<0>(a) < std::get<0>(b); });
-                for (size_t i = 0; i < n && std::get<0>(rin[i]) >= std::get<0>(rout[i]) + min_gain; ++i) {
-                    ram_swaps.emplace_back(std::get<0>(rin[i]) - std::get<0>(rout[i]), std::get<1>(rin[i]), std::get<2>(rin[i]),
-                                           std::get<1>(rout[i]), std::get<2>(rout[i]));
+                size_t k = 0;
+                for (; k < n && std::get<0>(rin[k]) >= std::get<0>(rout[k]) + min_gain; ++k) {
+                    ram_swaps.emplace_back(std::get<0>(rin[k]) - std::get<0>(rout[k]), std::get<1>(rin[k]), std::get<2>(rin[k]),
+                                           std::get<1>(rout[k]), std::get<2>(rout[k]));
+                }
+                // [TAG_EH_RAM_COVER] the copy's slots of experts the VRAM cache holds by now go to experts neither tier
+                // holds, however cold: a prompt batch uploads every expert outside VRAM, and one outside the copy too is
+                // copied from the mapped file (page faults, 0.1-0.5 GB/s per copy thread against 1-7 GB/s from the copy).
+                // Without this every VRAM swap left a duplicate in the copy and a cold expert in neither tier: Flash-Next,
+                // 2026-11-11, 4-6 GB of a 2048-token batch's 21 GB came from the file after the cache had adapted,
+                // although the copy had held every expert the VRAM cache missed at load. Below the hot swaps (gain < 1).
+                std::partial_sort(rcold.begin(), rcold.begin() + std::min(rcold.size(), (size_t) params.adapt_swaps), rcold.end(),
+                    [](const auto & a, const auto & b) { return std::get<0>(a) > std::get<0>(b); });
+                size_t c = 0;
+                for (size_t i = k; i < rout.size() && c < rcold.size() && c < (size_t) params.adapt_swaps; ++i) {
+                    if (std::get<0>(rout[i]) >= 0.0f) {
+                        continue; // not a duplicate (after partial_sort only the first n are in order)
+                    }
+                    const float gain = 0.5f + 0.1f*std::min(std::get<0>(rcold[c]), 4.9f);
+                    ram_swaps.emplace_back(gain, std::get<1>(rcold[c]), std::get<2>(rcold[c]), std::get<1>(rout[i]), std::get<2>(rout[i]));
+                    c++;
                 }
             }
             std::sort(ram_swaps.begin(), ram_swaps.end(), [](const auto & a, const auto & b) { return std::get<0>(a) > std::get<0>(b); });
