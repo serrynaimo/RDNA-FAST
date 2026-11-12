@@ -189,7 +189,9 @@
 
 <svelte:window onkeydown={handleKeydown} />
 
-<div class={['relative flex min-h-0 flex-1', className]}>
+<!-- [RDNA-FAST] as tall as its rows, not the page: it still shrinks (min-h-0) and the list scrolls
+     when the models outgrow the page, and the page's entrance frames the table, not empty space -->
+<div class={['relative flex min-h-0', className]}>
 	<div class="min-h-0 min-w-0 flex-1">
 		<ModelsManagerModelsTable
 			bind:capabilities={capabilityFilter}

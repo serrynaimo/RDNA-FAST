@@ -341,8 +341,9 @@
 
 /*
  * The Models page's header and table (entrance.ts, owner 2026-11-12). Neither has a border or
- * padding of its own, so the brackets frame them from just outside (the table's bottom pair stays
- * inside: it reaches the page's bottom edge) and the scan reveals that margin as well.
+ * padding of its own, so the brackets frame them from just outside and the scan reveals that
+ * margin as well. The table is as tall as its rows, and the page keeps a bottom margin for the
+ * brackets when it fills the page.
  */
 .rf-enter.rf-models-head,
 .rf-enter.rf-models-table {
@@ -352,12 +353,9 @@
 		rfEnterBorder 440ms ease-out calc(var(--rf-enter-delay, 0ms) + 440ms) backwards;
 }
 
-.rf-enter.rf-models-head::before {
-	inset: -8px;
-}
-
+.rf-enter.rf-models-head::before,
 .rf-enter.rf-models-table::before {
-	inset: -8px -8px 6px;
+	inset: -8px;
 }
 
 @keyframes rfEnterScanWide {
