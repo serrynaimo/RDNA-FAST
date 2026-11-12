@@ -2,8 +2,24 @@
 	import ModelsManager from '$lib/components/app/models/ModelsManager/ModelsManager.svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { APP_NAME, DISCOVER_ICON } from '$lib/constants';
+	import { ENTRANCE_MODELS, playEntrance } from '$lib/rdna/entrance';
 	import { modelsStore, uiStore } from '$lib/stores';
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
+
+	let pageEl = $state<HTMLElement | null>(null);
+	let entered = false;
+	let endEntrance: (() => void) | null = null;
+
+	onDestroy(() => endEntrance?.());
+
+	// the status tiles' entrance on the header and the table, once each time the page opens, when
+	// the list is there to scan in (entrance.ts)
+	$effect(() => {
+		if (entered || !pageEl || modelsStore.models.length === 0) return;
+
+		entered = true;
+		endEntrance = playEntrance(pageEl, ENTRANCE_MODELS);
+	});
 
 	// a direct load lands here before any chat has listed the models, and the root
 	// layout fetches the router details once that list arrives. An already loaded
@@ -24,9 +40,10 @@
 </svelte:head>
 
 <div
+	bind:this={pageEl}
 	class="mx-auto flex h-[100dvh] w-full max-w-7xl flex-col gap-6 px-4 pt-(--page-top) md:px-8 md:pt-6"
 >
-	<div class="flex items-start gap-4">
+	<div class="rf-models-head flex items-start gap-4">
 		<div class="flex min-w-0 flex-col gap-1">
 			<h1 class="text-2xl font-semibold tracking-tight">Models</h1>
 
@@ -49,5 +66,5 @@
 		{/if}
 	</div>
 
-	<ModelsManager class="min-h-0" />
+	<ModelsManager class="rf-models-table min-h-0" />
 </div>

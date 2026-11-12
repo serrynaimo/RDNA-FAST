@@ -15,6 +15,9 @@ export const ENTRANCE_TILES = '.rf-model, .rf-speed, .rf-slots, .rf-tile, .rf-re
 /** The chat page's prompt input box. */
 export const ENTRANCE_CHAT_INPUT = 'form.conversation-chat-form [data-slot="input-area"]';
 
+/** The Models page's header and table (owner, 2026-11-12), once each time the page opens. */
+export const ENTRANCE_MODELS = '.rf-models-head, .rf-models-table';
+
 /** Keep these in step with `.rf-enter` in rdna.css. */
 export const ENTER_STAGGER_MS = 70;
 export const ENTER_MS = 480;

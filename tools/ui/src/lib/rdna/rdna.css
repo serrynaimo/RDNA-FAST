@@ -339,6 +339,37 @@
 	inset: 12px;
 }
 
+/*
+ * The Models page's header and table (entrance.ts, owner 2026-11-12). Neither has a border or
+ * padding of its own, so the brackets frame them from just outside (the table's bottom pair stays
+ * inside: it reaches the page's bottom edge) and the scan reveals that margin as well.
+ */
+.rf-enter.rf-models-head,
+.rf-enter.rf-models-table {
+	animation:
+		rfEnterScanWide 480ms cubic-bezier(0.55, 0, 0.25, 1) var(--rf-enter-delay, 0ms) backwards,
+		rfEnterPower 480ms linear var(--rf-enter-delay, 0ms) backwards,
+		rfEnterBorder 440ms ease-out calc(var(--rf-enter-delay, 0ms) + 440ms) backwards;
+}
+
+.rf-enter.rf-models-head::before {
+	inset: -8px;
+}
+
+.rf-enter.rf-models-table::before {
+	inset: -8px -8px 6px;
+}
+
+@keyframes rfEnterScanWide {
+	from {
+		clip-path: inset(-12px -12px 100% -12px);
+	}
+
+	to {
+		clip-path: inset(-12px);
+	}
+}
+
 @keyframes rfEnterScan {
 	from {
 		clip-path: inset(0 0 100% 0);
@@ -442,6 +473,8 @@
 @media (prefers-reduced-motion: reduce) {
 	.rf-enter,
 	.rf-enter.rf-model,
+	.rf-enter.rf-models-head,
+	.rf-enter.rf-models-table,
 	.rf-dialog-brand[data-state='open'] {
 		animation: rfEnterFade 200ms ease-out backwards;
 	}
