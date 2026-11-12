@@ -746,12 +746,12 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_F8_E4M3:
+            return convert_unary_cont_cuda<ggml_fp8_e4m3_t>;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
-        case GGML_TYPE_F8_E4M3: // [TAG_FP8_KV]
-            return convert_unary_cont_cuda<ggml_fp8_e4m3_t>;
         default:
             return nullptr;
     }
@@ -830,12 +830,12 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_turbo3_0_cuda;
         case GGML_TYPE_TURBO4_0:
             return dequantize_row_turbo4_0_cuda;
+        case GGML_TYPE_F8_E4M3:
+            return convert_unary_cont_cuda<ggml_fp8_e4m3_t>;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
             return convert_unary_cont_cuda<nv_bfloat16>;
-        case GGML_TYPE_F8_E4M3: // [TAG_FP8_KV]
-            return convert_unary_cont_cuda<ggml_fp8_e4m3_t>;
         default:
             return nullptr;
     }
@@ -911,12 +911,12 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_turbo3_0_cuda;
         case GGML_TYPE_TURBO4_0:
             return dequantize_row_turbo4_0_cuda;
+        case GGML_TYPE_F8_E4M3:
+            return convert_unary_cont_cuda<ggml_fp8_e4m3_t>;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:
             return convert_unary_cont_cuda<nv_bfloat16>;
-        case GGML_TYPE_F8_E4M3: // [TAG_FP8_KV]
-            return convert_unary_cont_cuda<ggml_fp8_e4m3_t>;
         default:
             return nullptr;
     }
@@ -962,10 +962,10 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK_TURBO3, QR_TURBO3, dequantize_turbo3_0>;
         case GGML_TYPE_TURBO4_0:
             return dequantize_block_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
+        case GGML_TYPE_F8_E4M3:
+            return convert_unary_cuda<ggml_fp8_e4m3_t>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16>;
-        case GGML_TYPE_F8_E4M3: // [TAG_FP8_KV]
-            return convert_unary_cuda<ggml_fp8_e4m3_t>;
         default:
             return nullptr;
     }
@@ -1011,10 +1011,10 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK_TURBO3, QR_TURBO3, dequantize_turbo3_0>;
         case GGML_TYPE_TURBO4_0:
             return dequantize_block_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
+        case GGML_TYPE_F8_E4M3:
+            return convert_unary_cuda<ggml_fp8_e4m3_t>;
         case GGML_TYPE_F16:
             return convert_unary_cuda<half, nv_bfloat16>;
-        case GGML_TYPE_F8_E4M3: // [TAG_FP8_KV]
-            return convert_unary_cuda<ggml_fp8_e4m3_t, nv_bfloat16>;
         default:
             return nullptr;
     }
@@ -1060,10 +1060,10 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK_TURBO3, QR_TURBO3, dequantize_turbo3_0>;
         case GGML_TYPE_TURBO4_0:
             return dequantize_block_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
+        case GGML_TYPE_F8_E4M3:
+            return convert_unary_cuda<ggml_fp8_e4m3_t>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16, float>;
-        case GGML_TYPE_F8_E4M3: // [TAG_FP8_KV]
-            return convert_unary_cuda<ggml_fp8_e4m3_t, float>;
         default:
             return nullptr;
     }

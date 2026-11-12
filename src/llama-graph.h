@@ -47,8 +47,6 @@ enum llm_graph_type {
 
 enum llm_fused_op {
     LLM_FUSED_OP_FLASH_ATTN,
-    LLM_FUSED_OP_GDN_AR,
-    LLM_FUSED_OP_GDN_CH,
     LLM_FUSED_OP_LIGHTNING_INDEXER,
     LLM_FUSED_OP_DSV4_HC_PRE,
     LLM_FUSED_OP_DSV4_HC_COMB,
@@ -974,6 +972,8 @@ public:
 
     int64_t get_max_nodes() const;
 
+    void set_max_nodes(int64_t max_nodes);
+
     void reset();
 
     void set_inputs(const llama_ubatch * ubatch);
@@ -1027,9 +1027,9 @@ public:
 
     ggml_cgraph * gf;
 
+private:
     int64_t max_nodes;
 
-private:
     // keep a copy of the previous graph parameters
     // we will use this to determine whether the graph can be reused by comparing them with the new parameters
     // note: these are updated after constructing the new graph

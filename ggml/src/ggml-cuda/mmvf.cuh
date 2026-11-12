@@ -20,4 +20,4 @@ void ggml_cuda_mul_mat_f_few_rows(ggml_backend_cuda_context & ctx, const ggml_te
 bool ggml_cuda_should_use_mm_skinny(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 
 void ggml_cuda_mul_mat_f_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
-bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);
+bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, int64_t ne11);

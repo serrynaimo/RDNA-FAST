@@ -402,7 +402,7 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_float((const nv_bfloat16 *) src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
-        case GGML_TYPE_F8_E4M3: // [TAG_FP8_KV]
+        case GGML_TYPE_F8_E4M3:
             get_rows_cuda_float((const ggml_fp8_e4m3_t *) src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
