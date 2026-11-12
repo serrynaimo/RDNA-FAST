@@ -12,6 +12,7 @@ import {
 	buildBrowserInfoToolDefinition,
 	buildGetDatetimeToolDefinition,
 	buildReadMediaToolDefinition,
+	buildSearchChatsToolDefinition,
 	DISABLED_TOOL_CATEGORIES_LOCALSTORAGE_KEY,
 	DISABLED_TOOL_KEYS_LOCALSTORAGE_KEY,
 	HOME_TILDE,
@@ -130,7 +131,9 @@ class ToolsStore {
 			// [RDNA-FAST] Keenable web search and page reading, keyless, on by default
 			buildWebSearchToolDefinition(),
 			buildWebFetchToolDefinition(),
-			buildSandboxToolDefinition(!!settingsStore.config.symbolicMathEnabled)
+			buildSandboxToolDefinition(!!settingsStore.config.symbolicMathEnabled),
+			// disabled by default, see searchChatsDefaultDisabledMigration
+			buildSearchChatsToolDefinition()
 		];
 		const readMedia = this.readMediaTool();
 
