@@ -132,7 +132,6 @@ class ToolsStore {
 			buildWebFetchToolDefinition(),
 			buildSandboxToolDefinition(!!settingsStore.config.symbolicMathEnabled)
 		];
-
 		const readMedia = this.readMediaTool();
 
 		if (readMedia) tools.push(readMedia);
