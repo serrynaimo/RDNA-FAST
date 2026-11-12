@@ -2980,6 +2980,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.ram_keep_gib = f;
         }
     ).set_env("LLAMA_ARG_RAM_KEEP_GIB"));
+    // [TAG_EH_FILE_READ]
+    add_opt(common_arg(
+        {"--expert-copy"}, "DIR",
+        "expert handoff: read the experts outside VRAM and the RAM copy from copies of the model files in DIR (a folder "
+        "or a drive), made there at load when missing or out of date (needs the model's size free); faster prompts, "
+        "longer answers can be slower (default: none, read through the mapped model)",
+        [](common_params & params, const std::string & value) {
+            params.expert_copy = value;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_COPY"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

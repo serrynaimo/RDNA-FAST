@@ -128,17 +128,37 @@ struct ggml_upload_engine_stats {
     uint64_t n_dma;           // DMAs (runs of pieces)
     uint64_t bytes;           // bytes sent
     uint64_t n_gathers;       // gather kernels
-    uint64_t copy_ns;         // the host copy threads' time in memcpy (summed over the threads)
+    uint64_t copy_ns;         // the host copy threads' time in memcpy and file reads (summed over the threads)
     uint64_t wait_ring_ns;    // the issuer waiting for gathers to free ring space (the device is the bottleneck)
     uint64_t wait_copy_ns;    // the issuer waiting for host copies (the host memory is the bottleneck)
     uint64_t wait_gather_ns;  // gathers waiting on the host for their pieces' DMAs to be sent
     uint64_t dropped;         // pieces pushed and never gathered
+    uint64_t read_bytes;      // [TAG_EH_DIRECT_READ] bytes read from files (alignment included)
+    uint64_t read_ns;         // the copy threads' time in those reads (summed over the threads)
+    uint64_t n_reads;         // reads
+    uint64_t n_read_failed;   // reads that failed or came back short (their pieces were copied from memory instead)
+};
+
+// [TAG_EH_DIRECT_READ] a file the engine reads pieces from, straight into its pinned staging buffers: the experts of a
+// prompt that are neither in VRAM nor in the RAM copy (llama.cpp: from a copy of the model file, --expert-copy).
+// Through the mapping they came in by page faults, a few dozen KiB per fault; as positioned reads the pieces of a layer
+// that are adjacent in the file go as one read. The reads start, end and land on multiples of align (1 for buffered
+// reads; unbuffered ones need the sector size, and the engine reads a little around each run of pieces).
+struct ggml_upload_file {
+    // reads bytes at offset off into dst: the bytes read (fewer at the end of the file), negative on an error
+    int64_t (*read)(void * ctx, void * dst, uint64_t off, size_t bytes);
+    void *  ctx;
+    size_t  align;
 };
 
 typedef ggml_upload_engine_t (*ggml_upload_engine_new_t)      (void * backend, const struct ggml_upload_engine_params * params);
 typedef void                 (*ggml_upload_engine_free_t)     (ggml_upload_engine_t eng);
 // returns the piece's index, or -1 if it is larger than a staging buffer
 typedef int64_t              (*ggml_upload_engine_push_t)     (ggml_upload_engine_t eng, const void * src, size_t bytes);
+// [TAG_EH_DIRECT_READ] a piece read from file at off; src holds the same bytes in host memory (the mapping), copied
+// instead if the read fails. The file must outlive the pieces pushed from it.
+typedef int64_t              (*ggml_upload_engine_push_file_t)(ggml_upload_engine_t eng, const struct ggml_upload_file * file,
+                                                               uint64_t off, const void * src, size_t bytes);
 // on backend's stream (a backend of the engine's device): dst[copies[i].dst_off ...] = the copies, after their DMAs
 typedef bool                 (*ggml_upload_engine_gather_t)   (ggml_upload_engine_t eng, void * backend, void * dst,
                                                                const struct ggml_upload_copy * copies, int n_copies);

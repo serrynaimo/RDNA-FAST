@@ -1821,6 +1821,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
+    mparams.expert_copy     = params.expert_copy.empty() ? nullptr : params.expert_copy.c_str(); // [TAG_EH_FILE_READ]
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

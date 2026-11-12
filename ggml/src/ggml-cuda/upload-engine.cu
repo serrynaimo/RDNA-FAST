@@ -84,21 +84,40 @@ int64_t ue_now_ns() {
 
 struct ggml_upload_engine {
     struct piece {
-        const uint8_t * src;
         size_t  bytes;
         int64_t job;
-        size_t  job_off;
+        size_t  job_off;          // where its bytes are in the job's staging buffer and ring space
+    };
+    // [TAG_EH_DIRECT_READ] pieces adjacent in one file, read together: their bytes [lo, hi) of the file, which are at
+    // src in host memory (copied from there if a read fails)
+    struct run {
+        const ggml_upload_file * file;
+        uint64_t                 lo, hi;
+        const uint8_t *          src;
+    };
+    // a copy thread's work: the memcpy of a piece, or one read of (a part of) a run, aligned
+    struct unit {
+        const uint8_t *          src;       // the memcpy's source; NULL: a read
+        const ggml_upload_file * file;
+        uint64_t                 file_off;  // the read's start
+        size_t                   stage_off; // where it lands in the job's staging buffer
+        size_t                   bytes;
+        int32_t                  run;       // the read's run in the job
     };
     struct job {
         int64_t  p0 = 0, p1 = 0;  // its pieces [p0, p1)
-        size_t   bytes = 0;
+        size_t   bytes = 0;       // of its staging buffer (alignment gaps included)
         size_t   ring_off = 0;
         uint64_t vstart = 0;      // its ring positions (the ring's bytes counted from the start, wraps included)
         uint64_t vend = 0;
         bool     closed = false;  // no more pieces: the copy threads may take it
         bool     copied = false;  // in its staging buffer
-        int64_t  left   = 0;      // pieces not yet copied, once admitted
+        int64_t  left   = 0;      // units not yet done, once admitted
+        std::vector<unit> units;
+        std::vector<run>  runs;
+        int32_t  open_run = -1;   // the run a file piece may extend: its units are the job's last
     };
+    static constexpr size_t unit_max = 2u*1024*1024; // the most bytes per read (several threads fill one buffer)
     // a gather's end: the ring before position v and the table before tpos are free once ev has completed
     struct done {
         uint64_t    v;
@@ -134,7 +153,7 @@ struct ggml_upload_engine {
     int64_t                 j_base = 0;
     int64_t                 n_jobs = 0;      // jobs made (the last may be open)
     int64_t                 n_claimed = 0;   // admitted: its staging buffer is free, its pieces are in `work`
-    std::deque<int64_t>     work;            // pieces of admitted jobs not yet taken by a copy thread
+    std::deque<std::pair<int64_t, int32_t>> work; // (job, unit) of admitted jobs not yet taken by a copy thread
     int64_t                 n_issued = 0;    // DMA queued
     int64_t                 claim_limit = INT64_MAX; // reset(): no claims at or past this
     uint64_t                vhead = 0;       // ring position of the next job
@@ -147,7 +166,8 @@ struct ggml_upload_engine {
     std::thread              issuer;
 
     std::atomic<uint64_t> st_pieces{0}, st_dma{0}, st_bytes{0}, st_gathers{0}, st_copy{0}, st_wait_ring{0},
-                          st_wait_copy{0}, st_wait_gather{0}, st_dropped{0};
+                          st_wait_copy{0}, st_wait_gather{0}, st_dropped{0},
+                          st_read_bytes{0}, st_read{0}, st_reads{0}, st_read_failed{0};
 
     piece & P(int64_t i) { return pieces[(size_t) (i - p_base)]; }
     job   & J(int64_t j) { return jobs[(size_t) (j - j_base)]; }
@@ -245,23 +265,113 @@ struct ggml_upload_engine {
         cv.notify_all();
     }
 
+    // under mtx: the open job, a new one if there is none or if it cannot take `bytes` more from position `from`
+    job & open_job(int64_t ip, size_t from, size_t bytes, bool & fresh) {
+        fresh = false;
+        if (n_jobs == 0 || J(n_jobs - 1).closed || from + bytes > p.stage_bytes) {
+            close_open();
+            jobs.emplace_back();
+            job & jb = jobs.back();
+            jb.p0 = jb.p1 = ip;
+            n_jobs++;
+            fresh = true;
+        }
+        return J(n_jobs - 1);
+    }
+
     int64_t push(const void * src, size_t bytes) {
         if (bytes == 0 || bytes > p.stage_bytes) {
             return -1;
         }
         std::lock_guard<std::mutex> lk(mtx);
         const int64_t ip = p_base + (int64_t) pieces.size();
-        if (n_jobs == 0 || J(n_jobs - 1).closed || J(n_jobs - 1).bytes + bytes > p.stage_bytes) {
-            close_open();
-            jobs.emplace_back();
-            job & jb = jobs.back();
-            jb.p0 = jb.p1 = ip;
-            n_jobs++;
-        }
-        job & jb = J(n_jobs - 1);
-        pieces.push_back({ (const uint8_t *) src, bytes, n_jobs - 1, jb.bytes });
+        bool fresh = false;
+        job & jb = open_job(ip, n_jobs > 0 ? J(n_jobs - 1).bytes : 0, bytes, fresh);
+        pieces.push_back({ bytes, n_jobs - 1, jb.bytes });
+        jb.units.push_back({ (const uint8_t *) src, nullptr, 0, jb.bytes, bytes, -1 });
+        jb.open_run = -1;
         jb.p1     = ip + 1;
         jb.bytes += bytes;
+        if (jb.bytes + 4096 > p.stage_bytes) {
+            close_open();
+        }
+        return ip;
+    }
+
+    // [TAG_EH_DIRECT_READ] the staging buffers can take reads aligned to a
+    bool stage_aligned(size_t a) const {
+        if (a == 0 || (a & (a - 1)) != 0 || p.stage_bytes % a != 0) {
+            return false;
+        }
+        for (const uint8_t * b : stage) {
+            if ((uintptr_t) b % a != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // [TAG_EH_DIRECT_READ] a piece read from a file: it extends the open run when it follows that run's last piece in
+    // the file (a layer's uncached experts in order: one read per few MiB), else it starts a run at an aligned place
+    int64_t push_file(const ggml_upload_file * f, uint64_t off, const void * src, size_t bytes) {
+        if (f == nullptr || f->read == nullptr || !stage_aligned(f->align) || bytes == 0 || bytes + 2*f->align > p.stage_bytes) {
+            return push(src, bytes);
+        }
+        const uint64_t a  = f->align;
+        const size_t   um = std::max<size_t>(a, unit_max/a*a);
+        std::lock_guard<std::mutex> lk(mtx);
+        const int64_t ip = p_base + (int64_t) pieces.size();
+        if (n_jobs > 0 && !J(n_jobs - 1).closed && J(n_jobs - 1).open_run >= 0) {
+            job & jb = J(n_jobs - 1);
+            run & r  = jb.runs[(size_t) jb.open_run];
+            unit & u = jb.units.back();
+            if (r.file == f && r.hi == off && r.src + (r.hi - r.lo) == (const uint8_t *) src) {
+                const uint64_t end  = (off + bytes + a - 1)/a*a;
+                const uint64_t have = u.file_off + u.bytes;
+                const size_t   grow = end > have ? (size_t) (end - have) : 0;
+                if (jb.bytes + grow <= p.stage_bytes) {
+                    pieces.push_back({ bytes, n_jobs - 1, u.stage_off + (size_t) (off - u.file_off) });
+                    size_t g = grow;
+                    const size_t add = std::min(g, um - std::min(um, u.bytes));
+                    u.bytes += add;
+                    g       -= add;
+                    uint64_t fo = u.file_off + u.bytes;
+                    size_t   so = u.stage_off + u.bytes;
+                    const int32_t ir = jb.open_run;
+                    while (g > 0) {
+                        const size_t n = std::min(g, um);
+                        jb.units.push_back({ nullptr, f, fo, so, n, ir });
+                        fo += n;
+                        so += n;
+                        g  -= n;
+                    }
+                    jb.bytes += grow;
+                    jb.runs[(size_t) ir].hi = off + bytes;
+                    jb.p1 = ip + 1;
+                    if (jb.bytes + 4096 > p.stage_bytes) {
+                        close_open();
+                    }
+                    return ip;
+                }
+            }
+        }
+        const uint64_t lo = off/a*a;
+        const uint64_t hi = (off + bytes + a - 1)/a*a;
+        const size_t   at = n_jobs > 0 ? (J(n_jobs - 1).bytes + a - 1)/a*a : 0;
+        bool fresh = false;
+        job & jb = open_job(ip, at, (size_t) (hi - lo), fresh);
+        const size_t s0 = fresh ? 0 : at;
+        const int32_t ir = (int32_t) jb.runs.size();
+        jb.runs.push_back({ f, off, off + bytes, (const uint8_t *) src });
+        jb.open_run = ir;
+        for (uint64_t fo = lo; fo < hi; ) {
+            const size_t n = (size_t) std::min<uint64_t>(hi - fo, um);
+            jb.units.push_back({ nullptr, f, fo, s0 + (size_t) (fo - lo), n, ir });
+            fo += n;
+        }
+        pieces.push_back({ bytes, n_jobs - 1, s0 + (size_t) (off - lo) });
+        jb.bytes = s0 + (size_t) (hi - lo);
+        jb.p1    = ip + 1;
         if (jb.bytes + 4096 > p.stage_bytes) {
             close_open();
         }
@@ -287,16 +397,30 @@ struct ggml_upload_engine {
                 return;
             }
             if (!work.empty()) {
-                const int64_t ip = work.front();
+                const int64_t j  = work.front().first;
+                const int32_t iu = work.front().second;
                 work.pop_front();
-                const piece & pc = P(ip);
-                const int64_t j = pc.job;
-                uint8_t * dst = stage[(size_t) (j % p.n_stage)] + pc.job_off;
-                const uint8_t * src = pc.src;
-                const size_t bytes = pc.bytes;
+                const job & jb = J(j);
+                const unit u = jb.units[(size_t) iu];
+                const run  r = u.run >= 0 ? jb.runs[(size_t) u.run] : run{};
+                uint8_t * dst = stage[(size_t) (j % p.n_stage)] + u.stage_off;
                 lk.unlock();
                 const int64_t t0 = ue_now_ns();
-                memcpy(dst, src, bytes);
+                if (u.src != nullptr) {
+                    memcpy(dst, u.src, u.bytes);
+                } else {
+                    // [TAG_EH_DIRECT_READ] the read must bring the run's bytes inside it; else they come from memory
+                    const int64_t  got = u.file->read(u.file->ctx, dst, u.file_off, u.bytes);
+                    const uint64_t nlo = std::max(u.file_off, r.lo);
+                    const uint64_t nhi = std::min<uint64_t>(u.file_off + u.bytes, r.hi);
+                    st_read.fetch_add((uint64_t) (ue_now_ns() - t0), std::memory_order_relaxed);
+                    st_reads.fetch_add(1, std::memory_order_relaxed);
+                    st_read_bytes.fetch_add(got > 0 ? (uint64_t) got : 0, std::memory_order_relaxed);
+                    if (nhi > nlo && (got < 0 || (uint64_t) got < nhi - u.file_off)) {
+                        st_read_failed.fetch_add(1, std::memory_order_relaxed);
+                        memcpy(dst + (nlo - u.file_off), r.src + (nlo - r.lo), (size_t) (nhi - nlo));
+                    }
+                }
                 st_copy.fetch_add((uint64_t) (ue_now_ns() - t0), std::memory_order_relaxed);
                 lk.lock();
                 if (--J(j).left == 0) {
@@ -315,9 +439,9 @@ struct ggml_upload_engine {
             }
             lk.lock();
             job & jb = J(j);
-            jb.left = jb.p1 - jb.p0;
-            for (int64_t i = jb.p0; i < jb.p1; ++i) {
-                work.push_back(i);
+            jb.left = (int64_t) jb.units.size();
+            for (int32_t i = 0; i < (int32_t) jb.units.size(); ++i) {
+                work.emplace_back(j, i);
             }
             if (jb.left == 0) {
                 jb.copied = true;
@@ -575,6 +699,11 @@ int64_t ggml_backend_cuda_upload_engine_push(ggml_upload_engine_t eng, const voi
     return eng->push(src, bytes);
 }
 
+int64_t ggml_backend_cuda_upload_engine_push_file(ggml_upload_engine_t eng, const ggml_upload_file * file, uint64_t off,
+                                                  const void * src, size_t bytes) {
+    return eng->push_file(file, off, src, bytes);
+}
+
 bool ggml_backend_cuda_upload_engine_gather(ggml_upload_engine_t eng, void * backend, void * dst,
                                             const ggml_upload_copy * copies, int n_copies) {
     ggml_backend_t be = (ggml_backend_t) backend;
@@ -600,4 +729,8 @@ void ggml_backend_cuda_upload_engine_get_stats(ggml_upload_engine_t eng, ggml_up
     st->wait_copy_ns   = eng->st_wait_copy.load();
     st->wait_gather_ns = eng->st_wait_gather.load();
     st->dropped        = eng->st_dropped.load();
+    st->read_bytes     = eng->st_read_bytes.load();
+    st->read_ns        = eng->st_read.load();
+    st->n_reads        = eng->st_reads.load();
+    st->n_read_failed  = eng->st_read_failed.load();
 }

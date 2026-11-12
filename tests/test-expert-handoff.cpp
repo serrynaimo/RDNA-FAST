@@ -777,6 +777,7 @@ struct ue_api {
     ggml_upload_engine_new_t       make   = nullptr;
     ggml_upload_engine_free_t      free   = nullptr;
     ggml_upload_engine_push_t      push   = nullptr;
+    ggml_upload_engine_push_file_t push_file = nullptr; // [TAG_EH_DIRECT_READ]
     ggml_upload_engine_gather_t    gather = nullptr;
     ggml_upload_engine_reset_t     reset  = nullptr;
     ggml_upload_engine_get_stats_t stats  = nullptr;
@@ -787,7 +788,39 @@ struct ue_api {
         gather = (ggml_upload_engine_gather_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_gather");
         reset  = (ggml_upload_engine_reset_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_reset");
         stats  = (ggml_upload_engine_get_stats_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_get_stats");
+        push_file = (ggml_upload_engine_push_file_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_push_file");
         return make && free && push && gather && reset && stats;
+    }
+};
+
+// [TAG_EH_DIRECT_READ] a "file" in memory for the contract test: its reads check the alignment an unbuffered read
+// needs, and a failing variant returns errors and short reads (the engine then copies from the mapping)
+struct ue_mem_file {
+    const std::vector<uint8_t> * data = nullptr;
+    size_t                       align = 4096;
+    uint32_t                     fail_every = 0; // 0: never; n: every n-th read fails or comes back short
+    std::atomic<uint32_t>        n_reads{0};
+    std::atomic<uint32_t>        n_misaligned{0};
+    ggml_upload_file             uf = {};
+
+    static int64_t read(void * ctx, void * dst, uint64_t off, size_t bytes) {
+        ue_mem_file * f = (ue_mem_file *) ctx;
+        const uint32_t k = ++f->n_reads;
+        if (off % f->align != 0 || bytes % f->align != 0 || (uintptr_t) dst % f->align != 0) {
+            f->n_misaligned++;
+        }
+        if (f->fail_every != 0 && k % f->fail_every == 0) {
+            if (k % (2*f->fail_every) == 0) {
+                return -1;
+            }
+            bytes = bytes > f->align ? f->align : 0; // short
+        }
+        if (off >= f->data->size()) {
+            return 0;
+        }
+        const size_t n = std::min<size_t>(bytes, f->data->size() - (size_t) off);
+        memcpy(dst, f->data->data() + off, n);
+        return (int64_t) n;
     }
 };
 
@@ -816,7 +849,15 @@ static int run_upload_engine_test() {
     for (auto & b : dsrc_h) { b = (uint8_t) rng(); }
     ggml_backend_tensor_set(dsrc, dsrc_h.data(), 0, dsrc_h.size());
 
-    struct ent { int kind; size_t src_off; size_t dst_off; size_t bytes; int64_t piece; }; // kind 0 piece, 1 device, 2 zeros
+    struct ent { int kind; size_t src_off; size_t dst_off; size_t bytes; int64_t piece; }; // kind 0 piece, 1 device, 2 zeros, 3 file piece
+    // [TAG_EH_DIRECT_READ] file pieces: host as a file, and from graph 12 on (odd graphs) a file whose reads fail now and then
+    ue_mem_file mf, mf_bad;
+    mf.data = &host;
+    mf.uf = { ue_mem_file::read, &mf, mf.align };
+    mf_bad.data = &host;
+    mf_bad.fail_every = 7;
+    mf_bad.uf = { ue_mem_file::read, &mf_bad, mf_bad.align };
+    const bool have_file = ue.push_file != nullptr;
     int n_fail = 0, n_gathers = 0, n_entries = 0;
     std::vector<uint8_t> got(ggml_nbytes(dst)), want(ggml_nbytes(dst));
     for (int graph = 0; graph < 24 && n_fail == 0; ++graph) {
@@ -829,9 +870,16 @@ static int run_upload_engine_test() {
             for (int k = 0; k < n_e; ++k) {
                 ent e;
                 const uint32_t r = rng() % 100;
-                e.kind = r < 60 ? 0 : r < 85 ? 1 : 2;
-                e.bytes = 1 + rng() % (e.kind == 0 ? up.stage_bytes : 64u << 10);
-                e.src_off = rng() % ((e.kind == 0 ? host.size() : dsrc_h.size()) - e.bytes);
+                e.kind = r < 35 ? 0 : r < 70 ? 3 : r < 88 ? 1 : 2;
+                if (e.kind == 3 && !have_file) { e.kind = 0; }
+                // file pieces: up to the largest that fits a staging buffer with its alignment; half of them follow
+                // the previous file piece in the file (a run the engine reads at once)
+                e.bytes = 1 + rng() % (e.kind == 0 ? up.stage_bytes : e.kind == 3 ? up.stage_bytes - 2*mf.align : 64u << 10);
+                e.src_off = rng() % ((e.kind == 0 || e.kind == 3 ? host.size() : dsrc_h.size()) - e.bytes);
+                if (e.kind == 3 && !g.empty() && g.back().kind == 3 && rng() % 2 == 0 &&
+                        g.back().src_off + g.back().bytes + e.bytes <= host.size()) {
+                    e.src_off = g.back().src_off + g.back().bytes;
+                }
                 if (at + e.bytes > got.size()) { break; }
                 e.dst_off = at;
                 e.piece = -1;
@@ -845,6 +893,10 @@ static int run_upload_engine_test() {
                     if (rng() % 8 == 0) { ue.push(eng, host.data() + rng() % (host.size() - 4096), 1 + rng() % 4096); } // skipped
                     e.piece = ue.push(eng, host.data() + e.src_off, e.bytes);
                     if (e.piece < 0) { fprintf(stderr, "push refused %zu bytes\n", e.bytes); n_fail++; }
+                } else if (e.kind == 3) {
+                    const ggml_upload_file * f = graph >= 12 && graph % 2 == 1 ? &mf_bad.uf : &mf.uf;
+                    e.piece = ue.push_file(eng, f, e.src_off, host.data() + e.src_off, e.bytes);
+                    if (e.piece < 0) { fprintf(stderr, "push_file refused %zu bytes\n", e.bytes); n_fail++; }
                 }
             }
         };
@@ -858,7 +910,7 @@ static int run_upload_engine_test() {
             std::vector<ggml_upload_copy> cps;
             for (const ent & e : g) {
                 ggml_upload_copy c = { e.piece, nullptr, e.dst_off, e.bytes };
-                if (e.kind == 0) {
+                if (e.kind == 0 || e.kind == 3) {
                     memcpy(want.data() + e.dst_off, host.data() + e.src_off, e.bytes);
                 } else if (e.kind == 1) {
                     c.src = (const uint8_t *) dsrc->data + e.src_off;
@@ -888,9 +940,19 @@ static int run_upload_engine_test() {
     }
     ggml_upload_engine_stats st = {};
     ue.stats(eng, &st);
-    printf("upload engine: %d gathers of %d ranges, %llu pieces in %llu DMAs (%.1f MB), %llu dropped: %s\n", n_gathers,
+    if (!have_file) {
+        fprintf(stderr, "the engine has no push_file\n");
+        n_fail++;
+    }
+    if (mf.n_misaligned + mf_bad.n_misaligned > 0) {
+        fprintf(stderr, "%u file reads were not aligned to %zu\n", (unsigned) (mf.n_misaligned + mf_bad.n_misaligned), mf.align);
+        n_fail++;
+    }
+    printf("upload engine: %d gathers of %d ranges, %llu pieces in %llu DMAs (%.1f MB), %llu dropped; %llu file reads "
+        "(%.1f MB), %llu failed or short: %s\n", n_gathers,
         n_entries, (unsigned long long) st.n_pieces, (unsigned long long) st.n_dma, st.bytes/1e6,
-        (unsigned long long) st.dropped, n_fail == 0 ? "OK" : "FAIL");
+        (unsigned long long) st.dropped, (unsigned long long) st.n_reads, st.read_bytes/1e6,
+        (unsigned long long) st.n_read_failed, n_fail == 0 ? "OK" : "FAIL");
     ue.free(eng);
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);

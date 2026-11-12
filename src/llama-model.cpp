@@ -42,6 +42,7 @@
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <filesystem>
 #include <map>
 #include <numeric>
 #include <regex>
@@ -1302,6 +1303,11 @@ struct llama_model::impl {
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
 
+    // ROCmFPX [TAG_EH_DIRECT_READ] the file of each mapping (mappings[i])
+    std::vector<std::string> mapping_paths;
+    // ROCmFPX [TAG_EH_FILE_READ] model file -> its copy (make_expert_copies)
+    std::map<std::string, std::string> expert_copies;
+
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
@@ -2095,8 +2101,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (use_mmap_buffer) {
-        for (auto & mapping : ml.mappings) {
-            pimpl->mappings.emplace_back(std::move(mapping));
+        for (size_t i = 0; i < ml.mappings.size(); ++i) {
+            pimpl->mappings.emplace_back(std::move(ml.mappings[i]));
+            pimpl->mapping_paths.push_back(i < ml.files.size() ? ml.files[i]->name() : std::string()); // [TAG_EH_DIRECT_READ]
         }
     }
 
@@ -2918,6 +2925,80 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+// ROCmFPX [TAG_EH_DIRECT_READ]
+bool llama_model::mapped_file_of(const void * p, std::string & path, uint64_t & off) const {
+    for (size_t i = 0; i < pimpl->mappings.size() && i < pimpl->mapping_paths.size(); ++i) {
+        const auto & m = pimpl->mappings[i];
+        const uint8_t * a = m ? (const uint8_t *) m->addr() : nullptr;
+        if (a != nullptr && !pimpl->mapping_paths[i].empty() && (const uint8_t *) p >= a && (const uint8_t *) p < a + m->size()) {
+            path = pimpl->mapping_paths[i];
+            off  = (uint64_t) ((const uint8_t *) p - a);
+            return true;
+        }
+    }
+    return false;
+}
+
+// ROCmFPX [TAG_EH_FILE_READ]
+void llama_model::make_expert_copies(const llama_model_loader & ml, const std::string & dir) {
+    namespace fs = std::filesystem;
+    for (const auto & file : ml.files) {
+        const std::string path = file->name();
+        std::error_code ec;
+        const fs::path src = fs::u8path(path);
+        const fs::path dst = fs::u8path(dir) / src.filename();
+        const uintmax_t n = fs::file_size(src, ec);
+        const auto      t = fs::last_write_time(src, ec);
+        if (ec) {
+            LLAMA_LOG_WARN("%s: %s: %s, read through the mapping\n", __func__, path.c_str(), ec.message().c_str());
+            continue;
+        }
+        std::error_code e1, e2;
+        if (fs::file_size(dst, e1) == n && !e1 && fs::last_write_time(dst, e2) == t && !e2) {
+            pimpl->expert_copies[path] = dst.u8string();
+            LLAMA_LOG_INFO("%s: the copy %s is current\n", __func__, dst.u8string().c_str());
+            continue;
+        }
+        fs::create_directories(dst.parent_path(), ec);
+        const uintmax_t had = fs::exists(dst, e1) ? fs::file_size(dst, e2) : 0;
+        const fs::space_info sp = fs::space(dst.parent_path(), ec);
+        const uintmax_t spare = (uintmax_t) 8 << 30;
+        if (ec || sp.available + (e2 ? 0 : had) < n + spare) {
+            LLAMA_LOG_WARN("%s: no room for a %.1f GB copy of %s in %s (%.1f GB free, 8 GiB kept); its experts are read "
+                "through the mapping\n", __func__, n/1e9, src.filename().u8string().c_str(), dir.c_str(), ec ? 0.0 : sp.available/1e9);
+            continue;
+        }
+        fs::path tmp = dst;
+        tmp += ".partial";
+        LLAMA_LOG_WARN("%s: copying %s (%.1f GB) to %s for the expert reads\n", __func__, path.c_str(), n/1e9, dir.c_str());
+        const int64_t t0 = ggml_time_us();
+        std::string err;
+        if (!llama_file_copy(path, tmp.u8string(), err)) {
+            fs::remove(tmp, ec);
+            LLAMA_LOG_WARN("%s: the copy failed (%s); its experts are read through the mapping\n", __func__, err.c_str());
+            continue;
+        }
+        fs::rename(tmp, dst, ec);
+        if (ec) {
+            fs::remove(tmp, e1);
+            LLAMA_LOG_WARN("%s: %s: %s; its experts are read through the mapping\n", __func__, dst.u8string().c_str(), ec.message().c_str());
+            continue;
+        }
+        const double s = (ggml_time_us() - t0)/1e6;
+        LLAMA_LOG_WARN("%s: copied in %.1f s (%.2f GB/s)\n", __func__, s, s > 0 ? n/1e9/s : 0.0);
+        pimpl->expert_copies[path] = dst.u8string();
+    }
+}
+
+bool llama_model::expert_copy_of(const std::string & path, std::string & copy) const {
+    const auto it = pimpl->expert_copies.find(path);
+    if (it == pimpl->expert_copies.end()) {
+        return false;
+    }
+    copy = it->second;
+    return true;
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {
@@ -3602,6 +3683,7 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.expert_copy                 =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

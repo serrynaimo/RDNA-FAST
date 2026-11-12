@@ -713,7 +713,7 @@ struct ggml_expert_handoff_host {
     int64_t de(int32_t e) const { return sim_resident > 0 ? e % sim_resident : e; }
 
     // [TAG_EH_POOL2] the phases
-    enum { PH_XQ = 0, PH_GU = 1, PH_HQ = 2, PH_DN = 3 };
+    enum { PH_XQ = 0, PH_GU = 1, PH_HQ = 2, PH_DN = 3, PH_FETCH = 4 };
     alignas(64) std::atomic<uint64_t> claim{0};   // generation (24 bits) << 40 | tasks (20) << 20 | next task (20)
     alignas(64) std::atomic<uint32_t> gen{0};     // the generation of the last published phase
     alignas(64) std::atomic<int32_t>  n_done{0};  // tasks of the current phase finished
@@ -767,6 +767,26 @@ struct ggml_expert_handoff_host {
     int64_t t_prev_end = 0;                  // worker 0: when the last answer was stored
     std::atomic<uint64_t> st_read_copy{0};   // [TAG_EH_RESIDENT]
     std::atomic<uint64_t> st_read_tensor{0};
+
+    // [TAG_EH_FILE_READ] the job's missed experts outside the RAM copy, read from file copies into stg before the
+    // gate/up phase (one read per expert and tensor, spread over the workers); stg_ptr[k][expert] is the staged start
+    // of tensor kind k (0 gate, 1 up, 2 gate_up, 3 down), set for this job only
+    struct eh_fetch {
+        int      k;
+        int64_t  ed;
+        uint64_t aoff;   // the aligned read
+        size_t   alen;
+        size_t   dst;    // its place in stg
+        size_t   skip;   // the expert's start in it
+    };
+    std::vector<eh_fetch> fetch;
+    std::vector<uint8_t>  stg_v;
+    uint8_t *             stg     = nullptr;
+    size_t                stg_cap = 0;
+    std::vector<const uint8_t *> stg_ptr[4];
+    std::atomic<uint64_t> st_file_bytes{0};
+    std::atomic<uint64_t> st_file_ns{0};
+    std::atomic<uint64_t> st_file_fail{0};
     int32_t job_il = -1;
     int64_t t_seen = 0;
 
@@ -876,6 +896,7 @@ struct ggml_expert_handoff_host {
                 case PH_GU: task_gu(u0, u1); break;
                 case PH_HQ: task_hq(u0, u1); break;
                 case PH_DN: task_dn(iw, u0, u1); break;
+                case PH_FETCH: task_fetch(u0, u1); break;
                 default: break;
             }
             n_done.fetch_add(1, std::memory_order_release);
@@ -909,6 +930,12 @@ struct ggml_expert_handoff_host {
         }
         seq = s;
         t_seen = eh_now_ns();
+
+        // [TAG_EH_FILE_READ] the last job's staged experts are gone
+        for (const eh_fetch & f : fetch) {
+            stg_ptr[f.k][f.ed] = nullptr;
+        }
+        fetch.clear();
 
         const int32_t il = hdr->layer;
         job_il = il;
@@ -992,6 +1019,41 @@ struct ggml_expert_handoff_host {
             st_read_tensor.fetch_add(uniq.size() - n_copy, std::memory_order_relaxed);
         }
 
+        // [TAG_EH_FILE_READ] the distinct missed experts outside the RAM copy, per tensor, read from the file copies
+        {
+            const void * const * srcs[4] = { L.l.gate_src, L.l.up_src, L.l.gate_up_src, L.l.down_src };
+            const ggml_tensor *  ts[4]   = { L.l.gate, L.l.up, L.l.gate_up, L.l.down };
+            size_t total = 0;
+            for (const int32_t e : uniq) {
+                const int64_t ed = de(e);
+                for (int k = 0; k < 4; ++k) {
+                    if (ts[k] == nullptr || L.l.file_read[k] == nullptr || (srcs[k] != nullptr && srcs[k][ed] != nullptr)) {
+                        continue;
+                    }
+                    const size_t   a    = std::max<size_t>(1, L.l.file_align[k]);
+                    const uint64_t off  = L.l.file_off[k] + (uint64_t) ed*ts[k]->nb[2];
+                    const uint64_t aoff = off/a*a;
+                    const uint64_t aend = (off + ts[k]->nb[2] + a - 1)/a*a;
+                    const size_t   dst  = (total + std::max<size_t>(a, 64) - 1)/std::max<size_t>(a, 64)*std::max<size_t>(a, 64);
+                    total = dst + (size_t) (aend - aoff);
+                    fetch.push_back({ k, ed, aoff, (size_t) (aend - aoff), dst, (size_t) (off - aoff) });
+                }
+            }
+            if (!fetch.empty()) {
+                if (total > stg_cap) {
+                    // 4 KiB aligned: unbuffered reads land on sector multiples
+                    stg_v.assign(total + 4096, 0);
+                    stg     = (uint8_t *) (((uintptr_t) stg_v.data() + 4095) & ~(uintptr_t) 4095);
+                    stg_cap = total;
+                }
+                for (int k = 0; k < 4; ++k) {
+                    if (ts[k] != nullptr && (int64_t) stg_ptr[k].size() != L.n_expert) {
+                        stg_ptr[k].assign(L.n_expert, nullptr);
+                    }
+                }
+            }
+        }
+
         st_layers.fetch_add(1, std::memory_order_relaxed);
         st_routed.fetch_add((uint64_t) n_tokens*n_used, std::memory_order_relaxed);
         st_host.fetch_add(misses.size(), std::memory_order_relaxed);
@@ -1032,28 +1094,52 @@ struct ggml_expert_handoff_host {
         }
     }
 
-    // [TAG_EH_RESIDENT] where expert e of t starts: its copy if src has one, else in the tensor
-    const uint8_t * expert_base(const ggml_tensor * t, const void * const * src, int32_t e) const {
+    // [TAG_EH_RESIDENT] where expert e of t (kind k: 0 gate, 1 up, 2 gate_up, 3 down) starts: its copy if src has
+    // one, else its staged read from a file copy [TAG_EH_FILE_READ], else in the tensor
+    const uint8_t * expert_base(const ggml_tensor * t, const void * const * src, int32_t e, int k) const {
         const int64_t ed = de(e);
         if (src != nullptr && src[ed] != nullptr) {
             return (const uint8_t *) src[ed];
         }
+        if (!stg_ptr[k].empty() && stg_ptr[k][ed] != nullptr) {
+            return stg_ptr[k][ed];
+        }
         return (const uint8_t *) t->data + ed*t->nb[2];
+    }
+
+    // [TAG_EH_FILE_READ] fetch units [u0, u1): each read into its place in stg; a short or failed read leaves the
+    // expert to the tensor
+    void task_fetch(int64_t u0, int64_t u1) {
+        const eh_layer & J = *job_layer;
+        const ggml_tensor * ts[4] = { J.l.gate, J.l.up, J.l.gate_up, J.l.down };
+        uint64_t bytes = 0, fail = 0;
+        for (int64_t i = u0; i < u1; ++i) {
+            const eh_fetch & f = fetch[i];
+            const int64_t n = J.l.file_read[f.k](J.l.file_ctx[f.k], stg + f.dst, f.aoff, f.alen);
+            if (n >= (int64_t) (f.skip + ts[f.k]->nb[2])) {
+                stg_ptr[f.k][f.ed] = stg + f.dst + f.skip;
+                bytes += (uint64_t) n;
+            } else {
+                fail++;
+            }
+        }
+        st_file_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        st_file_fail.fetch_add(fail, std::memory_order_relaxed);
     }
 
     // gate/up row r (0 .. gu_rows - 1: gate rows first, or the up rows alone without a gate) of expert e
     const uint8_t * gu_row(const eh_layer & J, int32_t e, int64_t r) const {
         if (J.l.gate_up) {
             const ggml_tensor * t = J.l.gate_up;
-            return expert_base(t, J.l.gate_up_src, e) + r*t->nb[1];
+            return expert_base(t, J.l.gate_up_src, e, 2) + r*t->nb[1];
         }
         if (!J.has_gate) {
             const ggml_tensor * t = J.l.up;
-            return expert_base(t, J.l.up_src, e) + r*t->nb[1];
+            return expert_base(t, J.l.up_src, e, 1) + r*t->nb[1];
         }
         const bool g = r < J.n_ff;
         const ggml_tensor * t = g ? J.l.gate : J.l.up;
-        return expert_base(t, g ? J.l.gate_src : J.l.up_src, e) + (r % J.n_ff)*t->nb[1];
+        return expert_base(t, g ? J.l.gate_src : J.l.up_src, e, g ? 0 : 1) + (r % J.n_ff)*t->nb[1];
     }
 
     float gu_scale(const eh_layer & J, int32_t e, int64_t r) const {
@@ -1222,7 +1308,7 @@ struct ggml_expert_handoff_host {
         std::fill(s_.begin(), s_.begin() + nt*nc, 0.0f);
         for (size_t u = 0; u < uniq.size(); ++u) {
             const int32_t e = uniq[u];
-            const uint8_t * base = expert_base(dn, J.l.down_src, e);
+            const uint8_t * base = expert_base(dn, J.l.down_src, e, 3);
             const float sc = J.l.down_scale ? J.l.down_scale[e] : 1.0f;
             const float * bias = J.l.down_bias ? J.l.down_bias + (int64_t) e*J.n_embd : nullptr;
             for (int32_t k0 = uniq_begin[u]; k0 < uniq_begin[u + 1]; k0 += eh_multi_max) {
@@ -1304,6 +1390,11 @@ struct ggml_expert_handoff_host {
             const bool ran = job_layer != nullptr && !misses.empty() && !sim_nohost;
             if (ran) {
                 const eh_layer & J = *job_layer;
+                if (!fetch.empty()) { // [TAG_EH_FILE_READ]
+                    const int64_t tf = eh_now_ns();
+                    run_phase(PH_FETCH, (int64_t) fetch.size(), 0);
+                    st_file_ns.fetch_add((uint64_t) (eh_now_ns() - tf), std::memory_order_relaxed);
+                }
                 run_phase(PH_XQ, (int64_t) miss_tokens.size(), 4);
                 t_step[0] = eh_now_ns();
                 run_phase(PH_GU, (int64_t) uniq.size()*J.n_ff, 0);
@@ -1499,6 +1590,9 @@ void ggml_expert_handoff_host_get_stats(ggml_expert_handoff_host_t h, ggml_exper
     st->n_read_copy   = h->st_read_copy.load();
     st->n_read_tensor = h->st_read_tensor.load();
     st->n_workers     = h->n_workers;
+    st->file_bytes    = h->st_file_bytes.load(); // [TAG_EH_FILE_READ]
+    st->file_ns       = h->st_file_ns.load();
+    st->n_file_fail   = h->st_file_fail.load();
 }
 
 const uint64_t * ggml_expert_handoff_host_counts(ggml_expert_handoff_host_t h, int32_t il) {

@@ -384,6 +384,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {0, model_ptr.release()};
         }
 
+        // [TAG_EH_FILE_READ] before load_tensors maps the files; not for a probe that only sizes the model (fit)
+        if (params.expert_copy != nullptr && params.expert_copy[0] != '\0' && !params.no_alloc) {
+            model->make_expert_copies(ml, params.expert_copy);
+        }
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }

@@ -8211,6 +8211,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_upload_engine_push") == 0) {
         return (void *)ggml_backend_cuda_upload_engine_push;
     }
+    if (strcmp(name, "ggml_backend_upload_engine_push_file") == 0) { // [TAG_EH_DIRECT_READ]
+        return (void *)ggml_backend_cuda_upload_engine_push_file;
+    }
     if (strcmp(name, "ggml_backend_upload_engine_gather") == 0) {
         return (void *)ggml_backend_cuda_upload_engine_gather;
     }

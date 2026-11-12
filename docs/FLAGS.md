@@ -75,6 +75,7 @@ cache. [More](expert-handoff.md)
 | `--expert-profile-save FILE` | none | writes this run's routing counts (plus those of `--expert-profile`) to `FILE` every 30 s of use and at exit |
 | `--ram-keep-gib N` | 4 | RAM left free for everything else; the experts the VRAM cache misses are copied into the rest (locked), the most used first, and the CPU reads them there |
 | `--resident-budget-gib N` | all that fits | at most `N` GiB for that RAM copy |
+| `--expert-copy DIR` | none | reads the experts outside VRAM and the RAM copy from copies of the model files in `DIR`, made there at load when missing or out of date ([copy the model](expert-handoff.md#copy-the-model-for-the-reads)) |
 
 ## Environment variables
 

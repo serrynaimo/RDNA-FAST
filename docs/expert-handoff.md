@@ -79,6 +79,7 @@ VRAM, Gemma 4 with half its experts on the CPU has a KL divergence of about 0.08
 | `--expert-profile-save FILE` | none | Writes the routing counts of this run (plus those of `--expert-profile`) to `FILE` every 30 s of use and at exit. |
 | `--ram-keep-gib N` | 4 | RAM left free for everything else. The experts the VRAM cache misses are copied into the rest, the most used first. |
 | `--resident-budget-gib N` | all that fits | At most `N` GiB for that RAM copy. |
+| `--expert-copy DIR` | none | Reads the experts outside VRAM and the RAM copy from copies of the model files in `DIR` (a folder or a drive), made there at load when missing or out of date ([Copy the model](#copy-the-model-for-the-reads)). |
 | `--pool-workers N` | one per physical core but one | CPU threads that compute the experts the cache misses. |
 | `--adapt-every N` | 4 | Every `N` decode steps, the most used experts outside the cache replace the least used ones in it (0 keeps the cache as it started). |
 | `--adapt-swaps N` | 96 | The most experts swapped per round. |
@@ -87,7 +88,10 @@ VRAM, Gemma 4 with half its experts on the CPU has a KL divergence of about 0.08
 - **RAM decides the speed.** The CPU computes its experts fastest from the RAM copy, and every expert that doesn't fit
   there is read from the model file, from the SSD if the system has pushed it out. Give the model all the RAM you can:
   close other programs, and lower `--ram-keep-gib` (say to 2) on a machine that runs nothing else. Flash-Next on a
-  20 GB card has about 20 GB of experts outside VRAM, so it runs best with 40 GB of RAM or more.
+  20 GB card has about 20 GB of experts outside VRAM, so it runs best with 40 GB of RAM or more. With 21 GB of RAM
+  free for it, `--ram-keep-gib 2` held 18 instead of 16 GiB of them: the 700-token prompt took 3.3-3.6 instead of
+  4.5 s and short answers ran about 15% faster, other answers as fast as with the default (2026-11-12), leaving the
+  rest of the system about 2 GiB.
 - **Save a profile for your work.** Without one, the cache starts with an even share of every layer's experts and the
   first answers are slower until it has learned. See [Profiles](#profiles).
 - **Drafting: MTP, not n-gram.** The MTP draft (`-md mtp-Qwen3.8-Flash-Next-Q4_0.gguf --spec-type draft-mtp
@@ -221,6 +225,31 @@ What helps:
 - **Patience after a load.** Experts outside the RAM copy come from the SSD until the file cache has them again:
   before the RAM copy, the first answers on Flash-Next came at 12.5 t/s. With every expert outside VRAM in the RAM
   copy, as in [Results](#results), the first answer after a load ran at 43.9 t/s.
+
+### Copy the model for the reads
+
+On Windows, every read of a file that a process has mapped takes about 10 ms longer, and the server maps the model.
+`--expert-copy DIR` reads the experts outside VRAM and the RAM copy from copies of the model files in `DIR` instead,
+which nobody maps: the prompt uploads and the CPU read them there through the file cache. A folder on another SSD
+adds that drive's speed; one on the same drive works too.
+
+The server makes the copies at load, before it maps the model: when a file is missing in `DIR` or differs in size or
+modification time, it copies it there (66.5 GB for Flash-Next took 23 s on PCIe 4 to PCIe 3), as long as the drive
+keeps 8 GiB free afterwards. Later loads use them as they are. To remove them, delete them.
+
+Flash-Next with MTP on the 20 GB card, 21 GB of RAM free for it (RAM copy 16 of 22.8 GiB), 2026-11-12:
+
+| | Mapped file | `--expert-copy` |
+| --- | ---: | ---: |
+| 700-token prompt | 4.5-4.6 s | **3.0-3.1 s** |
+| 3.8k-token prompt | 310-385 t/s | **408-414 t/s** |
+| 15k-token prompt | 411-421 t/s | 411-414 t/s |
+| Decode, short answers | 32.4-37.3 t/s | **40.9-41.4 t/s** |
+| Decode, copying a 1,200-token text | **70.5-73.0 t/s** | 56.1-60.2 t/s |
+| Decode, after a 3.8k-token prompt | **40.2-40.6 t/s** | 33.2-33.7 t/s |
+
+Longer answers after a prompt are slower: each token copies the experts it misses out of the file cache again, where
+the mapping reads them in place. With all the experts outside VRAM in the RAM copy, the copy has nothing to add.
 
 ## Limits
 

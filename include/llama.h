@@ -374,6 +374,10 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // ROCmFPX [TAG_EH_FILE_READ] a folder (or drive) for copies of the model files, made at load when missing or
+        // out of date; expert handoff reads the experts outside VRAM and its RAM copy from them. NULL = none
+        const char * expert_copy;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data

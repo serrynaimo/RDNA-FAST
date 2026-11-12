@@ -5,6 +5,7 @@
 #include "ggml.h"
 
 #include <cstring>
+#include <filesystem>
 #include <climits>
 #include <cstdlib>
 #include <stdexcept>
@@ -1147,6 +1148,37 @@ void llama_prefetch(llama_memory_ranges mr) {
 
 size_t llama_path_max() {
     return PATH_MAX;
+}
+
+bool llama_file_copy(const std::string & src, const std::string & dst, std::string & err) {
+#if defined(_WIN32)
+    auto wide = [](const std::string & s) {
+        const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+        std::wstring w(n > 0 ? (size_t) n : 1, L'\0');
+        if (n > 0) {
+            MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
+        }
+        return w;
+    };
+    // unbuffered: a model-sized copy would otherwise push everything else out of the file cache; CopyFileEx keeps the
+    // last write time
+    if (!CopyFileExW(wide(src).c_str(), wide(dst).c_str(), nullptr, nullptr, nullptr, COPY_FILE_NO_BUFFERING)) {
+        err = llama_format_win_err(GetLastError());
+        return false;
+    }
+    return true;
+#else
+    std::error_code ec;
+    std::filesystem::copy_file(src, dst, std::filesystem::copy_options::overwrite_existing, ec);
+    if (!ec) {
+        std::filesystem::last_write_time(dst, std::filesystem::last_write_time(src, ec), ec);
+    }
+    if (ec) {
+        err = ec.message();
+        return false;
+    }
+    return true;
+#endif
 }
 
 #if defined(_WIN32)

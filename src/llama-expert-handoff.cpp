@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <sstream>
@@ -34,6 +35,7 @@
 #endif
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -172,6 +174,7 @@ struct eh_upload_api {
     ggml_upload_engine_new_t       make   = nullptr;
     ggml_upload_engine_free_t      free   = nullptr;
     ggml_upload_engine_push_t      push   = nullptr;
+    ggml_upload_engine_push_file_t push_file = nullptr; // [TAG_EH_DIRECT_READ] optional
     ggml_upload_engine_gather_t    gather = nullptr;
     ggml_upload_engine_reset_t     reset  = nullptr;
     ggml_upload_engine_get_stats_t stats  = nullptr;
@@ -183,7 +186,113 @@ struct eh_upload_api {
         gather = (ggml_upload_engine_gather_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_gather");
         reset  = (ggml_upload_engine_reset_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_reset");
         stats  = (ggml_upload_engine_get_stats_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_get_stats");
+        push_file = (ggml_upload_engine_push_file_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_engine_push_file");
         return make && free && push && gather && reset && stats;
+    }
+};
+
+// [TAG_EH_DIRECT_READ] [TAG_EH_FILE_READ] a copy of a model file (--expert-copy) opened for positioned reads by the upload
+// engine's copy threads and the host pool (ggml_upload_file): the experts that are neither in VRAM nor in the RAM copy
+// come from it in reads of up to a few MiB instead of page faults through the mapping. Several threads read at once: on
+// Windows the handle is overlapped (a synchronous handle serializes its reads), each thread waits for its own read on
+// an event of its own.
+struct eh_direct_file {
+    std::string      path;
+    ggml_upload_file uf = {};
+#if defined(_WIN32)
+    HANDLE h = INVALID_HANDLE_VALUE;
+#else
+    int fd = -1;
+#endif
+
+    eh_direct_file() = default;
+    eh_direct_file(const eh_direct_file &) = delete;
+    eh_direct_file & operator=(const eh_direct_file &) = delete;
+
+    ~eh_direct_file() {
+#if defined(_WIN32)
+        if (h != INVALID_HANDLE_VALUE) {
+            CloseHandle(h);
+        }
+#else
+        if (fd >= 0) {
+            close(fd);
+        }
+#endif
+    }
+
+    bool open(const std::string & p) {
+        path = p;
+#if defined(_WIN32)
+        const int n = MultiByteToWideChar(CP_UTF8, 0, p.c_str(), -1, nullptr, 0);
+        if (n <= 0) {
+            return false;
+        }
+        std::wstring w((size_t) n, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, p.c_str(), -1, &w[0], n);
+        h = CreateFileW(w.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                        OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+#else
+        fd = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            return false;
+        }
+#endif
+        uf.read  = read;
+        uf.ctx   = this;
+        uf.align = 1;
+        return true;
+    }
+
+    static int64_t read(void * ctx, void * dst, uint64_t off, size_t bytes) {
+        const eh_direct_file * f = (const eh_direct_file *) ctx;
+#if defined(_WIN32)
+        struct tls_event {
+            HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            ~tls_event() { if (ev) { CloseHandle(ev); } }
+        };
+        static thread_local tls_event te;
+        if (te.ev == nullptr) {
+            return -1;
+        }
+        OVERLAPPED ov = {};
+        ov.Offset     = (DWORD) (off & 0xFFFFFFFFu);
+        ov.OffsetHigh = (DWORD) (off >> 32);
+        ov.hEvent     = te.ev;
+        if (!ReadFile(f->h, dst, (DWORD) bytes, nullptr, &ov)) {
+            const DWORD e = GetLastError();
+            if (e == ERROR_HANDLE_EOF) {
+                return 0;
+            }
+            if (e != ERROR_IO_PENDING) {
+                return -1;
+            }
+        }
+        DWORD got = 0;
+        if (!GetOverlappedResult(f->h, &ov, &got, TRUE)) {
+            return GetLastError() == ERROR_HANDLE_EOF ? 0 : -1;
+        }
+        return (int64_t) got;
+#else
+        size_t done = 0;
+        while (done < bytes) {
+            const ssize_t r = ::pread(f->fd, (uint8_t *) dst + done, bytes - done, (off_t) (off + done));
+            if (r < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return done > 0 ? (int64_t) done : -1;
+            }
+            if (r == 0) {
+                break;
+            }
+            done += (size_t) r;
+        }
+        return (int64_t) done;
+#endif
     }
 };
 
@@ -357,10 +466,17 @@ struct llama_expert_handoff::impl {
         ggml_upload_engine_t eng;
         bool                 queued = false;
         std::vector<int64_t> piece;                 // [e]: its piece in the engine, -1 if cached (or not queued)
+        const ggml_upload_file * file = nullptr;    // [TAG_EH_DIRECT_READ] w's model file, read unbuffered
+        uint64_t             file_off = 0;          // w's offset in it
     };
     // the host experts by name: an allocated graph's MUL_MAT_IDs read the scheduler's copies, named
     // "<backend>#<name>#<copy>" (ggml_backend_sched_split_graph)
     std::unordered_map<std::string, const ggml_tensor *> by_name;
+    // [TAG_EH_DIRECT_READ] the model files the experts are mapped from, opened for unbuffered reads, and each mapped
+    // expert tensor's file and offset
+    std::vector<std::unique_ptr<eh_direct_file>> dfiles;
+    bool direct_host = false; // [TAG_EH_FILE_READ] the host reads its misses outside the RAM copy from the copies
+    std::unordered_map<const ggml_tensor *, std::pair<const ggml_upload_file *, uint64_t>> file_of;
     mutable std::mutex             plan_mtx;
     mutable std::vector<plan_item> plan;
     mutable size_t                 plan_next  = 0;
@@ -536,6 +652,7 @@ struct llama_expert_handoff::impl {
             } else {
                 LLAMA_LOG_WARN("%s: the GPU backend has no upload engine\n", __func__);
             }
+            open_direct_files();
         }
 
         // each GPU's budget: its free VRAM less the reserve, or its share of an explicit size (n_slots of the
@@ -1191,6 +1308,19 @@ struct llama_expert_handoff::impl {
                 hl.up_src        = resident_of(il, ml.ffn_up_exps);
                 hl.gate_up_src   = resident_of(il, ml.ffn_gate_up_exps);
                 hl.down_src      = resident_of(il, ml.ffn_down_exps);
+                if (direct_host) {
+                    // [TAG_EH_FILE_READ] the host reads its misses outside the RAM copy from the file copies too
+                    const ggml_tensor * kt[4] = { ml.ffn_gate_exps, ml.ffn_up_exps, ml.ffn_gate_up_exps, ml.ffn_down_exps };
+                    for (int k = 0; k < 4; ++k) {
+                        const auto fo = kt[k] != nullptr ? file_of.find(kt[k]) : file_of.end();
+                        if (fo != file_of.end()) {
+                            hl.file_read[k]  = fo->second.first->read;
+                            hl.file_ctx[k]   = fo->second.first->ctx;
+                            hl.file_off[k]   = fo->second.second;
+                            hl.file_align[k] = fo->second.first->align;
+                        }
+                    }
+                }
                 ok = api.set_layer(host, il, &hl);
             }
             l.state = ok ? 1 : -1;
@@ -1303,6 +1433,10 @@ struct llama_expert_handoff::impl {
             pi.ip  = it->second.ip;
             pi.be  = be;
             pi.eng = engines[id];
+            if (const auto fo = file_of.find(w); fo != file_of.end()) { // [TAG_EH_DIRECT_READ]
+                pi.file     = fo->second.first;
+                pi.file_off = fo->second.second;
+            }
             plan.push_back(std::move(pi));
             // ids [n_used, n_tokens]: at 4 routings per expert, ~98% of the experts are routed to
             const ggml_tensor * ids = node->src[2];
@@ -1335,9 +1469,70 @@ struct llama_expert_handoff::impl {
                 continue;
             }
             const void * r = resident(pi.il, (size_t) pi.ip, e); // [TAG_EH_RESIDENT]
-            pi.piece[e] = uapi.push(pi.eng, r ? r : (const uint8_t *) pi.w->data + (size_t) e*es, es);
+            const uint8_t * m = (const uint8_t *) pi.w->data + (size_t) e*es;
+            if (r == nullptr && pi.file != nullptr) {
+                // [TAG_EH_DIRECT_READ] not in the RAM copy: from the SSD, read straight into the engine's staging
+                pi.piece[e] = uapi.push_file(pi.eng, pi.file, pi.file_off + (uint64_t) e*es, m, es);
+            } else {
+                pi.piece[e] = uapi.push(pi.eng, r ? r : m, es);
+            }
         }
         pi.queued = true;
+    }
+
+    // [TAG_EH_FILE_READ] each expert tensor in a mapping of a model file: that file's copy (--expert-copy, made before
+    // the files were mapped), read through the page cache by the prompt uploads and by the host's own misses. Not the
+    // mapped file itself: while a process maps a file, Windows adds about 10 ms to every read of it (16 x 512 KiB reads:
+    // 0.79 GB/s against 2.6-2.9 GB/s, 2026-11-11). Buffered, the uploads and the host share the copy's cache (read
+    // unbuffered, the host's page faults found nothing cached after a prompt and decode lost 22-25%, 2026-11-12).
+    void open_direct_files() {
+        if (uapi.push_file == nullptr) {
+            return;
+        }
+        bool any_engine = false;
+        for (ggml_upload_engine_t e : engines) {
+            any_engine = any_engine || e != nullptr;
+        }
+        if (!any_engine) {
+            return;
+        }
+        std::unordered_map<std::string, const ggml_upload_file *> by_path;
+        std::vector<std::string> failed;
+        size_t n_tensors = 0;
+        for (const layer & l : layers) {
+            for (const ggml_tensor * t : l.experts) {
+                std::string path, copy;
+                uint64_t off = 0;
+                if (t == nullptr || !eh_is_host_weight(t) || !ggml_is_contiguous(t) || !model.mapped_file_of(t->data, path, off) ||
+                        !model.expert_copy_of(path, copy)) {
+                    continue;
+                }
+                auto it = by_path.find(path);
+                if (it == by_path.end()) {
+                    auto f = std::make_unique<eh_direct_file>();
+                    const ggml_upload_file * uf = nullptr;
+                    if (f->open(copy)) {
+                        uf = &f->uf;
+                        dfiles.push_back(std::move(f));
+                    } else {
+                        failed.push_back(copy);
+                    }
+                    it = by_path.emplace(path, uf).first;
+                }
+                if (it->second != nullptr) {
+                    file_of[t] = { it->second, off };
+                    n_tensors++;
+                }
+            }
+        }
+        for (const std::string & p : failed) {
+            LLAMA_LOG_WARN("%s: %s cannot be opened; its experts are read through the mapping\n", __func__, p.c_str());
+        }
+        if (n_tensors > 0) {
+            direct_host = true;
+            LLAMA_LOG_WARN("%s: experts outside VRAM and the RAM copy are read from %zu file copies (%zu tensors)\n",
+                __func__, dfiles.size(), n_tensors);
+        }
     }
 
     // the scheduler's upload of w into dst (its copy on be): true if the engine did it. Without used (the routing,
@@ -1729,6 +1924,11 @@ struct llama_expert_handoff::impl {
                     LLAMA_LOG_WARN("%s: host gather %.0f us per layer; the device's time from an answer to its next send %.0f us\n",
                         __func__, (st.gather_ns - last.gather_ns)/1000.0/d_layers,
                         d_ngap ? (st.gap_ns - last.gap_ns)/1000.0/d_ngap : 0.0);
+                    if (st.file_bytes > last.file_bytes || st.n_file_fail > last.n_file_fail) { // [TAG_EH_FILE_READ]
+                        LLAMA_LOG_WARN("%s: host read %.2f GB of missed experts from the file copies in %.2f s, %" PRIu64 " reads failed\n",
+                            __func__, (st.file_bytes - last.file_bytes)/1e9, (st.file_ns - last.file_ns)/1e9,
+                            st.n_file_fail - last.n_file_fail);
+                    }
                 }
             }
             // [TAG_EH_COPY_ENGINE] the uploads of large batches since the last report
@@ -1741,6 +1941,8 @@ struct llama_expert_handoff::impl {
                         us.n_pieces += s.n_pieces; us.n_dma += s.n_dma; us.bytes += s.bytes; us.n_gathers += s.n_gathers;
                         us.copy_ns += s.copy_ns; us.wait_ring_ns += s.wait_ring_ns; us.wait_copy_ns += s.wait_copy_ns;
                         us.wait_gather_ns += s.wait_gather_ns; us.dropped += s.dropped;
+                        us.read_bytes += s.read_bytes; us.read_ns += s.read_ns; us.n_reads += s.n_reads;
+                        us.n_read_failed += s.n_read_failed;
                     }
                 }
                 if (us.bytes > up_last.bytes) {
@@ -1751,6 +1953,13 @@ struct llama_expert_handoff::impl {
                         us.n_pieces - up_last.n_pieces, us.n_gathers - up_last.n_gathers, (us.copy_ns - up_last.copy_ns)/1e9,
                         (us.wait_copy_ns - up_last.wait_copy_ns)/1e9, (us.wait_ring_ns - up_last.wait_ring_ns)/1e9,
                         (us.wait_gather_ns - up_last.wait_gather_ns)/1e9, us.dropped - up_last.dropped, n_up_fallback);
+                    // [TAG_EH_DIRECT_READ]
+                    if (us.n_reads > up_last.n_reads) {
+                        LLAMA_LOG_WARN("%s: uploads: %.2f GB of them read from the model files in %" PRIu64 " reads, %.1f s of "
+                            "the copy threads' time; %" PRIu64 " reads failed (copied through the mapping)\n", __func__,
+                            (us.read_bytes - up_last.read_bytes)/1e9, us.n_reads - up_last.n_reads,
+                            (us.read_ns - up_last.read_ns)/1e9, us.n_read_failed - up_last.n_read_failed);
+                    }
                 }
                 up_last = us;
                 n_up_graphs_last = n_up_graphs;

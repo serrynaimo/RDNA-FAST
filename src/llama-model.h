@@ -972,6 +972,16 @@ struct llama_model {
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
+    // ROCmFPX [TAG_EH_DIRECT_READ] the model file a mapped tensor's host bytes come from: its path and the offset of p
+    // in it (false: p is not in a mapping of a model file)
+    bool mapped_file_of(const void * p, std::string & path, uint64_t & off) const;
+
+    // ROCmFPX [TAG_EH_FILE_READ] copies of the model files in dir (--expert-copy), before they are mapped: kept when
+    // their size and modification time match, made otherwise (with room for them and 8 GiB to spare)
+    void make_expert_copies(const llama_model_loader & ml, const std::string & dir);
+    // the copy of the model file at path, if there is one
+    bool expert_copy_of(const std::string & path, std::string & copy) const;
+
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
 

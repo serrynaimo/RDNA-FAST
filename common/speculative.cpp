@@ -3235,6 +3235,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.model                 = params_spec.mparams;
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+        result.expert_copy.clear(); // [TAG_EH_FILE_READ] the copies are the target model's
 
         // a draft pinned to a single device doesn't need the meta wrapper an inherited -sm tensor would give it
         // (the device list is null-terminated, so a single device means size 2)

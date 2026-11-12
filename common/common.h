@@ -614,6 +614,7 @@ struct common_params {
     float       adapt_decay      = 0.7f;
     float       resident_budget_gib = -1.0f; // [TAG_EH_RESIDENT] < 0 = what fits, > 0 = at most this
     float       ram_keep_gib        = 4.0f;
+    std::string expert_copy;               // [TAG_EH_FILE_READ] folder for copies of the model files, empty = none
     bool        poll_explicit       = false; // [TAG_EH_POLL] --poll or --poll-batch given
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;

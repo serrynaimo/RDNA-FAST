@@ -199,6 +199,15 @@ extern "C" {
         const void * const * up_src;
         const void * const * gate_up_src;
         const void * const * down_src;
+        // [TAG_EH_FILE_READ] optional, per tensor (0 gate, 1 up, 2 gate_up, 3 down): the experts outside the copies
+        // above are read from a file nobody maps (a copy of the model) into the pool's staging, instead of through the
+        // tensor's mapping. file_read(ctx, dst, off, bytes) reads bytes at off into dst and returns the bytes read
+        // (negative on an error); file_off is expert 0's offset in the file; reads start, end and land on multiples
+        // of file_align. A failed read falls back to the tensor.
+        int64_t (*file_read[4])(void * ctx, void * dst, uint64_t off, size_t bytes);
+        void *   file_ctx[4];
+        uint64_t file_off[4];
+        size_t   file_align[4];
     };
 
     struct ggml_expert_handoff_stats {
@@ -228,6 +237,10 @@ extern "C" {
         uint64_t gap_ns;
         uint64_t n_gap;
         int32_t  n_workers; // [TAG_EH_POOL2] the pool's threads
+        // [TAG_EH_FILE_READ] the experts read from file copies: bytes, the time of those read phases, failed reads
+        uint64_t file_bytes;
+        uint64_t file_ns;
+        uint64_t n_file_fail;
     };
 
     typedef struct ggml_expert_handoff_host * ggml_expert_handoff_host_t;
