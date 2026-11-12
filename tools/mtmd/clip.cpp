@@ -7938,7 +7938,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_MLP_NORM:
             return ctx->model.mm_3_b->ne[0];
         case PROJECTOR_TYPE_MINICPMV:
-            return ctx->model.mm_model_proj->ne[0];
+            return ctx->model.mm_model_proj->ne[1];
         case PROJECTOR_TYPE_MINICPMV4_6:
         case PROJECTOR_TYPE_MINICPMV4_7:
         case PROJECTOR_TYPE_MINICPM_OCR_1_0:
