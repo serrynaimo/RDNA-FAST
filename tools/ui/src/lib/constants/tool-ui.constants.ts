@@ -21,6 +21,7 @@ import {
 	History,
 	Info,
 	Link,
+	MessagesSquare,
 	Save,
 	SearchCode,
 	SlidersHorizontal,
@@ -39,6 +40,11 @@ export const TOOL_UI: Readonly<Record<BuiltInTool, ToolUiEntry>> = {
 	[BuiltInTool.BROWSER_RUN_JAVASCRIPT]: {
 		icon: Braces,
 		label: 'Run JavaScript',
+		source: ToolSource.BROWSER
+	},
+	[BuiltInTool.BROWSER_SEARCH_CHATS]: {
+		icon: MessagesSquare,
+		label: 'Search chats',
 		source: ToolSource.BROWSER
 	},
 	// [RDNA-FAST] src/lib/rdna/web-tools.ts
@@ -60,7 +66,7 @@ export const TOOL_UI: Readonly<Record<BuiltInTool, ToolUiEntry>> = {
 	},
 	[BuiltInTool.RDNA_RECENT_CONVERSATIONS]: {
 		icon: History,
-		label: 'Search chats',
+		label: 'Recent chats',
 		source: ToolSource.RDNA
 	},
 	[BuiltInTool.RDNA_ROUTER_CONFIG]: {

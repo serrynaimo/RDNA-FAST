@@ -1902,6 +1902,10 @@ struct clip_model_loader {
                         hparams.image_resize_pad  = PAD_NONE; // the HF processor resizes to the smart_resize size, no padding
                         hparams.image_round_half_even = true; // smart_resize uses Python round()
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
+                        if (hparams.n_merge != 2) {
+                            // the temporal merge input and the merger use a 2x2 patch grid
+                            throw std::runtime_error(string_format("%s: spatial_merge_size (%d) must be 2\n", __func__, hparams.n_merge));
+                        }
                         get_u32(KEY_WIN_ATTN_PATTERN, hparams.n_wa_pattern, model.proj_type == PROJECTOR_TYPE_QWEN25VL); // only 2.5 requires it
                         // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
                         hparams.set_limit_image_tokens(8, 4096);
@@ -2679,8 +2683,15 @@ struct clip_model_loader {
         model.post_ln_w = get_tensor(string_format(TN_LN_POST, prefix, "weight"), false);
         model.post_ln_b = get_tensor(string_format(TN_LN_POST, prefix, "bias"),   false);
 
+        // every vision encoder starts with a patch embedding, except the ones with their own stem
+        const bool has_patch_embd = (
+            model.modality  == CLIP_MODALITY_VISION &&
+            model.proj_type != PROJECTOR_TYPE_GEMMA3NV &&
+            model.proj_type != PROJECTOR_TYPE_DEEPSEEKOCR &&
+            model.proj_type != PROJECTOR_TYPE_DEEPSEEKOCR2);
+
         model.patch_bias = get_tensor(TN_PATCH_BIAS, false);
-        model.patch_embeddings_0 = get_tensor(TN_PATCH_EMBD,   false);
+        model.patch_embeddings_0 = get_tensor(TN_PATCH_EMBD,   has_patch_embd);
         model.patch_embeddings_1 = get_tensor(TN_PATCH_EMBD_1, false);
 
         model.norm_embd_w = get_tensor(string_format(TN_NORM_EMBD, "weight"), false);
@@ -2891,23 +2902,22 @@ struct clip_model_loader {
             case PROJECTOR_TYPE_MLP:
             case PROJECTOR_TYPE_MLP_NORM:
                 {
-                    // LLaVA projection
-                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"), false);
-                    model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"), false);
-                    // Yi-type llava
-                    model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"), false);
-                    model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 1, "bias"), false);
-                    // missing in Yi-type llava
-                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"), false);
-                    model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"), false);
-                    // Yi-type llava
-                    model.mm_3_w = get_tensor(string_format(TN_LLAVA_PROJ, 3, "weight"), false);
-                    model.mm_3_b = get_tensor(string_format(TN_LLAVA_PROJ, 3, "bias"), false);
-                    model.mm_4_w = get_tensor(string_format(TN_LLAVA_PROJ, 4, "weight"), false);
-                    model.mm_4_b = get_tensor(string_format(TN_LLAVA_PROJ, 4, "bias"), false);
+                    // LLaVA projection: mm.0 -> gelu -> mm.2
+                    // Yi-type llava (MLP_NORM): mm.0 -> norm mm.1 -> gelu -> mm.3 -> norm mm.4
+                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
+                    model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"));
+                    model.mm_3_w = get_tensor(string_format(TN_LLAVA_PROJ, 3, "weight"), model.proj_type == PROJECTOR_TYPE_MLP_NORM);
                     if (model.mm_3_w) {
                         // TODO: this is a hack to support Yi-type llava
                         model.proj_type = PROJECTOR_TYPE_MLP_NORM;
+                        model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
+                        model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 1, "bias"));
+                        model.mm_3_b = get_tensor(string_format(TN_LLAVA_PROJ, 3, "bias"));
+                        model.mm_4_w = get_tensor(string_format(TN_LLAVA_PROJ, 4, "weight"));
+                        model.mm_4_b = get_tensor(string_format(TN_LLAVA_PROJ, 4, "bias"));
+                    } else {
+                        model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
+                        model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
                     }
                     model.image_newline = get_tensor(TN_IMAGE_NEWLINE, false);
                 } break;
@@ -3156,7 +3166,6 @@ struct clip_model_loader {
                 {
                     // reuse tensors already loaded by the common section
                     // (TN_PATCH_EMBD and TN_PATCH_BIAS have the same tensor names)
-                    GGML_ASSERT(model.patch_embeddings_0 && "yasa2 requires v.patch_embd.weight");
                     model.yasa_patch_w = model.patch_embeddings_0;
                     model.yasa_patch_b = model.patch_bias;
                     model.yasa_patch_ln_w = get_tensor(TN_YASA_PATCH_LN_W, false);
@@ -4209,6 +4218,10 @@ struct clip_model_loader {
                     model.mm_img_end        = get_tensor(TN_MM_IMG_END);
                     model.image_newline     = get_tensor(TN_IMAGE_NEWLINE);
                     model.view_seperator    = get_tensor(TN_IMAGE_SEPERATOR, false);
+                    // the position embedding is resampled on the host as F32
+                    if (!model.position_embeddings || model.position_embeddings->type != GGML_TYPE_F32) {
+                        throw std::runtime_error(string_format("%s: HunyuanVL requires an F32 %s\n", __func__, string_format(TN_POS_EMBD, prefix).c_str()));
+                    }
                 } break;
             case PROJECTOR_TYPE_JANUS_PRO:
                 {
@@ -7929,7 +7942,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_MLP_NORM:
             return ctx->model.mm_3_b->ne[0];
         case PROJECTOR_TYPE_MINICPMV:
-            return ctx->model.mm_model_proj->ne[0];
+            return ctx->model.mm_model_proj->ne[1];
         case PROJECTOR_TYPE_MINICPMV4_6:
         case PROJECTOR_TYPE_MINICPMV4_7:
         case PROJECTOR_TYPE_MINICPM_OCR_1_0:

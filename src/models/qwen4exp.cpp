@@ -1853,7 +1853,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
             cur->src[6] = packed_keys;
             cur->src[7] = packed_values;
             ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(indices->ne[0]));
-            ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+            ggml_prec_set_acc(cur, GGML_PREC_F32);
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
             cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
             ggml_build_forward_expand(gf, cur);

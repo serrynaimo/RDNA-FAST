@@ -32,8 +32,6 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         # only the shard names, so the table itself is never held
         self._ple_shards: dict[int, str] = {}
         self._ple_row_dim: int | None = None
-        # halves of the merged weights, keyed by (bid, merged tensor), see _merge_shared_input
-        self._merge_parts: dict[tuple[int, gguf.MODEL_TENSOR], dict[int, Tensor]] = {}
 
     _MTP_MIXER_PREFIX = "mtp.hyper_connection_mixer."
 
@@ -169,8 +167,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             yield (self.map_tensor_name(name), data_torch.squeeze())
             return
 
-        for new_name, data in super().modify_tensors(data_torch, name, bid):
-            yield from self._merge_shared_input(new_name, data, bid)
+        yield from super().modify_tensors(data_torch, name, bid)
 
     # matmuls that read the same input, written as one weight [a | b] so the runtime does one matmul:
     # (merged tensor, (a, b), linear-attention layers only)
@@ -180,30 +177,6 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         (gguf.MODEL_TENSOR.ATTN_QKV_GATE,       (gguf.MODEL_TENSOR.ATTN_QKV,     gguf.MODEL_TENSOR.ATTN_GATE),      True),
         (gguf.MODEL_TENSOR.SSM_BETA_ALPHA_CAT,  (gguf.MODEL_TENSOR.SSM_BETA,     gguf.MODEL_TENSOR.SSM_ALPHA),      True),
     )
-
-    # caches one half of a merged weight until the other half arrives, then yields [a | b]
-    def _merge_shared_input(self, new_name: str, data: Tensor, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        # a pre-quantized checkpoint carries per-tensor scales, which one merged weight cannot hold
-        if bid is None or self.hparams.get("quantization_config"):
-            yield (new_name, data)
-            return
-
-        layer_types = self.hparams.get("layer_types") or []
-        is_linear = bid < len(layer_types) and layer_types[bid] == "linear_attention"
-
-        match = next(((merged, parts.index(part)) for merged, parts, linear_only in self._SHARED_INPUT_MERGES
-                      for part in parts
-                      if (is_linear or not linear_only) and self.match_model_tensor_name(new_name, part, bid)), None)
-        if match is None:
-            yield (new_name, data)
-            return
-
-        merged, idx = match
-        halves = self._merge_parts.setdefault((bid, merged), {})
-        halves[idx] = data
-        if len(halves) == 2:
-            del self._merge_parts[(bid, merged)]
-            yield (self.format_tensor_name(merged, bid), torch.cat([halves[0], halves[1]], dim=0))
 
     # the shards concatenate into a tensor of well over 100 GB
     # use LazyChunkedTensor here, a single shard resident at a time
@@ -247,8 +220,6 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     def prepare_tensors(self):
         super().prepare_tensors()
-        if self._merge_parts:
-            raise ValueError(f"merged weights missing a half: {sorted((bid, t.name) for bid, t in self._merge_parts)}")
         n_parts = self.hparams.get("split_ngram_parts", 0)
         if self._ple_shards and len(self._ple_shards) != n_parts:
             raise ValueError(

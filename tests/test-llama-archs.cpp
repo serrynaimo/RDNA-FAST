@@ -893,8 +893,8 @@ static int test_mtp_dev_rows(const llm_arch arch, const size_t seed, const float
         const run_result host_kv  = run(false, false);
         const run_result host_out = run(false, true);
 
-        if (!llama_set_embeddings_nextn_dev(ctx_tgt, true) || !llama_set_embd_state_src(ctx_dft, ctx_tgt)) {
-            llama_set_embd_state_src(ctx_dft, nullptr);
+        if (!llama_set_embeddings_nextn_dev(ctx_tgt, true) || !llama_set_ctx_state_src(ctx_dft, ctx_tgt)) {
+            llama_set_ctx_state_src(ctx_dft, nullptr);
             llama_set_embeddings_nextn_dev(ctx_tgt, false);
             if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
                 std::fprintf(stderr, "FAIL MTP device rows (%s) on %s: the device buffer is not available\n", llm_arch_name(arch), ggml_backend_dev_name(dev));
@@ -906,7 +906,7 @@ static int test_mtp_dev_rows(const llm_arch arch, const size_t seed, const float
         const run_result dev_kv  = run(true, false);
         const run_result dev_out = run(true, true);
 
-        llama_set_embd_state_src(ctx_dft, nullptr);
+        llama_set_ctx_state_src(ctx_dft, nullptr);
         llama_set_embeddings_nextn_dev(ctx_tgt, false);
         const run_result host_again = run(false, true);
 

@@ -52,7 +52,6 @@ struct llama_cparams {
     bool fused_top_k_mask;   // use fused top-k sparse attention mask
     bool auto_ftkm;
     bool no_perf;
-    bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
@@ -84,7 +83,7 @@ struct llama_cparams {
 
     llama_context * ctx_other;
 
-    // context whose h_nextn device buffer holds the state rows of a batch, see llama_set_embd_state_src()
+    // context whose h_nextn device buffer holds the state rows of a batch, see llama_set_ctx_state_src()
     llama_context * ctx_state_src;
 
     // MTP draft contexts: candidate rows for the draft head (rocmfpx-draft-vocab.h), nullptr when off

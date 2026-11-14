@@ -876,18 +876,6 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model * 
                            "{%- if false %}");
     }
 
-    // TODO @aldehir : this is a temporary fix, pending Minja changes
-    // Ref: https://github.com/ggml-org/llama.cpp/pull/17713#issuecomment-3631342664
-    if (default_template_src.find("[TOOL_CALLS]") != std::string::npos
-        // search for the error message and patch it
-        && default_template_src.find("if (message['content'] is none or") != std::string::npos) {
-        string_replace_all(default_template_src,
-                           "{%- if (message['content'] is none or message['content'] == '' or "
-                           "message['content']|length == 0) and (message['tool_calls'] is not defined or "
-                           "message['tool_calls'] is none or message['tool_calls']|length == 0) %}",
-                           "{%- if false %}");
-    }
-
     std::string token_bos = bos_token_override;
     std::string token_eos = eos_token_override;
     bool        add_bos   = false;
@@ -1198,13 +1186,6 @@ static common_chat_params common_chat_params_init_lfm2_5(const common_chat_templ
     return common_chat_params_init_lfm2(tmpl, inputs, /* tool_list_tokens = */ false);
 }
 
-// Older gemma4 templates need their tool responses rewritten before rendering
-static common_chat_params common_chat_params_init_gemma4_legacy(const common_chat_template & tmpl, const autoparser::generation_params & inputs) {
-    auto adjusted = inputs;
-    workaround::convert_tool_responses_gemma4(adjusted.messages);
-    return common_chat_params_init_gemma4(tmpl, adjusted);
-}
-
 // Pick the dedicated handler for a template from its source, or null for the autoparser.
 // Order matters: the first match wins, and later checks assume the earlier ones did not match.
 static common_chat_params_init_fn common_chat_template_detect_params_init(const std::string & src) {
@@ -1337,11 +1318,6 @@ static common_chat_params_init_fn common_chat_template_detect_params_init(const 
     // Gemma4 format detection
     if (src.find("'<|tool_call>call:'") != std::string::npos) {
         LOG_DBG("Using specialized template: Gemma4\n");
-        if (src.find("{#- OpenAI Chat Completions:") == std::string::npos) {
-            LOG_WRN("%s: detected an outdated gemma4 chat template, applying compatibility workarounds. "
-                    "Consider updating to the official template.\n", __func__);
-            return common_chat_params_init_gemma4_legacy;
-        }
         return common_chat_params_init_gemma4;
     }
 
