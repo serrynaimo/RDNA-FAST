@@ -18,7 +18,6 @@ import {
 	FileSearch,
 	FileText,
 	Globe,
-	History,
 	Info,
 	Link,
 	MessagesSquare,
@@ -62,11 +61,6 @@ export const TOOL_UI: Readonly<Record<BuiltInTool, ToolUiEntry>> = {
 	[BuiltInTool.RDNA_DOWNLOAD_MODEL]: {
 		icon: Download,
 		label: 'Download model',
-		source: ToolSource.RDNA
-	},
-	[BuiltInTool.RDNA_RECENT_CONVERSATIONS]: {
-		icon: History,
-		label: 'Recent chats',
 		source: ToolSource.RDNA
 	},
 	[BuiltInTool.RDNA_ROUTER_CONFIG]: {

@@ -53,7 +53,6 @@ export enum BuiltInTool {
 	BROWSER_WEB_SEARCH = 'web_search',
 	// [RDNA-FAST] the RDNA-FAST tool section, src/lib/rdna/rdna-tools.ts
 	RDNA_DOWNLOAD_MODEL = 'download_model',
-	RDNA_RECENT_CONVERSATIONS = 'recent_conversations',
 	RDNA_ROUTER_CONFIG = 'router_config',
 	RDNA_SAVE_PRESET = 'save_preset',
 	RDNA_SERVER_INFO = 'server_info',

@@ -1,6 +1,5 @@
 /**
  * RDNA-FAST chat tools (owner, 2026-11-08), their own "RDNA-FAST" section in the chat's tools, on by default:
- *   recent_conversations  this browser's chats: find them by words, or read one's last messages
  *   download_model        a GGUF from Hugging Face through the router, unless it is there or on its way already
  *   server_info           the server's machine: OS, CPU, RAM, GPU and VRAM, the build
  *   save_preset           the flags and env vars a model runs with, kept by the router ([TAG_MODEL_PRESET])
@@ -10,20 +9,13 @@
 import { apiUrl, modelQuery, rdnaGet } from './api';
 import { isClassifier } from './model-info';
 import { BuiltInTool, JsonSchemaType, ServerModelStatus, ToolCallType } from '$lib/enums';
-import { DatabaseService } from '$lib/services/database.service';
 // direct imports between stores, not via the barrel, to avoid circular deps
 import { modelsStore } from '$lib/stores/models/index.svelte';
 import { serverStore } from '$lib/stores/server.svelte';
-import type {
-	ApiModelDataEntry,
-	DatabaseConversation,
-	OpenAIToolDefinition,
-	ToolExecutionResult
-} from '$lib/types';
+import type { ApiModelDataEntry, OpenAIToolDefinition, ToolExecutionResult } from '$lib/types';
 import { getAuthHeaders, RDNA_UI_HEADERS } from '$lib/utils/api-headers';
 
 const RDNA_TOOLS = new Set<string>([
-	BuiltInTool.RDNA_RECENT_CONVERSATIONS,
 	BuiltInTool.RDNA_DOWNLOAD_MODEL,
 	BuiltInTool.RDNA_SERVER_INFO,
 	BuiltInTool.RDNA_SAVE_PRESET,
@@ -33,15 +25,6 @@ const RDNA_TOOLS = new Set<string>([
 /** The section's name in the chat's tools. */
 export const RDNA_TOOL_GROUP_LABEL = 'RDNA-FAST';
 export const RDNA_TOOL_GROUP_KEY = 'rdna-fast';
-
-const CONVERSATIONS_DEFAULT = 5;
-const CONVERSATIONS_MAX = 20;
-/** Chats searched for words in their messages, the most recent first (titles: all of them). */
-const CONVERSATIONS_SCANNED = 200;
-const SNIPPET_CHARS = 160;
-/** One chat read back: its last messages, each cut here. */
-const READ_MESSAGES = 6;
-const READ_MESSAGE_CHARS = 600;
 
 export function isRdnaTool(name: string): boolean {
 	return RDNA_TOOLS.has(name);
@@ -65,18 +48,6 @@ function fn(
 
 export function buildRdnaToolDefinitions(): OpenAIToolDefinition[] {
 	return [
-		fn(
-			BuiltInTool.RDNA_RECENT_CONVERSATIONS,
-			'Find earlier chats by words in titles and messages; no query = the latest. With id: read that chat.',
-			{
-				id: { type: JsonSchemaType.STRING },
-				limit: {
-					description: `default ${CONVERSATIONS_DEFAULT}, max ${CONVERSATIONS_MAX}`,
-					type: JsonSchemaType.NUMBER
-				},
-				query: { type: JsonSchemaType.STRING }
-			}
-		),
 		fn(
 			BuiltInTool.RDNA_DOWNLOAD_MODEL,
 			'Download a GGUF from Hugging Face, e.g. "unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M". Reports it if it is there already.',
@@ -126,132 +97,8 @@ function fail(content: string): ToolExecutionResult {
 	return { content, isError: true };
 }
 
-function clip(text: string, max: number): string {
-	const t = text.replace(/\s+/g, ' ').trim();
-
-	return t.length > max ? `${t.slice(0, max - 1)}…` : t;
-}
-
-function when(ts: number | undefined): string {
-	if (!ts) return '';
-
-	const d = new Date(ts);
-	const pad = (n: number) => String(n).padStart(2, '0');
-
-	return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
-
 function gb(bytes: number | undefined): string {
 	return bytes ? `${(bytes / 1e9).toFixed(1)} GB` : '?';
-}
-
-/** Words of a query, lower case, two letters or more */
-function terms(query: string): string[] {
-	return query
-		.toLowerCase()
-		.split(/[^\p{L}\p{N}_.-]+/u)
-		.filter((t) => t.length >= 2);
-}
-
-/** Text around the first term found, or null */
-function snippet(text: string, words: string[]): string | null {
-	const lower = text.toLowerCase();
-
-	let at = -1;
-
-	for (const w of words) {
-		const i = lower.indexOf(w);
-
-		if (i >= 0 && (at < 0 || i < at)) at = i;
-	}
-
-	if (at < 0) return null;
-
-	const start = Math.max(0, at - SNIPPET_CHARS / 2);
-
-	return `${start > 0 ? '…' : ''}${clip(text.slice(start, start + SNIPPET_CHARS), SNIPPET_CHARS)}`;
-}
-
-function conversationLine(i: number, c: DatabaseConversation): string {
-	return `${i + 1}. ${c.name || 'Untitled'} (${when(c.lastModified)}, id ${c.id})`;
-}
-
-async function recentConversations(args: Record<string, unknown>): Promise<ToolExecutionResult> {
-	const id = typeof args.id === 'string' ? args.id.trim() : '';
-	const query = typeof args.query === 'string' ? args.query.trim() : '';
-	const limit = Math.min(
-		CONVERSATIONS_MAX,
-		Math.max(1, Math.round(Number(args.limit) || CONVERSATIONS_DEFAULT))
-	);
-	const all = await DatabaseService.getAllConversations(); // newest first
-
-	if (id) {
-		const conv = all.find((c) => c.id === id) ?? all.find((c) => c.id.startsWith(id));
-
-		if (!conv) return fail(`No chat with id ${id}.`);
-
-		const messages = (await DatabaseService.getConversationMessages(conv.id)).filter(
-			(m) => (m.role === 'user' || m.role === 'assistant') && m.content?.trim()
-		);
-		const last = messages.slice(-READ_MESSAGES);
-
-		return ok(
-			[
-				`${conv.name || 'Untitled'} (${when(conv.lastModified)}), last ${last.length} of ${messages.length} messages:`,
-				...last.map((m) => `${m.role}: ${clip(m.content, READ_MESSAGE_CHARS)}`)
-			].join('\n')
-		);
-	}
-
-	if (!query) {
-		if (all.length === 0) return ok('No chats yet.');
-
-		return ok(
-			all
-				.slice(0, limit)
-				.map((c, i) => conversationLine(i, c))
-				.join('\n')
-		);
-	}
-
-	const words = terms(query);
-
-	if (words.length === 0) return fail('The query has no words to search for.');
-
-	// titles first (every chat), then the messages of the most recent chats
-	const hits: { conv: DatabaseConversation; score: number; text: string | null }[] = [];
-
-	for (const [rank, conv] of all.entries()) {
-		const title = (conv.name || '').toLowerCase();
-
-		let score = words.filter((w) => title.includes(w)).length * 3;
-		let text: string | null = null;
-
-		if (rank < CONVERSATIONS_SCANNED) {
-			for (const m of await DatabaseService.getConversationMessages(conv.id)) {
-				const s = m.content ? snippet(m.content, words) : null;
-
-				if (!s) continue;
-
-				score += words.filter((w) => m.content.toLowerCase().includes(w)).length;
-				text ??= s;
-			}
-		}
-
-		if (score > 0) hits.push({ conv, score, text });
-	}
-
-	if (hits.length === 0) return ok(`No chat mentions "${query}".`);
-
-	// the best matches, the newer first among equals (the list is newest first already)
-	hits.sort((a, b) => b.score - a.score);
-
-	return ok(
-		hits
-			.slice(0, limit)
-			.map((h, i) => `${conversationLine(i, h.conv)}${h.text ? `\n   ${h.text}` : ''}`)
-			.join('\n')
-	);
 }
 
 const NOT_ON_DISK = new Set<string>([
@@ -555,8 +402,6 @@ export async function executeRdnaTool(
 ): Promise<ToolExecutionResult> {
 	try {
 		switch (name) {
-			case BuiltInTool.RDNA_RECENT_CONVERSATIONS:
-				return await recentConversations(args);
 			case BuiltInTool.RDNA_DOWNLOAD_MODEL:
 				return await downloadModel(args);
 			case BuiltInTool.RDNA_SERVER_INFO:
