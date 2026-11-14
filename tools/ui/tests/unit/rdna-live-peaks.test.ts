@@ -52,10 +52,11 @@ describe('speed card: finished bench runs only', () => {
 		expect(cardSource(2)).toBe('rdna-bench-v1, best of the last two runs');
 		expect(cardSource(1)).toBe('rdna-bench-v1, one run');
 		expect(cardSource(0)).toBe('no rdna-bench-v1 run yet');
-		expect(
-			cardFooter('Swift-1.5-Qwen3.8-27B IQ4_XS', 98304, 'b12781-707407de1', cardSource(2))
-		).toBe(
-			'Swift-1.5-Qwen3.8-27B IQ4_XS · 96k context · b12781 · rdna-bench-v1, best of the last two runs'
+		expect(cardFooter('IQ4_XS', 131072, 'b13449-a092af0a1', cardSource(2))).toBe(
+			'IQ4_XS · 4k prompt · 128k context · b13449 · rdna-bench-v1, best of the last two runs'
+		);
+		expect(cardFooter(null, null, null, cardSource(0))).toBe(
+			'4k prompt · no rdna-bench-v1 run yet'
 		);
 	});
 

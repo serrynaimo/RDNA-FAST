@@ -66,12 +66,7 @@
 	let saving = $state(false);
 
 	let footer = $derived(
-		cardFooter(
-			modelLabel,
-			runs[0]?.nCtx ?? nCtx,
-			runs[0]?.build ?? buildInfo,
-			cardSource(runs.length)
-		)
+		cardFooter(quant, runs[0]?.nCtx ?? nCtx, runs[0]?.build ?? buildInfo, cardSource(runs.length))
 	);
 
 	/** Switch the view; a finished run's bar goes with it (one in progress stays). */

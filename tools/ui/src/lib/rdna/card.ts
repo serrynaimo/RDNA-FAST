@@ -76,14 +76,24 @@ export function cardSource(benchRuns: number): string {
 	return `no ${RDNA_BENCH_NAME} run yet`;
 }
 
-/** The card's footer: model, context, build of the newest run, source. */
+/** The request the card's prefill and decode figures come from (the bench's cold 4k prompt). */
+export const CARD_REQUEST = '4k prompt';
+
+/**
+ * The card's footer: quant (the card names the model above), the request, context, build of the
+ * newest run, source (owner, 2026-11-14).
+ */
 export function cardFooter(
-	modelLabel: string,
+	quant: string | null,
 	nCtx: number | null,
 	buildInfo: string | null,
 	source: string
 ): string {
-	const parts = [modelLabel];
+	const parts: string[] = [];
+
+	if (quant) parts.push(quant);
+
+	parts.push(CARD_REQUEST);
 
 	if (nCtx) parts.push(`${fmtCtx(nCtx)} context`);
 
