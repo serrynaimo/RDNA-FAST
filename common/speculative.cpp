@@ -11,6 +11,8 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 
+#include "../src/llama-ext.h" // RDNA-FAST: llama_model_dflash_dspine_top_k [TAG_DSPINE], llama_kv_lanes_merge_max
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
