@@ -1755,7 +1755,8 @@ static __global__ void mul_mat_q_stream_k_fixup(
     const int col_high = expert_bounds[zt + 1];
     const int col_diff = col_high - col_low;
 
-    if (j_sup <= 0) {
+    // an empty tile of this expert, skipped by mul_mat_q too: nothing to add, and its ids_dst reads would run past the padding
+    if (jt*J >= col_diff) {
         return;
     }
 
