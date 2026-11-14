@@ -1657,7 +1657,6 @@ LFM3-Omni is not trained to reason, run it with `--reasoning off` so that its tu
 
 Tools go into the system prompt with the chat template, and the tool calls are parsed as in `/v1/chat/completions`. The client runs the calls of a response, sends their results as `function_call_output` items, then asks for the next response.
 
-
 ### POST `/v1/responses`: OpenAI-compatible Responses API
 
 *Options:*

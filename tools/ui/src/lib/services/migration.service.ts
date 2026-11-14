@@ -854,7 +854,6 @@ const rdnaDiscoverOnMigration: Migration = {
 		localStorage.setItem(CONFIG_LOCALSTORAGE_KEY, JSON.stringify(config));
 	}
 };
-
 const SEARCH_CHATS_DEFAULT_DISABLED_MIGRATION_ID = 'search-chats-default-disabled-v1';
 const searchChatsDefaultDisabledMigration: Migration = {
 	description: 'Disable the search_chats tool by default, globally and in existing conversations',
