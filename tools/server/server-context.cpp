@@ -1631,6 +1631,8 @@ private:
         }
 
         mtmd_cap = mtmd_helper_get_capabilities(model_tgt, mctx);
+        // the helper only knows about the built-in video decoder
+        mtmd_cap.video = mtmd_cap.video || (mtmd_cap.vision && init_opt.video_params.decoder != nullptr);
 
         if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
             if (params_base.ctx_shift) {
@@ -6329,6 +6331,10 @@ void server_context::set_state_callback(server_state_callback_t callback) {
 void server_context::add_request_record(json record) {
     record["id"] = impl->queue_tasks.get_new_id();
     impl->history_add(std::move(record));
+}
+
+void server_context::set_video_decoder(const mtmd_helper_video_decoder * decoder) {
+    impl->init_opt.video_params.decoder = decoder;
 }
 
 //
