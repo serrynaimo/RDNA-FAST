@@ -29,6 +29,8 @@ add_library(${TARGET} STATIC
     server-schema.h
     server-classifier.cpp
     server-classifier.h
+    server-slot-sched.cpp
+    server-slot-sched.h
 )
 
 if (BUILD_SHARED_LIBS)
