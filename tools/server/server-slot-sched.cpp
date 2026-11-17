@@ -906,7 +906,8 @@ bool server_prompt_cache::save(
 
     bool saved = false;
 
-    if (disk_enabled()) {
+    // the files do not record the lora config: only states made without an active adapter go to disk
+    if (disk_enabled() && lora_get_enabled_ids(prompt.lora).empty()) {
         saved = save_disk(prompt, ctx_tgt, ctx_dft, id_slot, state_spec) || saved;
     }
 
@@ -1346,7 +1347,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(
         const bool covered = lcp == prompt.tokens.size() &&
             (partial_seq_rm || it->prompt.tokens.size() == prompt.tokens.size());
 
-        if (covered) {
+        if (covered && are_lora_equal(it->prompt.lora, prompt.lora)) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
         }
@@ -1374,7 +1375,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(
         for (auto it = states.begin(); it != states.end();) {
             const size_t len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-            if (len == it->prompt.tokens.size()) {
+            if (len == it->prompt.tokens.size() && are_lora_equal(it->prompt.lora, prompt.lora)) {
                 SRV_TRC(" - removing obsolete cached prompt with length %zu\n", len);
 
                 it = states.erase(it);
@@ -1417,6 +1418,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ prompt.checkpoints,
+            /*.lora        =*/ prompt.lora,
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
@@ -1743,6 +1745,7 @@ void server_prompt_cache::log_disk_state() const {
 bool server_prompt_cache::load(
               server_prompt & prompt,
         const server_tokens & tokens_new,
+        const std::vector<common_adapter_lora_info> & lora_new,
               llama_context * ctx_tgt,
               llama_context * ctx_dft,
                     int32_t   id_slot,
@@ -1757,8 +1760,10 @@ bool server_prompt_cache::load(
     // Worth of what the slot already holds. Like every candidate below it is measured in
     // tokens the slot would actually keep: a diverging tail on a recurrent/hybrid target
     // means rolling back to the newest checkpoint at or before the divergence.
-    const size_t lcp_base  = prompt.tokens.get_common_prefix(tokens_new);
-    const size_t eff_base  = prompt.tokens.empty() ? 0 :
+    // a prompt made with another lora config is cleared before the new one starts, so it counts as empty
+    const bool   is_empty  = prompt.tokens.empty() || lora_should_clear_cache(prompt.lora, lora_new);
+    const size_t lcp_base  = is_empty ? 0 : prompt.tokens.get_common_prefix(tokens_new);
+    const size_t eff_base  = is_empty ? 0 :
         server_prompt_cache_eff_tokens(prompt.tokens.size(), lcp_base, partial_seq_rm,
                                        server_prompt_cache_ckpt_at_or_below(prompt.checkpoints, lcp_base));
 
@@ -1777,6 +1782,11 @@ bool server_prompt_cache::load(
     // Find the most similar RAM prompt first. On an equal match, the hot RAM
     // copy wins and avoids SSD I/O.
     for (auto it = states.begin(); it != states.end(); ++it) {
+        if (lora_should_clear_cache(it->prompt.lora, lora_new)) {
+            SRV_TRC("   - prompt with length %7zu, skipping, other lora config\n", it->prompt.tokens.size());
+            continue;
+        }
+
         const size_t lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
         const size_t eff_cur = server_prompt_cache_eff_tokens(it->prompt.tokens.size(), lcp_cur, partial_seq_rm,
                                                               server_prompt_cache_ckpt_at_or_below(it->prompt.checkpoints, lcp_cur));
@@ -1811,8 +1821,11 @@ bool server_prompt_cache::load(
     size_t n_skip_boundary   = 0;
     size_t lcp_skip_boundary = 0;
 
+    // the disk entries were made without an active adapter (save() writes no other), see the declaration
+    const bool disk_lora_ok = lora_get_enabled_ids(lora_new).empty();
+
     for (auto it = disk_states.begin(); it != disk_states.end(); ++it) {
-        if (!it->usable) {
+        if (!it->usable || !disk_lora_ok) {
             continue;
         }
 
@@ -1885,7 +1898,11 @@ bool server_prompt_cache::load(
     if (it_best_disk != disk_states.end()) {
         SRV_INF(" - found better disk prompt: entry=%" PRIu64 " eff=%zu lcp=%zu cached_tokens=%zu request_tokens=%zu\n",
                 it_best_disk->id, eff_best, lcp_selected, it_best_disk->tokens.size(), tokens_new.size());
-        return load_disk(it_best_disk, prompt, ctx_tgt, ctx_dft, id_slot, lcp_selected, state_spec);
+        if (!load_disk(it_best_disk, prompt, ctx_tgt, ctx_dft, id_slot, lcp_selected, state_spec)) {
+            return false;
+        }
+        prompt.lora = lora_new; // no active adapter, like the entry
+        return true;
     }
 
     if (it_best_ram != states.end()) {
@@ -2009,7 +2026,7 @@ std::vector<int> server_slot_sched::get_free_slots(const std::vector<server_slot
     return res;
 }
 
-server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> & slots, const server_task & task) const {
+server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> & slots, const server_task & task, const std::vector<common_adapter_lora_info> & lora) const {
     const server_slot_info * ret = nullptr;
 
     bool update_cache = false;
@@ -2057,6 +2074,12 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
             // skip the slot if it does not contains cached tokens
             if (tokens.empty()) {
                 SLT_TRC(slot, "%s", " - skipping, slot is empty\n");
+                continue;
+            }
+
+            // the task would clear this slot, its state cannot be reused with another lora config
+            if (lora_should_clear_cache(slot.prompt->lora, lora)) {
+                SLT_TRC(slot, "%s", " - skipping, other lora config\n");
                 continue;
             }
 

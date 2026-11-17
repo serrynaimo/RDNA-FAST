@@ -370,10 +370,10 @@ struct server_slot {
         return prompt_cache.save(prompt, ctx_tgt, ctx_dft, id, state_spec);
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, bool probe = false) {
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::vector<common_adapter_lora_info> & lora_new, bool probe = false) {
         std::vector<uint8_t> state_spec;
 
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, &state_spec, probe);
+        bool res = prompt_cache.load(prompt, tokens, lora_new, ctx_tgt, ctx_dft, id, &state_spec, probe);
         if (res && spec && !state_spec.empty()) {
             common_speculative_set_state(spec, id, state_spec);
         }
@@ -1212,6 +1212,9 @@ private:
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
     int32_t n_swa;
 
+    // n_swa for server_prompt::get_reuse(): 0 with a recurrent state, which holds one position only
+    int32_t n_swa_reuse;
+
     // slots / clients
     std::vector<server_slot> slots;
 
@@ -1658,6 +1661,9 @@ private:
         }
 
         n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
+
+        // the min position of a hybrid memory is the position of its recurrent state, not the start of the SWA window
+        n_swa_reuse = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt) ? 0 : n_swa;
 
         // Necessary similarity of prompt for slot selection
         slot_sched.slot_prompt_similarity = params_base.slot_prompt_similarity;
@@ -2459,7 +2465,7 @@ private:
 
             slot.prompt_save(*prompt_cache);
 
-            if (!slot.prompt_load(*prompt_cache, task.tokens)) {
+            if (!slot.prompt_load(*prompt_cache, task.tokens, get_task_lora(task))) {
                 slot.prompt_clear();
             }
 
@@ -2469,7 +2475,7 @@ private:
         } else if (plan.probe_cache) {
             const int64_t t_start = ggml_time_us();
 
-            if (!slot.prompt_load(*prompt_cache, task.tokens, true)) {
+            if (!slot.prompt_load(*prompt_cache, task.tokens, get_task_lora(task), true)) {
                 slot.prompt_clear();
             }
 
@@ -2519,6 +2525,11 @@ private:
         return output;
     }
 
+    // per-request lora if given, otherwise the global config
+    std::vector<common_adapter_lora_info> get_task_lora(const server_task & task) const {
+        return task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         // A prompt-cache restore move-assigns a whole server_prompt over the slot's,
         // and cached entries are text-only, so their tokens carry has_mtmd = false.
@@ -2526,18 +2537,19 @@ private:
         // hits GGML_ASSERT(has_mtmd) in server_tokens::push_back. Re-stamp per launch.
         slot.prompt.tokens.has_mtmd = mctx != nullptr;
 
-        // per-request lora if given, otherwise the global config
-        auto task_loras = task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
-        if (!are_lora_equal(task_loras, slot.lora)) {
+        auto task_loras = get_task_lora(task);
+
+        // the state can come from the prompt cache, so it is compared with its own lora config, not with the one of the last task
+        if (!are_lora_equal(task_loras, slot.prompt.lora)) {
             // if lora has changed, check to see if the cache should be cleared
-            if (lora_should_clear_cache(slot.lora, task_loras)) {
-                SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task_loras.size());
+            if (lora_should_clear_cache(slot.prompt.lora, task_loras)) {
+                SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.prompt.lora.size(), task_loras.size());
                 slot.prompt.clear();
             } else {
                 SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
             }
-            slot.lora = task_loras;
         }
+        slot.lora = task_loras;
 
         // if using alora, make sure it's only a single one requested and active
         size_t alora_invocation_start = task.tokens.size();
@@ -2586,6 +2598,8 @@ private:
                 slot.alora_invocation_start = alora_invocation_start;
             }
         }
+
+        slot.prompt.lora = slot.lora;
 
         if (!task.tokens.validate(ctx_tgt)) {
             send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
@@ -3686,7 +3700,7 @@ private:
                         child.t_start_us = task.t_start_us;
                     }
 
-                    const auto plan = slot_sched.select(get_slot_infos(), task);
+                    const auto plan = slot_sched.select(get_slot_infos(), task, get_task_lora(task));
 
                     server_slot * slot = plan.id_slot == -1 ? nullptr : get_slot_by_id(plan.id_slot);
 
@@ -5056,7 +5070,7 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                auto reuse = slot.prompt.get_reuse(n_past, has_new_tokens, n_swa, pos_min);
+                                auto reuse = slot.prompt.get_reuse(n_past, has_new_tokens, n_swa_reuse, pos_min);
 
                                 if (reuse.ckpt) {
                                     const auto & cur = *reuse.ckpt;
@@ -5417,7 +5431,7 @@ private:
                     // The previous batches are decoded and this one is not yet, so the contexts hold exactly the
                     // first n_tokens_start tokens: the moment to write a shared prefix entry. An entry with the same
                     // tokens is only touched, so this costs a directory scan except the first time a prefix is seen.
-                    if (n_tokens_cur > 0 && is_prefix_point((int32_t) n_tokens_start) &&
+                    if (n_tokens_cur > 0 && is_prefix_point((int32_t) n_tokens_start) && lora_get_enabled_ids(slot.lora).empty() &&
                             (size_t) n_tokens_start >= prompt_cache->disk_min_tokens &&
                             pos_min >= 0 && pos_max == (llama_pos) n_tokens_start - 1) {
                         server_tokens tokens_prefix = slot.prompt.tokens.clone();

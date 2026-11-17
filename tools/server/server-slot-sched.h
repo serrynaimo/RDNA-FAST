@@ -28,6 +28,10 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // the lora config that the tokens were processed with, it follows the state to the prompt cache and back
+    // TODO: slot files do not store it
+    std::vector<common_adapter_lora_info> lora;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
@@ -41,11 +45,13 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            lora,
         };
     }
 
     // n_prefix: tokens shared with the new prompt, must be > 0
     // has_new_tokens: the new prompt is longer than n_prefix
+    // n_swa: 0 if a state must end right before the next token (no SWA, or recurrent)
     // pos_min: min position of the live state
     // n_past == 0 without a checkpoint means that nothing can be reused
     server_prompt_reuse get_reuse(int32_t n_prefix, bool has_new_tokens, int32_t n_swa, llama_pos pos_min) const;
@@ -312,7 +318,9 @@ struct server_prompt_cache {
     bool has_disk_prefix(const server_tokens & tokens, size_t n_tokens) const;
 
     // restore the most useful entry (RAM or disk) for tokens_new into the slot, if any is
-    // better than what the slot already holds. On a hit, `prompt` is replaced and
+    // better than what the slot already holds. lora_new: the lora config of the new prompt, the states made with
+    // another config are skipped; the disk tier holds only states made without an active adapter (its files do not
+    // record the config), so it is used only when lora_new has none. On a hit, `prompt` is replaced and
     // `state_spec` (optional) receives the entry's exact-boundary speculative state.
     // `probe` marks a lookup made while the slot keeps serving the same conversation
     // (near-miss logging is then demoted to debug).
@@ -320,6 +328,7 @@ struct server_prompt_cache {
     bool load(
               server_prompt & prompt,
         const server_tokens & tokens_new,
+        const std::vector<common_adapter_lora_info> & lora_new,
               llama_context * ctx_tgt,
               llama_context * ctx_dft,
                     int32_t   id_slot,
@@ -391,5 +400,6 @@ struct server_slot_sched {
     // idle slots that lose the least by being reused: empty slots first, then the least recently used ones
     std::vector<int> get_free_slots(const std::vector<server_slot_info> & slots, size_t n_slots_needed, int exclude_id_slot) const;
 
-    server_slot_plan select(const std::vector<server_slot_info> & slots, const server_task & task) const;
+    // lora: the lora config of the task
+    server_slot_plan select(const std::vector<server_slot_info> & slots, const server_task & task, const std::vector<common_adapter_lora_info> & lora) const;
 };
