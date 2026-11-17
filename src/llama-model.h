@@ -836,6 +836,7 @@ struct llama_model {
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
     std::vector<ggml_tensor *> ple_ngram_embd;
     struct ggml_tensor * per_layer_tok_embd_s = nullptr; // optional scalar scale of an FP8 table
+    float per_layer_tok_embd_scale            = 1.0f;    // value of per_layer_tok_embd_s, read after load
 
     // limite value embeddings
     struct ggml_tensor * value_embd = nullptr;
