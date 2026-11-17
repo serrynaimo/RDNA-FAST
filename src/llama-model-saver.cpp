@@ -549,6 +549,7 @@ void llama_model_saver::add_tensors_from_model() {
     for (const ggml_tensor * tensor : model->ple_ngram_embd) {
         add_tensor(tensor);
     }
+    add_tensor(model->per_layer_tok_embd_s);
     add_tensor(model->value_embd);
     add_tensor(model->hc_head_norm);
     add_tensor(model->hc_head_down);
