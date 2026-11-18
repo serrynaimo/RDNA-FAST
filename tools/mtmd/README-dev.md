@@ -83,7 +83,7 @@ Due to wide variety of audio generation pipelines, the `mtmd_gen_audio` system i
     - 60% changes inside `mtmd-helper-gen.cpp`
     - 10% changes inside `libmtmd` and `clip.cpp` systems
     - The rest downstream code (CLI, server) should have no changes at all
-5. Update usage documentation in `tools/tts/README.md`
+5. Update usage documentation in `docs/multimodal/tts.md`
 
 IMPORTANT: If your model needs changes that don't fit the existing infrastructure, **open an issue first for discussion**.
 

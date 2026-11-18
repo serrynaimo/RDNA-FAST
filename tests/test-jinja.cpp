@@ -2,6 +2,7 @@
 #include <iostream>
 #include <random>
 #include <cstdlib>
+#include <future>
 
 #include "chat-tts-norm.h"
 #include "json.h"
@@ -42,6 +43,8 @@ static void test_string_parts(testing & t);
 static void test_fuzzing(testing & t);
 static void test_tts_norm_patterns(testing & t);
 
+static void test_shared_render(testing & t);
+
 static bool g_python_mode = false;
 
 int main(int argc, char *argv[]) {
@@ -79,6 +82,7 @@ int main(int argc, char *argv[]) {
     t.test("object methods", test_object_methods);
     t.test("tts norm patterns", test_tts_norm_patterns);
     if (!g_python_mode) {
+        t.test("shared render", test_shared_render);
         t.test("hasher", test_hasher);
         t.test("stats", test_stats);
         t.test("caps", test_caps);
@@ -87,6 +91,45 @@ int main(int argc, char *argv[]) {
     }
 
     return t.summary();
+}
+
+static void test_shared_render(testing & t) {
+    t.test("shared AST with stats and input marking", [](testing & t) {
+        const std::string source = "{% macro emit(x) %}{{ x }}{% endmacro %}{% for i in range(2) %}{{ emit(prefix) }}{{ i }}{% endfor %}{% filter upper %}{{ body }}{% endfilter %}|{{ 'literal' is string }}|{{ obj.value }}";
+        const auto program = jinja::parse_from_tokens(jinja::lexer().tokenize(source));
+        std::vector<std::future<bool>> workers;
+        for (int worker = 0; worker < 8; ++worker) {
+            workers.push_back(std::async(std::launch::async, [&, worker] {
+                const auto prefix = "p" + std::to_string(worker);
+                for (int i = 0; i < 25; ++i) {
+                    jinja::context ctx(source);
+                    ctx.is_get_stats = i % 2 != 0;
+                    const json input = {
+                        { "prefix", prefix },
+                        { "body", "hi" },
+                        { "obj", { { "value", "V" } } }
+                    };
+                    jinja::global_from_json(ctx, input, true);
+                    const auto result = jinja::runtime::gather_string_parts(jinja::runtime(ctx).execute(program));
+                    if (result->as_string().str() != prefix + "0" + prefix + "1HI|True|V") {
+                        return false;
+                    }
+                    if (ctx.get_val("obj")->at("value")->stats.used != ctx.is_get_stats) {
+                        return false;
+                    }
+                    if (result->val_str.parts.empty() || !result->val_str.parts.front().is_input ||
+                        !result->val_str.parts.back().is_input) {
+                        return false;
+                    }
+                }
+                return true;
+            }));
+        }
+        for (auto & worker : workers) {
+            t.assert_true("request-local state", worker.get());
+        }
+    });
+
 }
 
 static void test_whitespace_control(testing & t) {
@@ -502,6 +545,13 @@ static void test_expressions(testing & t) {
         "c"
     );
 
+    test_template(t, "array index boundaries",
+        "{% for items in arrays %}{% for i in indices %}{{ items[i] | default('_') }}|{% endfor %};{% endfor %}",
+        {{"arrays", json::array({json::array({"a", "b", "c"}), json::array()})},
+         {"indices", json::array({INT64_MIN, -4, -3, -1, 0, 2, 3, INT64_MAX})}},
+        "_|_|a|c|a|c|_|_|;_|_|_|_|_|_|_|_|;"
+    );
+
     test_template(t, "array bool access",
         "{{ items[true] }}",
         {{"items", json::array({"a", "b", "c"})}},
@@ -575,6 +625,14 @@ static void test_expressions(testing & t) {
         "('c', 'b', 'a')"
     );
 
+    test_template(t, "multipart string comparison and access",
+        "{% set left = a + 'bc' %}{% set right = 'ab' + c %}{{ left == right }}|"
+        "{{ left[0] }}{{ left[1] }}{{ left[2] }}|{{ right[1:3] }}|"
+        "{{ left[3] is undefined }}|{{ empty[0] is undefined }}",
+        {{"a", "a"}, {"c", "c"}, {"empty", ""}},
+        "True|abc|bc|True|True"
+    );
+
     test_template(t, "string slice negative step",
         "{{ 'abcdef'[::-2] }}",
         json::object(),
@@ -597,6 +655,42 @@ static void test_expressions(testing & t) {
         "{{ (a + b) * c }}",
         {{"a", 2}, {"b", 3}, {"c", 4}},
         "20"
+    );
+
+    test_template(t, "floor division",
+        "{{ 7 // 2 }},{{ -7 // 2 }},{{ 7 // -2 }},{{ 7.5 // 2 }},{{ a // b }}",
+        {{"a", 10}, {"b", 3}},
+        "3,-4,-4,3.0,3"
+    );
+
+    test_template(t, "string comparison",
+        "{{ 'b' > 'a' }},{{ 'VBD' > 'VB' }},{{ 'a' <= 'a' }},{{ 'Z' < 'a' }},{{ 'ab' >= 'b' }}",
+        json::object(),
+        "True,True,True,True,False"
+    );
+
+    test_template(t, "unary minus after keyword",
+        "{{ 1 if false else -1 }},{{ not -1 }},{{ x and -2 }},{{ -3 if x }}",
+        {{"x", true}},
+        "-1,False,-2,-3"
+    );
+
+    test_template(t, "unary minus after elif",
+        "{% if false %}a{% elif -1 < 0 %}b{% endif %}",
+        json::object(),
+        "b"
+    );
+
+    test_template(t, "unary and binary sign",
+        "{{ -x }},{{ - 1 }},{{ --x }},{{ 1 - -x }},{{ 1 -1 }},{{ x -1 }},{{ [x, -1][-1] }},{{ +x }},{{ -x|abs }}",
+        {{"x", 3}},
+        "-3,-1,3,4,0,2,-1,3,3"
+    );
+
+    test_template(t, "binary minus after keyword attribute",
+        "{{ a.else - 1 }}",
+        {{"a", {{"else", 3}}}},
+        "2"
     );
 
     test_template(t, "string concat ~",
@@ -632,6 +726,31 @@ static void test_expressions(testing & t) {
     test_template_error(t, "too deeply nested parentheses",
         "{{ " + std::string(1000, '(') + "1" + std::string(1000, ')') + " }}",
         "template is nested more than 128 levels deep"
+    );
+
+    test_template_error(t, "undefined hint: missing object key (attr)",
+        "{% set m = {'a': 1} %}{{ m.missing_key() }}",
+        "Callee is not a function: got Undefined (hint: 'missing_key')"
+    );
+
+    test_template_error(t, "undefined hint: missing object key (subscript)",
+        "{% set m = {'a': 1} %}{{ m['missing_key']() }}",
+        "Callee is not a function: got Undefined (hint: 'missing_key')"
+    );
+
+    test_template_error(t, "undefined hint: unknown array attribute",
+        "{% set a = [1] %}{{ a.missing_key() }}",
+        "Callee is not a function: got Undefined (hint: 'missing_key')"
+    );
+
+    test_template_error(t, "undefined hint: unknown string attribute",
+        "{% set s = 'x' %}{{ s.missing_key() }}",
+        "Callee is not a function: got Undefined (hint: 'missing_key')"
+    );
+
+    test_template_error(t, "undefined hint: unknown int attribute",
+        "{% set n = 1 %}{{ n.missing_key() }}",
+        "Callee is not a function: got Undefined (hint: 'missing_key')"
     );
 }
 
@@ -1008,6 +1127,12 @@ static void test_filters(testing & t) {
         "{\"a\": 1, \"b\": 2}"
     );
 
+    test_template(t, "tojson sort_keys=true nested with separators",
+        "{{ data|tojson(sort_keys=true, separators=(',',':')) }}",
+        {{"data", {{"name", "f"}, {"args", {{"z", 1}, {"a", json::array({json{{"y", 2}, {"b", 3}}})}}}}}},
+        "{\"args\":{\"a\":[{\"b\":3,\"y\":2}],\"z\":1},\"name\":\"f\"}"
+    );
+
     test_template(t, "tojson",
         "{{ data|tojson }}",
         {{"data", {{"a", 1}, {"b", json::array({1, 2})}}}},
@@ -1345,6 +1470,15 @@ static void test_macros(testing & t) {
         "a+b"
     );
 
+    test_template(t, "caller saved and called after its scope ended",
+        "{% set ns = namespace(f=none) %}"
+        "{% macro keep() %}{% set ns.f = caller %}{% endmacro %}"
+        "{% macro outer(p) %}{% call keep() %}[{{ p }}]{% endcall %}{% endmacro %}"
+        "{{ outer('a') }}{{ outer('b') }}{{ ns.f() }}{{ ns.f() }}",
+        json::object(),
+        "[b][b]"
+    );
+
     test_template(t, "macro with caller",
         "\
 {%- macro nest_dict(o, i, ff='') %}\n\
@@ -1438,6 +1572,17 @@ static void test_tests(testing & t) {
         "{{ 'yes' if x is divisibleby(2) }}",
         {{"x", 2}},
         "yes"
+    );
+
+    test_template(t, "is divisibleby -1 with INT64_MIN",
+        "{{ x is divisibleby(-1) }}",
+        {{"x", INT64_MIN}},
+        "True"
+    );
+
+    test_template_error(t, "is divisibleby zero",
+        "{{ 10 is divisibleby(0) }}",
+        "divisibleby: division by zero"
     );
 
     test_template(t, "is eq",
@@ -2096,6 +2241,12 @@ static void test_array_methods(testing & t) {
         "6"
     );
 
+    test_template(t, "array|sum",
+        "{{ [1, 2.5, 3]|sum }},{{ [1, 2]|sum(start=10) }},{{ items|sum(attribute='w') }},{{ []|sum }}",
+        {{"items", json::array({{{"w", 1}}, {{"w", 2}}})}},
+        "6.5,13,3,0"
+    );
+
     test_template(t, "array|min",
         "{{ [tool_calls_count, tool_sep_count]|min }}",
         {{"tool_calls_count", 2}, {"tool_sep_count", 1}},
@@ -2729,6 +2880,27 @@ static void test_string_parts(testing & t) {
         jinja::runtime runtime(ctx);
         return runtime.gather_string_parts(runtime.execute(ast))->as_string();
     };
+
+    t.test("comparison across part boundaries", [](testing & t) {
+        jinja::string left, right;
+        left.parts = {{true, "a"}, {false, "bc"}};
+        right.parts = {{false, "ab"}, {true, "c"}};
+        t.assert_true("equal text with different partitions", left.equals(right) && right.equals(left));
+
+        right.parts = {{false, ""}, {false, "ab"}, {true, ""}, {true, "c"}, {false, ""}};
+        t.assert_true("empty parts do not change equality", left.equals(right) && right.equals(left));
+        t.assert_true("different bytes are unequal", !left.equals(jinja::string("abd")));
+        t.assert_true("prefixes are unequal", !left.equals(jinja::string("ab")) && !jinja::string("ab").equals(left));
+
+        jinja::string empty;
+        empty.parts = {{true, ""}, {false, ""}};
+        t.assert_true("empty partitions equal an empty string", empty.equals(jinja::string()) && jinja::string().equals(empty));
+
+        auto object = jinja::mk_val<jinja::value_object>();
+        object->insert(jinja::mk_val<jinja::value_string>(left), jinja::mk_val<jinja::value_int>(7));
+        const auto found = object->find(jinja::mk_val<jinja::value_string>(right));
+        t.assert_true("object keys ignore partition boundaries", found && found->as_int() == 7);
+    });
 
     t.test("merge joins only the neighbours with the same type", [](testing & t) {
         // "AB" comes from the input and merges, "-" comes from the template and must not

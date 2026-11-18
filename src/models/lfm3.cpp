@@ -187,7 +187,7 @@ llama_model_lfm3::graph<decision>::graph(const llama_model & model, const llm_gr
             prev_cur = ggml_get_rows(ctx0, prev_cur, inp_out_ids);
         }
 
-        cur = ggml_add(ctx0, prev_cur, cur);
+        cur = ggml_add(ctx0, cur, prev_cur);
 
         auto * ffn_norm_out = build_norm(cur, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
         cb(ffn_norm_out, "model.layers.{}.ffn_norm", il);
@@ -199,7 +199,7 @@ llama_model_lfm3::graph<decision>::graph(const llama_model & model, const llm_gr
             cb(ffn_out, "model.layers.{}.post_ffn_norm", il);
         }
 
-        cur = ggml_add(ctx0, cur, ffn_out);
+        cur = ggml_add(ctx0, ffn_out, cur);
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);

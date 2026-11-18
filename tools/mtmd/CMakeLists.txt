@@ -29,6 +29,10 @@ set(MTMD_CORE_SOURCES
     clip-graph.h
 )
 
+if (MTMD_VIDEO)
+    list(APPEND MTMD_CORE_SOURCES mtmd-helper-video-ffmpeg.cpp)
+endif()
+
 add_library(mtmd
             ${MTMD_CORE_SOURCES}
             models/models.h

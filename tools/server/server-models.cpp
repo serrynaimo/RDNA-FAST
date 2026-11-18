@@ -299,6 +299,8 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_ARG_MODELS_API_LOOPBACK_ONLY");
     preset.unset_option("LLAMA_ARG_CONNECT");
     preset.unset_option("LLAMA_ARG_CONNECT_CODE");
+    preset.unset_option("LLAMA_ARG_MCP_SERVERS_CONFIG");
+    preset.unset_option("LLAMA_ARG_MCP_SERVERS_JSON");
     if (unset_model_args) {
         preset.unset_option("LLAMA_ARG_MODEL");
         preset.unset_option("LLAMA_ARG_MMPROJ");
