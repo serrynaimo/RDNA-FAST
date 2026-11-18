@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cinttypes>
+#include <climits>
 #include <vector>
 
 //#define MTMD_AUDIO_DEBUG
@@ -349,6 +350,74 @@ static bool decode_audio_from_buf(const unsigned char * buf_in, size_t len, int 
 }
 
 } // namespace audio_helpers
+
+struct mtmd_helper_resampler {
+    ma_resampler       rs;
+    bool               passthrough = false;
+    std::vector<float> out;
+};
+
+mtmd_helper_resampler * mtmd_helper_resampler_init(int32_t rate_in, int32_t rate_out) {
+    if (rate_in <= 0 || rate_out <= 0) {
+        LOG_ERR("%s: invalid sample rate %d -> %d\n", __func__, rate_in, rate_out);
+        return nullptr;
+    }
+    auto * ctx = new mtmd_helper_resampler;
+    if (rate_in == rate_out) {
+        ctx->passthrough = true;
+        return ctx;
+    }
+    ma_resampler_config config = ma_resampler_config_init(ma_format_f32, 1, (ma_uint32) rate_in, (ma_uint32) rate_out,
+                                                          ma_resample_algorithm_linear);
+    config.linear.lpfOrder = MA_MAX_FILTER_ORDER;
+    if (ma_resampler_init(&config, nullptr, &ctx->rs) != MA_SUCCESS) {
+        LOG_ERR("%s: failed to initialize the resampler %d -> %d\n", __func__, rate_in, rate_out);
+        delete ctx;
+        return nullptr;
+    }
+    return ctx;
+}
+
+void mtmd_helper_resampler_free(mtmd_helper_resampler * ctx) {
+    if (!ctx) {
+        return;
+    }
+    if (!ctx->passthrough) {
+        ma_resampler_uninit(&ctx->rs, nullptr);
+    }
+    delete ctx;
+}
+
+int64_t mtmd_helper_resampler_process(mtmd_helper_resampler * ctx, const float * in, size_t n_in, const float ** out) {
+    if (ctx->passthrough) {
+        *out = in;
+        return (int64_t) n_in;
+    }
+    ma_uint64 n_expected = 0;
+    if (ma_resampler_get_expected_output_frame_count(&ctx->rs, n_in, &n_expected) != MA_SUCCESS) {
+        return -1;
+    }
+    ctx->out.resize(n_expected + 16);
+    size_t n_done_in  = 0;
+    size_t n_done_out = 0;
+    while (n_done_in < n_in) {
+        if (n_done_out == ctx->out.size()) {
+            ctx->out.resize(ctx->out.size() * 2);
+        }
+        ma_uint64 cnt_in  = n_in - n_done_in;
+        ma_uint64 cnt_out = ctx->out.size() - n_done_out;
+        if (ma_resampler_process_pcm_frames(&ctx->rs, in + n_done_in, &cnt_in, ctx->out.data() + n_done_out, &cnt_out) != MA_SUCCESS) {
+            return -1;
+        }
+        if (cnt_in == 0 && cnt_out == 0) {
+            break;
+        }
+        n_done_in  += cnt_in;
+        n_done_out += cnt_out;
+    }
+    *out = ctx->out.data();
+    return (int64_t) n_done_out;
+}
 
 static bool is_webp_file(const unsigned char * buf, size_t len) {
     // WEBP ref: https://developers.google.com/speed/webp/docs/riff_container
@@ -869,6 +938,54 @@ static mtmd_bitmap * decode_still_image(const char * path, const unsigned char *
 
 static void mtmd_helper_video_set_id(mtmd_helper_video * vctx, const std::string & id) {
     vctx->id = id;
+}
+
+int32_t mtmd_helper_get_media_meta(const unsigned char * buf, size_t len, mtmd_helper_init_opt opt, mtmd_helper_media_meta * out) {
+    *out = {MTMD_HELPER_MEDIA_TYPE_UNKNOWN, 0, 0, 0, -1.0f, -1};
+
+    if (audio_helpers::is_audio_file((const char *) buf, len)) {
+        // zero channels and rate: the source format, so the length comes from the header (or an mp3 frame scan)
+        ma_decoder_config cfg = ma_decoder_config_init(ma_format_f32, 0, 0);
+        ma_decoder dec;
+        if (ma_decoder_init_memory(buf, len, &cfg, &dec) != MA_SUCCESS) {
+            return 1;
+        }
+        ma_uint64 n = 0;
+        if (ma_decoder_get_length_in_pcm_frames(&dec, &n) == MA_SUCCESS && dec.outputSampleRate > 0) {
+            out->duration = (float) ((double) n / dec.outputSampleRate);
+        }
+        out->type        = MTMD_HELPER_MEDIA_TYPE_AUDIO;
+        out->sample_rate = (int32_t) dec.outputSampleRate;
+        ma_decoder_uninit(&dec);
+        return 0;
+    }
+
+    int nx, ny, nc;
+    if (len <= INT_MAX && stbi_info_from_memory(buf, (int) len, &nx, &ny, &nc)) {
+        out->type   = MTMD_HELPER_MEDIA_TYPE_IMAGE;
+        out->width  = (uint32_t) nx;
+        out->height = (uint32_t) ny;
+        return 0;
+    }
+
+    // webp (not read by stb_image) and video go through the video decoder
+    mtmd_helper_video_init_params params = opt.video_params;
+    const bool is_webp = is_webp_file(buf, len);
+    if (is_webp && video_builtin_decoder()) {
+        params.decoder = nullptr; // see decode_still_image()
+    }
+    mtmd_helper_video_stream_info src;
+    if (!video_open(nullptr, buf, len, params, src)) {
+        return 1;
+    }
+    out->type   = is_webp ? MTMD_HELPER_MEDIA_TYPE_IMAGE : MTMD_HELPER_MEDIA_TYPE_VIDEO;
+    out->width  = src.width;
+    out->height = src.height;
+    if (!is_webp) {
+        out->duration = src.duration;
+        out->n_frames = src.n_frames;
+    }
+    return 0;
 }
 
 mtmd_helper_video_init_params mtmd_helper_video_init_params_default() {
