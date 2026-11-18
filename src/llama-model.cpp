@@ -341,6 +341,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_lfm2moe(params);
         case LLM_ARCH_LFM3:
             return new llama_model_lfm3(params);
+        case LLM_ARCH_ZAYA1:
+            return new llama_model_zaya1(params);
         case LLM_ARCH_SMALLTHINKER:
             return new llama_model_smallthinker(params);
         case LLM_ARCH_GROVEMOE:
@@ -3504,7 +3506,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // a null filter_idx means the GGUF has no indexer tensors
                     llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
                     const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
-                    if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
+                    if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP || arch == LLM_ARCH_ZAYA1) {
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
@@ -4018,6 +4020,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_LFM2:
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_LFM3:
+        case LLM_ARCH_ZAYA1:
         case LLM_ARCH_SMALLTHINKER:
         case LLM_ARCH_SEED_OSS:
         case LLM_ARCH_GROVEMOE:

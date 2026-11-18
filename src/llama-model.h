@@ -227,6 +227,23 @@ struct llama_layer_shortconv {
     struct ggml_tensor * out_proj = nullptr;
 };
 
+struct llama_layer_zaya1 {
+    struct ggml_tensor * cca_conv_grp   = nullptr;
+    struct ggml_tensor * cca_conv_grp_b = nullptr;
+    struct ggml_tensor * cca_temp       = nullptr;
+
+    struct ggml_tensor * attn_res_hs = nullptr;
+    struct ggml_tensor * ffn_res_hs  = nullptr;
+
+    struct ggml_tensor * router_eda     = nullptr;
+    struct ggml_tensor * router_norm    = nullptr;
+    struct ggml_tensor * router_fc1     = nullptr;
+    struct ggml_tensor * router_fc1_b   = nullptr;
+    struct ggml_tensor * router_fc2     = nullptr;
+    struct ggml_tensor * router_fc2_b   = nullptr;
+    struct ggml_tensor * router_out     = nullptr;
+};
+
 struct llama_layer_nextn {
     struct ggml_tensor * eh_proj               = nullptr;
     struct ggml_tensor * eh_proj_s             = nullptr;
@@ -659,8 +676,10 @@ struct llama_layer {
     // limite
     struct ggml_tensor * attn_ve_gate     = nullptr;
     struct ggml_tensor * attn_xsa_alpha   = nullptr;
-    struct ggml_tensor * attn_resid_scale = nullptr;
-    struct ggml_tensor * ffn_resid_scale  = nullptr;
+    struct ggml_tensor * attn_resid_scale   = nullptr;
+    struct ggml_tensor * attn_resid_scale_b = nullptr;
+    struct ggml_tensor * ffn_resid_scale    = nullptr;
+    struct ggml_tensor * ffn_resid_scale_b  = nullptr;
     struct ggml_tensor * mudd_down        = nullptr;
     struct ggml_tensor * mudd_up          = nullptr;
     struct ggml_tensor * mudd_up_b        = nullptr;
@@ -688,6 +707,8 @@ struct llama_layer {
     struct llama_layer_convnext convnext;
 
     struct llama_layer_shortconv shortconv;
+
+    struct llama_layer_zaya1 zaya1;
 
     struct llama_layer_nextn nextn;
 
@@ -878,6 +899,10 @@ struct llama_model {
     struct ggml_tensor * dspark_markov_w2_s = nullptr;
     struct ggml_tensor * dspark_conf_proj   = nullptr;
     struct ggml_tensor * dspark_conf_proj_b = nullptr;
+
+    // zaya1
+    struct ggml_tensor * res_scale_in   = nullptr;
+    struct ggml_tensor * res_scale_in_b = nullptr;
 
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;
