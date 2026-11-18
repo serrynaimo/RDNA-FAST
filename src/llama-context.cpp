@@ -3094,6 +3094,7 @@ uint32_t llama_context::graph_max_nodes() const {
         model.arch == LLM_ARCH_BAILINGMOE3 ||
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
+        model.arch == LLM_ARCH_ZONOS3 ||
         model.arch == LLM_ARCH_CLEF ||
         model.arch == LLM_ARCH_CLOVER_MOE ||
         model.arch == LLM_ARCH_QWEN4EXP ||
@@ -3103,7 +3104,8 @@ uint32_t llama_context::graph_max_nodes() const {
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_MINIMAX_01 ||
         model.arch == LLM_ARCH_MINIMAX_M3 ||
-        model.arch == LLM_ARCH_HY_V4) {
+        model.arch == LLM_ARCH_HY_V4 ||
+        model.arch == LLM_ARCH_INKLING2) {
         res = std::max<uint32_t>(1024u, 32u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
         // DFlash2's convolutions and selector are shape work rather than matmuls,

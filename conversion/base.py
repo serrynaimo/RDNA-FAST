@@ -2436,6 +2436,9 @@ class TextModel(ModelBase):
         if chkhsh == "a9af07a84191f55098b248ae6f3dfe9e32d3190bebe8eafd91c1ddec9bc3449f":
             # ref: https://huggingface.co/IFM/K2-Horizon-36B
             res = "k2-horizon"
+        if chkhsh == "5635e1c8d621dff7b4825f41f2f97b6ceb39bcf2d5c541db28577080d6efd5e5":
+            # ref: https://huggingface.co/thinkingmachines/Inkling-2-Small
+            res = "inkling2"
 
         if res is None:
             logger.warning("\n")
@@ -3459,7 +3462,7 @@ def get_model_architecture(hparams: dict[str, Any], model_type: ModelType) -> st
     # Kimi-K3's text_config reports "KimiLinearForCausalLM", which is the older
     # Kimi-Linear-48B architecture and cannot load K3 (no attention residuals,
     # latent MoE, situ, ...). Route on the top-level architecture instead.
-    if model_type == ModelType.TEXT and arch in ("NEOChatModel", "StepVLForConditionalGeneration", "Sarashina2VisionForCausalLM", "Exaone4_5_ForConditionalGeneration", "Step3p7ForConditionalGeneration", "KimiK3ForConditionalGeneration", "Nemotron3_5TranscribeForConditionalGeneration"):
+    if model_type == ModelType.TEXT and arch in ("NEOChatModel", "StepVLForConditionalGeneration", "Sarashina2VisionForCausalLM", "Exaone4_5_ForConditionalGeneration", "Step3p7ForConditionalGeneration", "KimiK3ForConditionalGeneration", "Nemotron3_5TranscribeForConditionalGeneration", "HiggsAudio3Model"):
         return arch
 
     # if "architectures" is found in the sub-config, use that instead
@@ -3470,6 +3473,9 @@ def get_model_architecture(hparams: dict[str, Any], model_type: ModelType) -> st
     # some models (llava_onevision2) only declare the architecture inside text_config
     if arch is None and text_config.get("architectures") is not None:
         arch = text_config["architectures"][0]
+    # some configs only have a model_type (fishaudio/s2-pro)
+    if arch is None:
+        arch = hparams.get("model_type")
     if arch is None:
         raise ValueError("Failed to detect model architecture")
     return arch

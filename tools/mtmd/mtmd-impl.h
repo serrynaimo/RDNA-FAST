@@ -3,7 +3,7 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "gguf.h"
-#include "clip.h"
+#include "mtmd.h"
 
 #include <array>
 #include <climits>
@@ -25,7 +25,7 @@
 #include <windows.h>
 #endif
 
-// Internal header for clip.cpp
+// !!! Internal header, to be used by mtmd only !!!
 
 #define MTMD_INTERNAL_HEADER
 
@@ -106,6 +106,7 @@
 #define KEY_GEN_AUDIO_PROJ_TYPE    "clip.gen.audio.projector_type" // for models with mixed modalities
 // name of the weight variant, for settings that are not in the checkpoint
 #define KEY_GEN_AUDIO_VARIANT      "clip.gen.audio.model_variant"
+#define KEY_GEN_AUDIO_DEFAULT_VOICE "clip.gen.audio.default_voice"
 // sampling defaults of the generated audio, like general.sampling.* for text
 #define KEY_GEN_AUDIO_TEMP           "clip.gen.audio.sampling.temp"
 #define KEY_GEN_AUDIO_TOP_K          "clip.gen.audio.sampling.top_k"
@@ -124,6 +125,7 @@
 
 #define TN_POS_EMBD        "%s.position_embd.weight"
 #define TN_CLASS_EMBD      "v.class_embd"
+#define TN_CLASS_POS_EMBD  "v.class_position_embd.weight"
 #define TN_PATCH_EMBD      "v.patch_embd.weight"  // not rename tensor with ".0" postfix for backward compat
 #define TN_PATCH_EMBD_1    "v.patch_embd.weight.1"
 #define TN_PATCH_BIAS      "v.patch_embd.bias"
@@ -250,6 +252,12 @@
 #define TN_A_ASP_ATTN  "a.asp_attn.%s"
 #define TN_A_ASP_TDNN  "a.asp_tdnn.%s"
 
+// qwen3tts reference encoder, the transformer blocks use the generic names with the "a.gen.enc.tfm" prefix
+#define TN_A_GEN_ENC_QUANT_FIRST_IN  "a.gen.enc.quant.first.in_proj.%s"
+#define TN_A_GEN_ENC_QUANT_FIRST_CB  "a.gen.enc.quant.first.codebook.%s"
+#define TN_A_GEN_ENC_QUANT_REST_IN   "a.gen.enc.quant.rest.in_proj.%s"
+#define TN_A_GEN_ENC_QUANT_REST_CB   "a.gen.enc.quant.rest.codebook.%s"
+
 // qwen3tts code_predictor
 #define TN_A_GEN_CODE_PROJ_IN  "a.gen.code.proj_in.%s"
 #define TN_A_GEN_CODE_EMBD     "a.gen.code.embd.%s"
@@ -268,6 +276,31 @@
 #define TN_A_GEN_CODE_EH_PROJ      "a.gen.code.blk.%d.eh_proj.%s"
 #define TN_A_GEN_CODE_BLK_EMBD     "a.gen.code.blk.%d.embd.%s"
 #define TN_A_GEN_CODE_BLK_OUT_NORM "a.gen.code.blk.%d.out_norm.%s"
+
+// fish_s2: fast AR input embedding, shared by all codebooks
+#define TN_A_GEN_CODE_TOK_EMBD "a.gen.code.tok_embd.%s"
+
+// fish_s2 codec encoder, the transformer layers use the generic a.blk.* names
+#define TN_A_CODEC_ENC_ENTRY      "a.codec.enc.entry.%s"
+#define TN_A_CODEC_ENC_SNAKE      "a.codec.enc.blk.%d.snake.%s"
+#define TN_A_CODEC_ENC_CONV       "a.codec.enc.blk.%d.conv.%s"
+#define TN_A_CODEC_ENC_RES_ACT1   "a.codec.enc.blk.%d.res.%d.act1.%s"
+#define TN_A_CODEC_ENC_RES_CONV1  "a.codec.enc.blk.%d.res.%d.conv1.%s"
+#define TN_A_CODEC_ENC_RES_ACT2   "a.codec.enc.blk.%d.res.%d.act2.%s"
+#define TN_A_CODEC_ENC_RES_CONV2  "a.codec.enc.blk.%d.res.%d.conv2.%s"
+#define TN_A_CODEC_ENC_POST_SNAKE "a.codec.enc.post_snake.%s"
+#define TN_A_CODEC_ENC_POST_CONV  "a.codec.enc.post_conv.%s"
+#define TN_A_CODEC_DOWN_CONV      "a.codec.down.blk.%d.conv.%s"
+#define TN_A_CODEC_DOWN_DWCONV    "a.codec.down.blk.%d.dwconv.%s"
+#define TN_A_CODEC_DOWN_NORM      "a.codec.down.blk.%d.norm.%s"
+#define TN_A_CODEC_DOWN_PW1       "a.codec.down.blk.%d.pw1.%s"
+#define TN_A_CODEC_DOWN_PW2       "a.codec.down.blk.%d.pw2.%s"
+#define TN_A_CODEC_DOWN_GAMMA     "a.codec.down.blk.%d.gamma"
+#define TN_A_CODEC_PRE_NORM       "a.codec.pre_norm.%s"
+#define TN_A_CODEC_VQ_FIRST_IN    "a.codec.vq.first.in_proj.%s"
+#define TN_A_CODEC_VQ_FIRST_CB    "a.codec.vq.first.codebook.%s"
+#define TN_A_CODEC_VQ_REST_IN     "a.codec.vq.rest.in_proj.%s"
+#define TN_A_CODEC_VQ_REST_CB     "a.codec.vq.rest.codebook.%s"
 
 // qwen3tts code2wav (RVQ codes -> raw PCM)
 // pre_transformer layers use the generic TN_ATTN_*/TN_FFN_*/TN_LN_*/TN_LS_* macros, prefix "a.gen.wav.tfm"
@@ -413,6 +446,17 @@
 #define TN_A_CONV1D_NORM     "a.conv1d.%d.norm.%s"
 #define TN_A_PATCH           "a.patch.%d.%s"
 #define TN_A_PATCH_NORM      "a.patch.%d.norm.%s"
+
+// vibevoice-asr: causal ConvNeXt encoders, first index = encoder (0 = acoustic, 1 = semantic)
+#define TN_A_CNX_CONV        "a.cnx.%d.conv.%d.%s"
+#define TN_A_CNX_NORM        "a.cnx.%d.blk.%d.norm.%s"
+#define TN_A_CNX_DW          "a.cnx.%d.blk.%d.dw.%s"
+#define TN_A_CNX_LS1         "a.cnx.%d.blk.%d.ls1.%s"
+#define TN_A_CNX_FFN_NORM    "a.cnx.%d.blk.%d.ffn_norm.%s"
+#define TN_A_CNX_FFN_UP      "a.cnx.%d.blk.%d.ffn_up.%s"
+#define TN_A_CNX_FFN_DOWN    "a.cnx.%d.blk.%d.ffn_down.%s"
+#define TN_A_CNX_LS2         "a.cnx.%d.blk.%d.ls2.%s"
+#define TN_MM_AUDIO_MLP_NORM "mm.a.mlp_norm.%d.%s"
 #define TN_A_OUT_PROJ        "a.pre_encode.out.%s"
 #define TN_A_ATTN_PRE_NORM   "%s.blk.%d.attn_pre_norm.%s"
 #define TN_A_ATTN_POST_NORM  "%s.blk.%d.attn_post_norm.%s"
@@ -490,42 +534,7 @@
 #define TN_A_FUSION_KERNEL       "a.fusion.spk_kernel"
 
 // align x to upper multiple of n
-#define CLIP_ALIGN(x, n) ((((x) + (n) - 1) / (n)) * (n))
-
-// sliding window KV cache of a causal audio encoder, see clip_enc_state_init()
-struct clip_enc_state {
-    int32_t n_ctx  = 0; // ring slots: attention window + frames per call
-    int32_t n_past = 0; // absolute position of the next frame
-
-    std::vector<int32_t> slot_pos;  // absolute position held by each slot, -1 if empty
-    std::vector<float>   stem_tail; // last conv stem output frame, empty on a cold start
-
-    ggml_context_ptr        ctx_data;
-    ggml_backend_buffer_ptr buf;
-    std::vector<ggml_tensor *> k; // per layer [n_embd_kv, n_ctx]
-    std::vector<ggml_tensor *> v;
-
-    // lfm3a: same order as list_lfm3a_state_slots(), F32 [ne0, ne1], updated in place
-    std::vector<ggml_tensor *> slots;
-
-    // nemotron transcribe: the window's normalized log-mel, cache and FIFO rows in; its speaker rows and predictions out
-    std::vector<float> mel_norm;
-    std::vector<float> spk_prev;
-    std::vector<float> spk_chunk, spk_preds;
-};
-
-// per-sequence state of audio generation, see clip_gen_state_init()
-struct clip_gen_state {
-    std::mt19937 rng;
-
-    ggml_context_ptr        ctx_data;
-    ggml_backend_buffer_ptr buf;
-    std::vector<ggml_tensor *> slots; // same order as list_gen_state_slots(), F32 [ne0, ne1]
-};
-
-// forward declaration
-// TODO: improve this later
-struct clip_ctx;
+#define MTMD_ALIGN(x, n) ((((x) + (n) - 1) / (n)) * (n))
 
 enum projector_type {
     PROJECTOR_TYPE_MLP,
@@ -555,7 +564,9 @@ enum projector_type {
     PROJECTOR_TYPE_QWEN2A,
     PROJECTOR_TYPE_QWEN3A,
     PROJECTOR_TYPE_GLMA,
-    PROJECTOR_TYPE_QWEN25O, // will be replaced by QWEN2A or QWEN25VL depending on clip_ctx
+    PROJECTOR_TYPE_HIGGS_AUDIO,
+    PROJECTOR_TYPE_VIBEVOICE_ASR,
+    PROJECTOR_TYPE_QWEN25O, // will be replaced by QWEN2A or QWEN25VL depending on mtmd_subcontext
     PROJECTOR_TYPE_VOXTRAL,
     PROJECTOR_TYPE_VOXTRAL_RT,
     PROJECTOR_TYPE_MERALION,
@@ -574,6 +585,7 @@ enum projector_type {
     PROJECTOR_TYPE_DEEPSEEKOCR,
     PROJECTOR_TYPE_DEEPSEEKOCR2,
     PROJECTOR_TYPE_DEEPSEEK4V,
+    PROJECTOR_TYPE_DEEPSEEK41V,
     PROJECTOR_TYPE_LFM2A,
     PROJECTOR_TYPE_D1OMNI_A,
     PROJECTOR_TYPE_LFM3A,
@@ -582,6 +594,7 @@ enum projector_type {
     PROJECTOR_TYPE_YOUTUVL,
     PROJECTOR_TYPE_YASA2,
     PROJECTOR_TYPE_KIMIK25,
+    PROJECTOR_TYPE_KIMIK31,
     PROJECTOR_TYPE_NEMOTRON_V2_VL,
     PROJECTOR_TYPE_NEMOTRON_OMNI,
     PROJECTOR_TYPE_HUNYUANVL,
@@ -602,14 +615,23 @@ enum projector_type {
     PROJECTOR_TYPE_POCKETTTS_SPKENC,
     PROJECTOR_TYPE_POCKETTTS_GEN,
     PROJECTOR_TYPE_SOPRANO,
+    PROJECTOR_TYPE_KOKORO,
+    PROJECTOR_TYPE_TINY_VOCA,
     PROJECTOR_TYPE_LFM3A_GEN,
     PROJECTOR_TYPE_DRAMA3_GEN,
+    PROJECTOR_TYPE_ZONOS3_GEN,
+    PROJECTOR_TYPE_ZONOS3_SPKENC,
+    PROJECTOR_TYPE_YUE2_GEN,
+    PROJECTOR_TYPE_MINIMAX_MUSIC3_GEN,
+    PROJECTOR_TYPE_FISH_S2_GEN,
+    PROJECTOR_TYPE_FISH_S2_SPKENC,
     PROJECTOR_TYPE_MUSE_GLIMMER,
     PROJECTOR_TYPE_SENSENOVA_U1,
     PROJECTOR_TYPE_COHERE2V,
     PROJECTOR_TYPE_MUSE_SPARK_AUDIO,
     PROJECTOR_TYPE_CHATTERBOX,
     PROJECTOR_TYPE_CHATTERBOX_SPKENC,
+    PROJECTOR_TYPE_INKLING2V,
     PROJECTOR_TYPE_UNKNOWN,
 };
 
@@ -640,6 +662,8 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_QWEN2A,            "qwen2a"},
     { PROJECTOR_TYPE_QWEN3A,            "qwen3a"},
     { PROJECTOR_TYPE_GLMA,              "glma"},
+    { PROJECTOR_TYPE_HIGGS_AUDIO,       "higgs_audio"},
+    { PROJECTOR_TYPE_VIBEVOICE_ASR,     "vibevoice_asr"},
     { PROJECTOR_TYPE_QWEN25O,           "qwen2.5o"},
     { PROJECTOR_TYPE_VOXTRAL,           "voxtral"},
     { PROJECTOR_TYPE_VOXTRAL_RT,        "voxtral_rt"},
@@ -659,6 +683,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_DEEPSEEKOCR,       "deepseekocr"},
     { PROJECTOR_TYPE_DEEPSEEKOCR2,      "deepseekocr2"},
     { PROJECTOR_TYPE_DEEPSEEK4V,        "deepseek4v"},
+    { PROJECTOR_TYPE_DEEPSEEK41V,       "deepseek41v"},
     { PROJECTOR_TYPE_LFM2A,             "lfm2a"},
     { PROJECTOR_TYPE_D1OMNI_A,          "d1omni_a"},
     { PROJECTOR_TYPE_LFM3A,             "lfm3a"},
@@ -667,6 +692,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_YOUTUVL,           "youtuvl"},
     { PROJECTOR_TYPE_YASA2,             "yasa2"},
     { PROJECTOR_TYPE_KIMIK25,           "kimik25"},
+    { PROJECTOR_TYPE_KIMIK31,           "kimik31"},
     { PROJECTOR_TYPE_NEMOTRON_V2_VL,    "nemotron_v2_vl"},
     { PROJECTOR_TYPE_NEMOTRON_OMNI,     "nemotron_omni"},
     { PROJECTOR_TYPE_EXAONE4_5,         "exaone4_5"},
@@ -687,17 +713,26 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_POCKETTTS_SPKENC,  "pockettts_spkenc"},
     { PROJECTOR_TYPE_POCKETTTS_GEN,     "pockettts_gen"},
     { PROJECTOR_TYPE_SOPRANO,           "soprano"},
+    { PROJECTOR_TYPE_KOKORO,            "kokoro"},
+    { PROJECTOR_TYPE_TINY_VOCA,         "tiny_voca"},
     { PROJECTOR_TYPE_LFM3A_GEN,         "lfm3a_gen"},
     { PROJECTOR_TYPE_DRAMA3_GEN,        "drama3_gen"},
+    { PROJECTOR_TYPE_ZONOS3_GEN,        "zonos3_gen"},
+    { PROJECTOR_TYPE_ZONOS3_SPKENC,     "zonos3_spkenc"},
+    { PROJECTOR_TYPE_YUE2_GEN,          "yue2_gen"},
+    { PROJECTOR_TYPE_MINIMAX_MUSIC3_GEN, "minimax_music3_gen"},
+    { PROJECTOR_TYPE_FISH_S2_GEN,       "fish_s2_gen"},
+    { PROJECTOR_TYPE_FISH_S2_SPKENC,    "fish_s2_spkenc"},
     { PROJECTOR_TYPE_MUSE_GLIMMER,      "muse-glimmer"},
     { PROJECTOR_TYPE_SENSENOVA_U1,      "sensenova_u1"},
     { PROJECTOR_TYPE_COHERE2V,          "cohere2v"},
     { PROJECTOR_TYPE_MUSE_SPARK_AUDIO,  "muse-spark-audio"},
     { PROJECTOR_TYPE_CHATTERBOX,        "chatterbox"},
     { PROJECTOR_TYPE_CHATTERBOX_SPKENC, "chatterbox_spkenc"},
+    { PROJECTOR_TYPE_INKLING2V,         "inkling2v"},
 };
 
-static projector_type clip_projector_type_from_string(const std::string & str) {
+static projector_type projector_type_from_string(const std::string & str) {
     for (const auto & pair : PROJECTOR_TYPE_NAMES) {
         if (pair.second == str) {
             return pair.first;
@@ -706,13 +741,30 @@ static projector_type clip_projector_type_from_string(const std::string & str) {
     return PROJECTOR_TYPE_UNKNOWN;
 }
 
+struct mtmd_image_size {
+    int width;
+    int height;
+    bool operator==(const mtmd_image_size & other) const {
+        return width == other.width && height == other.height;
+    }
+    bool operator!=(const mtmd_image_size & other) const {
+        return !(*this == other);
+    }
+    int area() const {
+        // avoid overflow when computing area
+        GGML_ASSERT(width  >= 0 && width  <= 46000);
+        GGML_ASSERT(height >= 0 && height <= 46000);
+        return width * height;
+    }
+};
+
 // RGB uint8 image
-struct clip_image_u8 {
-    clip_image_size get_size() const {
+struct mtmd_image_u8 {
+    mtmd_image_size get_size() const {
         return { nx, ny };
     }
 
-    void set_size(clip_image_size size, bool is_placeholder) {
+    void set_size(mtmd_image_size size, bool is_placeholder) {
         nx = size.width;
         ny = size.height;
         if (is_placeholder) {
@@ -728,7 +780,7 @@ struct clip_image_u8 {
 
     const std::vector<uint8_t> & get_ro_buf() const {
         if (is_placeholder()) {
-            throw std::runtime_error("this clip_image_u8 is a placeholder");
+            throw std::runtime_error("this mtmd_image_u8 is a placeholder");
         }
         return buf;
     }
@@ -775,20 +827,20 @@ struct clip_image_u8 {
 struct mtmd_serialization; // forward declaration
 
 // separators appended after the image tokens of one entry, as rows of v.tok_embd_sep
-enum clip_suffix_type : int32_t {
-    CLIP_SUFFIX_NONE = 0,
+enum mtmd_suffix_type : int32_t {
+    MTMD_SUFFIX_NONE = 0,
     // MiniCPM-V 4.7 tiles
-    CLIP_SUFFIX_MINICPMV_OV,       // </image>
-    CLIP_SUFFIX_MINICPMV_OV_SLICE, // </image><slice>
-    CLIP_SUFFIX_MINICPMV_SLICE,    // </slice><slice>
-    CLIP_SUFFIX_MINICPMV_ROW_END,  // </slice>\n<slice>
-    CLIP_SUFFIX_MINICPMV_LAST,     // </slice>
-    CLIP_SUFFIX_COUNT,
+    MTMD_SUFFIX_MINICPMV_OV,       // </image>
+    MTMD_SUFFIX_MINICPMV_OV_SLICE, // </image><slice>
+    MTMD_SUFFIX_MINICPMV_SLICE,    // </slice><slice>
+    MTMD_SUFFIX_MINICPMV_ROW_END,  // </slice>\n<slice>
+    MTMD_SUFFIX_MINICPMV_LAST,     // </slice>
+    MTMD_SUFFIX_COUNT,
 };
 
 // rows of v.tok_embd_sep for each suffix type
 // MiniCPM-V 4.7 rows (set by the converter): 0 = </image>, 1 = <slice>, 2 = </slice>, 3 = \n
-static inline const std::vector<int> & clip_suffix_rows(clip_suffix_type type) {
+static inline const std::vector<int> & mtmd_suffix_rows(mtmd_suffix_type type) {
     static const std::vector<int> none;
     static const std::vector<int> minicpmv_ov       = { 0 };
     static const std::vector<int> minicpmv_ov_slice = { 0, 1 };
@@ -796,12 +848,12 @@ static inline const std::vector<int> & clip_suffix_rows(clip_suffix_type type) {
     static const std::vector<int> minicpmv_row_end  = { 2, 3, 1 };
     static const std::vector<int> minicpmv_last     = { 2 };
     switch (type) {
-        case CLIP_SUFFIX_NONE:              return none;
-        case CLIP_SUFFIX_MINICPMV_OV:       return minicpmv_ov;
-        case CLIP_SUFFIX_MINICPMV_OV_SLICE: return minicpmv_ov_slice;
-        case CLIP_SUFFIX_MINICPMV_SLICE:    return minicpmv_slice;
-        case CLIP_SUFFIX_MINICPMV_ROW_END:  return minicpmv_row_end;
-        case CLIP_SUFFIX_MINICPMV_LAST:     return minicpmv_last;
+        case MTMD_SUFFIX_NONE:              return none;
+        case MTMD_SUFFIX_MINICPMV_OV:       return minicpmv_ov;
+        case MTMD_SUFFIX_MINICPMV_OV_SLICE: return minicpmv_ov_slice;
+        case MTMD_SUFFIX_MINICPMV_SLICE:    return minicpmv_slice;
+        case MTMD_SUFFIX_MINICPMV_ROW_END:  return minicpmv_row_end;
+        case MTMD_SUFFIX_MINICPMV_LAST:     return minicpmv_last;
         default: GGML_ABORT("invalid suffix type");
     }
 }
@@ -812,7 +864,7 @@ static inline const std::vector<int> & clip_suffix_rows(clip_suffix_type type) {
 //     Memory layout: RGBRGB...RGBRGB... (nt times)
 // For audio, only one channel is used, buf.size() == nx*ny
 //     nx will be n_frames and ny will be n_mel
-struct clip_image_f32 {
+struct mtmd_image_f32 {
     // marks the global view in e.g., DeepSeek-OCR Models
     bool add_viewsep = false;
     // appends a learned newline (or EOI) token after the image
@@ -821,8 +873,10 @@ struct clip_image_f32 {
     // deepseek4v: number of leading IMAGE_PAD embeddings, aligns IMAGE_START to the LLM compressor ratio
     // depends on the chunk position, set at tokenize time (see mtmd_tokenizer::add_media)
     int32_t lead_pad = 0;
+    // audio (vibevoice): leading samples that only feed the causal convs, they produce no embedding
+    int32_t audio_n_ctx = 0;
     // separators appended after the image tokens
-    clip_suffix_type suffix_type = CLIP_SUFFIX_NONE;
+    mtmd_suffix_type suffix_type = MTMD_SUFFIX_NONE;
 
     // tile grid of the image group this entry belongs to
     // llava-next "anyres" (Granite4 Vision): the whole grid is encoded and assembled in a single graph
@@ -839,14 +893,14 @@ struct clip_image_f32 {
     };
     anyres_info anyres;
 
-    clip_image_size get_size() const {
+    mtmd_image_size get_size() const {
         return { nx_, ny_ };
     }
 
     int nx() const { return nx_; }
     int ny() const { return ny_; }
 
-    void set_size(clip_image_size size, bool is_placeholder, bool is_audio) {
+    void set_size(mtmd_image_size size, bool is_placeholder, bool is_audio) {
         nx_ = size.width;
         ny_ = size.height;
         if (is_placeholder) {
@@ -864,7 +918,7 @@ struct clip_image_f32 {
         buf = new_buf;
     }
 
-    void from_u8(const clip_image_u8 & img) {
+    void from_u8(const mtmd_image_u8 & img) {
         auto size = img.get_size();
         nx_ = size.width;
         ny_ = size.height;
@@ -896,7 +950,7 @@ struct clip_image_f32 {
 
     const std::vector<float> & get_ro_buf() const {
         if (is_placeholder()) {
-            throw std::runtime_error("this clip_image_f32 is a placeholder");
+            throw std::runtime_error("this mtmd_image_f32 is a placeholder");
         }
         return buf;
     }
@@ -922,7 +976,7 @@ struct clip_image_f32 {
 
 // token area kept after removing the padding added by the anyres resize
 // ref: https://github.com/huggingface/transformers/blob/v5.0.0/src/transformers/models/llava_next/modeling_llava_next.py#L109
-static inline void clip_anyres_unpad(int cur_w, int cur_h, int orig_w, int orig_h,
+static inline void mtmd_anyres_unpad(int cur_w, int cur_h, int orig_w, int orig_h,
                                      int & off_x, int & off_y, int & out_w, int & out_h) {
     off_x = 0;
     off_y = 0;
@@ -937,6 +991,11 @@ static inline void clip_anyres_unpad(int cur_w, int cur_h, int orig_w, int orig_
         off_x = (cur_w - new_w) / 2;
         out_w = cur_w - 2 * off_x;
     }
+}
+
+// deepseek41v: [START] ([IMAGE]*n_llm_w [NEWLINE])*n_llm_h [END], ref: num_image_tokens() in image_processor.py
+static inline int dsv41_n_block_tokens(int n_llm_w, int n_llm_h) {
+    return n_llm_h * (n_llm_w + 1) + 2;
 }
 
 // deepseek4v: layout of the LLM token block built from the aligner grid
@@ -959,21 +1018,21 @@ static inline dsv4_block_layout dsv4_get_block_layout(int n_llm_w, int n_llm_h, 
 // logging
 //
 
-static void clip_log_callback_default(enum ggml_log_level level, const char * text, void * user_data) {
+static void mtmd_log_callback_default(enum ggml_log_level level, const char * text, void * user_data) {
     (void) level;
     (void) user_data;
     fputs(text, stderr);
     fflush(stderr);
 }
 
-struct clip_logger_state {
+struct mtmd_logger_state {
     ggml_log_callback log_callback;
     void * log_callback_user_data;
 };
 
-extern struct clip_logger_state g_logger_state;
+extern struct mtmd_logger_state g_logger_state;
 
-static void clip_log_internal_v(enum ggml_log_level level, const char * format, va_list args) {
+static void mtmd_log_internal_v(enum ggml_log_level level, const char * format, va_list args) {
     if (format == NULL) {
         return;
     }
@@ -993,31 +1052,31 @@ static void clip_log_internal_v(enum ggml_log_level level, const char * format, 
     va_end(args_copy);
 }
 
-static void clip_log_internal(enum ggml_log_level level, const char * format, ...) {
+static void mtmd_log_internal(enum ggml_log_level level, const char * format, ...) {
     va_list args;
     va_start(args, format);
-    clip_log_internal_v(level, format, args);
+    mtmd_log_internal_v(level, format, args);
     va_end(args);
 }
 
-#define LOG_TRC(...) clip_log_internal(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
-#define LOG_DBG(...) clip_log_internal(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
-#define LOG_INF(...) clip_log_internal(GGML_LOG_LEVEL_INFO,  __VA_ARGS__)
-#define LOG_WRN(...) clip_log_internal(GGML_LOG_LEVEL_WARN,  __VA_ARGS__)
-#define LOG_ERR(...) clip_log_internal(GGML_LOG_LEVEL_ERROR, __VA_ARGS__)
-#define LOG_CNT(...) clip_log_internal(GGML_LOG_LEVEL_CONT,  __VA_ARGS__)
+#define LOG_TRC(...) mtmd_log_internal(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
+#define LOG_DBG(...) mtmd_log_internal(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
+#define LOG_INF(...) mtmd_log_internal(GGML_LOG_LEVEL_INFO,  __VA_ARGS__)
+#define LOG_WRN(...) mtmd_log_internal(GGML_LOG_LEVEL_WARN,  __VA_ARGS__)
+#define LOG_ERR(...) mtmd_log_internal(GGML_LOG_LEVEL_ERROR, __VA_ARGS__)
+#define LOG_CNT(...) mtmd_log_internal(GGML_LOG_LEVEL_CONT,  __VA_ARGS__)
 
 //
 // cpp wrappers
 //
 
-struct clip_image_f32_batch {
-    std::vector<clip_image_f32> entries;
+struct mtmd_image_f32_batch {
+    std::vector<mtmd_image_f32> entries;
     bool is_audio = false;
     bool is_video = false;
 
-    clip_image_f32_batch clone() const {
-        clip_image_f32_batch new_batch{
+    mtmd_image_f32_batch clone() const {
+        mtmd_image_f32_batch new_batch{
             /* entries  */ {},
             /* is_audio */ is_audio,
             /* is_video */ is_video,
@@ -1053,24 +1112,11 @@ static std::ifstream open_ifstream_binary(const std::string & fname) {
 }
 #endif
 
+std::string mtmd_format(const char * fmt, ...);
+
 // in test-mtmd-impl, we include woth common.h and this file, and these functions are duplicated
 // this is a quick fix to avoid compilation errors
 #ifndef DIRECTORY_SEPARATOR
-static std::string string_format(const char * fmt, ...) {
-    va_list ap;
-    va_list ap2;
-    va_start(ap, fmt);
-    va_copy(ap2, ap);
-    int size = vsnprintf(NULL, 0, fmt, ap);
-    GGML_ASSERT(size >= 0 && size < INT_MAX); // NOLINT
-    std::vector<char> buf(size + 1);
-    int size2 = vsnprintf(buf.data(), size + 1, fmt, ap2);
-    GGML_ASSERT(size2 == size);
-    va_end(ap2);
-    va_end(ap);
-    return std::string(buf.data(), buf.size());
-}
-
 static void string_replace_all(std::string & s, const std::string & search, const std::string & replace) {
     if (search.empty()) {
         return;
@@ -1132,7 +1178,7 @@ static std::string gguf_data_to_str(enum gguf_type type, const void * data, int 
         case GGUF_TYPE_FLOAT32: return std::to_string(((const float    *)data)[i]);
         case GGUF_TYPE_FLOAT64: return std::to_string(((const double   *)data)[i]);
         case GGUF_TYPE_BOOL:    return ((const int8_t *)data)[i] != 0 ? "true" : "false";
-        default:                return string_format("unknown type %d", type);
+        default:                return mtmd_format("unknown type %d", type);
     }
 }
 
@@ -1237,9 +1283,3 @@ static void print_tensor_data(ggml_tensor * t, uint8_t * data, int64_t n) {
     }
 }
 
-//
-// API used internally with mtmd
-//
-
-projector_type clip_get_projector_type(const struct clip_ctx * ctx);
-void clip_set_debug_output_embeddings(struct clip_ctx * ctx, bool debug);

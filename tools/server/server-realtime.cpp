@@ -155,9 +155,11 @@ struct realtime_conversation {
     bool        started   = false; // something went into the slot, the session config is fixed
     bool        turn_open = false; // a user turn is being filled
     bool        has_audio = false; // the open turn has audio not committed yet
+    int64_t     n_turn_samples = 0; // audio of the open turn, at the model rate
     bool        tool_results = false; // tool results went in after the last response, the next one answers them
     int         n_turns   = 0;
     std::string next_header;       // text that goes in before the next user turn
+    mtmd_helper::resampler_ptr resampler; // input_rate -> model rate
 
     // the item or response the results belong to, shared with the result loop
     std::mutex  mutex;
@@ -369,12 +371,37 @@ struct realtime_conversation {
             memcpy(&v, pcm.data() + 2 * i, sizeof(v));
             samples[i] = v / 32768.0f;
         }
-        if (samples.empty() || !ensure_turn()) {
+        if (samples.empty()) {
             return;
         }
+        if (!resample(samples) || samples.empty() || !ensure_turn()) {
+            return;
+        }
+        const int64_t n = (int64_t) samples.size();
         if (control(SERVER_CONTROL_ACTION_AUDIO_APPEND, {}, std::move(samples))) {
             has_audio = true;
+            n_turn_samples += n;
         }
+    }
+
+    bool resample(std::vector<float> & samples) {
+        if (!resampler) {
+            resampler.reset(mtmd_helper_resampler_init(input_rate, mtmd_get_audio_sample_rate(deps.mctx)));
+            if (!resampler) {
+                send_error("failed to initialize the audio resampler", "server_error");
+                return false;
+            }
+        }
+        const float * out = nullptr;
+        const int64_t n   = mtmd_helper_resampler_process(resampler.get(), samples.data(), samples.size(), &out);
+        if (n < 0) {
+            send_error("failed to resample the audio", "server_error");
+            return false;
+        }
+        if (out != samples.data()) {
+            samples.assign(out, out + n);
+        }
+        return true;
     }
 
     // ends the audio of the open turn, it becomes a user item
@@ -386,7 +413,8 @@ struct realtime_conversation {
         if (!control(SERVER_CONTROL_ACTION_AUDIO_END)) {
             return false;
         }
-        has_audio = false;
+        has_audio      = false;
+        n_turn_samples = 0;
 
         std::lock_guard<std::mutex> lock(mutex);
         const json prev = last_item_id.empty() ? json(nullptr) : json(last_item_id);
@@ -400,6 +428,7 @@ struct realtime_conversation {
     }
 
     void on_commit() {
+        const int64_t n_audio = n_turn_samples;
         if (!commit() || type != "transcription") {
             return;
         }
@@ -409,11 +438,19 @@ struct realtime_conversation {
             transcribe_item_id = last_item_id;
             transcript.clear();
         }
+        // some models (VibeVoice-ASR) take an instruction after the audio, with its length
+        const auto * tmpls = deps.meta.chat_params.tmpls.get();
+        common_chat_prompt_preset preset = common_chat_get_asr_prompt(tmpls, language);
+        if (preset.needs_audio_length) {
+            preset = common_chat_get_asr_prompt(tmpls, language, (double) n_audio / mtmd_get_audio_sample_rate(deps.mctx));
+        }
+        const std::string after_audio = preset.media_first ? preset.user : "";
+
         server_control_response response;
         response.n_predict = max_output_tokens;
         response.out_mode  = MTMD_HELPER_GEN_AUDIO_OUT_TEXT;
         response.sampling  = response_sampling(nullptr);
-        if (!control(SERVER_CONTROL_ACTION_RESPONSE_CREATE, user_footer + assistant_header, {}, response)) {
+        if (!control(SERVER_CONTROL_ACTION_RESPONSE_CREATE, after_audio + user_footer + assistant_header, {}, response)) {
             return;
         }
         control(SERVER_CONTROL_ACTION_CLEAR);
@@ -632,8 +669,16 @@ struct realtime_conversation {
         }
         const json audio = session.value("audio", json::object());
         const json in    = audio.value("input", json::object());
-        if (in.contains("format") && in["format"].is_object() && json_value(in["format"], "rate", input_rate) != input_rate) {
-            send_error("session.update: the input audio must be PCM16 at " + std::to_string(input_rate) + " Hz");
+        if (in.contains("format") && in["format"].is_object()) {
+            const int rate = json_value(in["format"], "rate", input_rate);
+            if (rate < 8000 || rate > 192000) {
+                send_error("session.update: the input audio rate must be between 8000 and 192000 Hz");
+                return;
+            }
+            if (rate != input_rate) {
+                input_rate = rate;
+                resampler.reset();
+            }
         }
         if (in.contains("transcription") && in["transcription"].is_object()) {
             language = json_value(in["transcription"], "language", language);
@@ -717,12 +762,7 @@ struct realtime_conversation {
     //
 
     static std::string encode_pcm16(const std::vector<float> & samples) {
-        std::string bytes(samples.size() * sizeof(int16_t), '\0');
-        for (size_t i = 0; i < samples.size(); i++) {
-            const int16_t v = (int16_t) std::lround(std::max(-1.0f, std::min(1.0f, samples[i])) * 32767.0f);
-            memcpy(&bytes[2 * i], &v, sizeof(v));
-        }
-        return base64::encode(bytes);
+        return base64::encode(pcm_f32_to_s16(samples.data(), samples.size()));
     }
 
     // the message item of the response is added with its first delta
@@ -1166,7 +1206,7 @@ bool server_realtime_slot::response_step() {
 }
 
 bool server_realtime_slot::update() {
-    llama_set_embeddings(ctx, true);
+    llama_set_embeddings(ctx, gen.valid());
 
     if (responding) {
         return response_step();
