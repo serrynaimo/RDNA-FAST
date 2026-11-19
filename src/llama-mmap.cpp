@@ -6,7 +6,6 @@
 
 #include <cstring>
 #include <filesystem>
-#include <climits>
 #include <cstdlib>
 #include <stdexcept>
 #include <cerrno>
@@ -33,9 +32,6 @@
     #endif
     #include <malloc.h>
     #include <windows.h>
-    #ifndef PATH_MAX
-        #define PATH_MAX MAX_PATH
-    #endif
     #include <io.h>
 #endif
 
@@ -1146,9 +1142,6 @@ void llama_prefetch(llama_memory_ranges mr) {
 #endif
 }
 
-size_t llama_path_max() {
-    return PATH_MAX;
-}
 
 bool llama_file_copy(const std::string & src, const std::string & dst, std::string & err) {
 #if defined(_WIN32)
