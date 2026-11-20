@@ -7932,7 +7932,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            return true;
+            return ggml_are_same_stride(op->src[0], op->src[1]);
         case GGML_OP_GATED_DELTA_NET_REPLAY:
             // RDNA3.5 keeps the snapshots: its tiled kernel for 16+ token batches has no replay variant
             return !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[dev_ctx->device].cc);
