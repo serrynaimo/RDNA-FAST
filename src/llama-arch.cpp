@@ -182,6 +182,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_RICURSIVE,        "ricursive"        },
     { LLM_ARCH_INKLING2,         "inkling2"         },
     { LLM_ARCH_INKLING2_LOOP,    "inkling2_loop"    },
+    { LLM_ARCH_DOMYN_EDGE,       "domynedge"        },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
 
