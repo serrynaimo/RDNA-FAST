@@ -7568,7 +7568,7 @@ void server_routes::init_routes() {
         }
 
         const json body = json::parse(req.body);
-        const auto questions = decision.parse_questions(body);
+        const auto questions = decision.parse_questions(body, ctx_server.chat_params.allow_audio);
 
         std::vector<raw_buffer> files;
         const json state = decision.prepare_state(decision.parse_state(body, files));
