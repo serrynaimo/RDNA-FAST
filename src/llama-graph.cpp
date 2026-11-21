@@ -4551,6 +4551,10 @@ ggml_tensor * llm_graph_context::build_attn_rel_table(
         ggml_tensor * o = build_attn_mha(q_h, k_h, v_h, nullptr, m, s_h, nullptr, 0, kq_scale, il);
 
         cur = cur ? ggml_concat(ctx0, cur, o, 0) : o;
+
+        // each head runs and joins before the next one starts: otherwise the graph order puts every head's attention
+        // first, and their f16 K/V conversion space is live at once (128k cells: 1.9 GB of compute instead of 0.5)
+        ggml_build_forward_expand(gf, cur);
     }
 
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);

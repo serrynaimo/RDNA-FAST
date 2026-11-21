@@ -308,8 +308,11 @@ static void get_rows_cuda_float(
 
     if constexpr (std::is_same<dst_t, float>::value &&
                   (std::is_same<src0_t, float>::value || std::is_same<src0_t, half>::value)) {
+        // [RDNA-FAST] rows of one or two values take the packed kernel on every device: the generic one launches a
+        // block per row with one or two busy threads (Inkling's per-head relative-position bias gathers n_kv x n_tokens
+        // single values per head, 67M blocks at 128k cells and 512 tokens)
         if (ne00 > 0 && ne00 <= 128 && ne10 >= 128 &&
-                GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+                (ne00 <= 2 || GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc))) {
             auto launch = [&](auto width, auto elements) {
                 constexpr int cols = decltype(width)::value;
                 constexpr int values = decltype(elements)::value;
