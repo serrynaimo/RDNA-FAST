@@ -246,7 +246,7 @@ The web UI is built with Vite. The build output is embedded into `llama-server`
 - The binary archives (Linux CPU, Linux and Windows ROCm) built by
   `.github/workflows/rdna-fast-release.yml` carry `LICENSE`, `NOTICE` and `licenses/`.
   The container image and `rdna-fast-ui.tar.gz` do not.
-- The Windows ROCm archives also carry the HIP runtime of the ROCm 10.1 SDK they are built
+- The Windows ROCm archives also carry the HIP runtime of the ROCm 10.2 SDK they are built
   with, copied next to the binaries ([TAG_BUNDLE_HIP_RUNTIME],
   `ggml/src/ggml-hip/CMakeLists.txt`). Their license texts are in `licenses/hip-runtime/`,
   outside the `licenses/LICENSE-*` files that `app/CMakeLists.txt` embeds into the `llama`

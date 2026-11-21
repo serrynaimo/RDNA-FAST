@@ -51,7 +51,7 @@ default, so ordinary ROCmI4 execution retains the exact implementation.
 
 Both presets target gfx1151 (Strix Halo) with a Linux compiler path, and
 `validate-sync.sh` uses them for its HIP and W4A4 steps. RDNA-FAST builds for
-the RX 7900 XT (gfx1100) with ROCm 10.1 on Windows without a preset; the
+the RX 7900 XT (gfx1100) with ROCm 10.2 on Windows without a preset; the
 command is in the top-level [Quick start](../../README.md#quick-start).
 
 ## Syncing

@@ -103,11 +103,11 @@ jobs:
           fi
           docker run --rm --entrypoint llama-server "$IMAGE" --version
 
-  # ROCm 10.1 builds (TheRock's pip SDK), one per GPU family like TheRock's own downloads: RDNA3 (gfx110X), RDNA3.5
+  # ROCm 10.2 builds (TheRock's pip SDK), one per GPU family like TheRock's own downloads: RDNA3 (gfx110X), RDNA3.5
   # (gfx115X), RDNA4 (gfx120X). One family per build keeps the Windows ggml-hip.dll far below the 2 GB DLL limit (all 24
   # release targets: 2.68 GB, which Windows does not load) and the compile within a runner's day. The flags are the
   # README's build, with a portable CPU baseline (AVX2 / FMA / F16C) instead of -march=native; the UI is the one the ui
-  # job provided. They need ROCm 10.1's bin (Windows: hipBLAS / rocBLAS) or libraries (Linux) at run time.
+  # job provided. They need ROCm 10.2's bin (Windows: hipBLAS / rocBLAS) or libraries (Linux) at run time.
   rocm-windows:
     needs: ui
     runs-on: windows-2022
@@ -123,8 +123,8 @@ jobs:
           - family: gfx120X
             targets: "gfx1200;gfx1201"
     env:
-      ROCM_VERSION: "10.1.0"
-      ASSET: rdna-fast-windows-rocm-10.1-${{ matrix.family }}
+      ROCM_VERSION: "10.2.0"
+      ASSET: rdna-fast-windows-rocm-10.2-${{ matrix.family }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -229,8 +229,8 @@ jobs:
           - family: gfx120X
             targets: "gfx1200;gfx1201"
     env:
-      ROCM_VERSION: "10.1.0"
-      ASSET: rdna-fast-linux-rocm-10.1-${{ matrix.family }}
+      ROCM_VERSION: "10.2.0"
+      ASSET: rdna-fast-linux-rocm-10.2-${{ matrix.family }}
     steps:
       - uses: actions/checkout@v4
         with:

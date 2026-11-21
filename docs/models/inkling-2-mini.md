@@ -20,7 +20,7 @@ model (unsloth's among them) were made before that and don't load.
 ## Run
 
 ```
-set "PATH=C:\TheRock\rocm-10.1\bin;%PATH%"
+set "PATH=C:\TheRock\rocm-10.2\bin;%PATH%"
 set GGML_CUDA_NO_PINNED=1
 set LLAMA_MAX_QUEUED=3
 
