@@ -4452,6 +4452,125 @@ ggml_tensor * llm_graph_context::build_attn(
     return build_attn(inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, sinks, nullptr, kq_scale, il, kq_mask);
 }
 
+// the dense bias of a bigger batch goes per head (see the declaration)
+static constexpr size_t RDNA_REL_BIAS_DENSE_MAX = 256u << 20;
+
+ggml_tensor * llm_graph_context::build_attn_rel_table(
+        llm_graph_input_mem_hybrid_iswa_rel * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * wo_s,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * table,
+        ggml_tensor * sinks,
+              float   kq_scale,
+              int     il) const {
+    const bool is_swa = hparams.is_swa(il);
+
+    auto * inp_attn = inp->get_attn();
+
+    ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+    ggml_tensor * base    = is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask();
+
+    const int64_t n_head   = q_cur->ne[1];
+    const int64_t n_kv     = rel_pos->ne[0];
+    const int64_t n_stream = base->ne[3];
+
+    const bool per_head = cparams.flash_attn && base->type == GGML_TYPE_F16 &&
+        (size_t) n_kv * n_tokens * n_head * sizeof(float) > RDNA_REL_BIAS_DENSE_MAX;
+
+    if (!per_head) {
+        // vanilla: the whole bias [n_kv, n_tokens/n_stream, n_head, n_stream]
+        ggml_tensor * t = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
+
+        ggml_tensor * kq_b = ggml_get_rows(ctx0, t, rel_pos);
+        kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
+        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+        cb(kq_b, "kq_b", il);
+
+        return build_attn(inp, wo, wo_b, wo_s, q_cur, k_cur, v_cur, kq_b, sinks, kq_scale, il);
+    }
+
+    // per head: the steps of the iswa build_attn up to the attention
+    auto * k_rot = is_swa ? inp_attn->self_k_rot_swa[il] : inp_attn->self_k_rot[il];
+    auto * v_rot = is_swa ? inp_attn->self_v_rot_swa[il] : inp_attn->self_v_rot[il];
+
+    if (k_rot) {
+        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
+    }
+    if (v_rot) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, v_rot);
+    }
+
+    const auto * mctx_iswa = inp_attn->mctx;
+    const auto * mctx_cur  = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+
+    build_attn_scale_kv_inputs(ctx0, mctx_cur, q_cur, k_cur, v_cur, il);
+
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, k_cur);
+    ggml_build_forward_expand(gf, v_cur);
+
+    {
+        const auto & k_idxs = is_swa ? inp_attn->get_k_idxs_swa() : inp_attn->get_k_idxs();
+        const auto & v_idxs = is_swa ? inp_attn->get_v_idxs_swa() : inp_attn->get_v_idxs();
+
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+    }
+
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    const int64_t n_head_kv = k->ne[1];
+    GGML_ASSERT(n_head % n_head_kv == 0);
+    const int64_t n_gqa = n_head/n_head_kv;
+
+    ggml_tensor * cur = nullptr;
+
+    for (int64_t h = 0; h < n_head; ++h) {
+        const int64_t g = h/n_gqa;
+
+        ggml_tensor * q_h = ggml_view_3d(ctx0, q_cur, q_cur->ne[0], 1, q_cur->ne[2], q_cur->nb[1], q_cur->nb[2], h*q_cur->nb[1]);
+        ggml_tensor * k_h = ggml_view_4d(ctx0, k, k->ne[0], 1, k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], g*k->nb[1]);
+        ggml_tensor * v_h = ggml_view_4d(ctx0, v, v->ne[0], 1, v->ne[2], v->ne[3], v->nb[1], v->nb[2], v->nb[3], g*v->nb[1]);
+
+        // this head's bias with the cells contiguous: the table column of head h is a [1, n_extent + 1, n_tokens]
+        // view whose single-value rows the distances pick, [1, n_kv, n_tokens]
+        ggml_tensor * b = ggml_view_3d(ctx0, table, 1, table->ne[0], table->ne[2], table->nb[0], table->nb[2], h*table->nb[1]);
+        ggml_tensor * m = ggml_get_rows(ctx0, b, rel_pos);
+        m = ggml_reshape_4d(ctx0, m, n_kv, n_tokens/n_stream, 1, n_stream);
+        m = ggml_add(ctx0, ggml_cast(ctx0, m, GGML_TYPE_F16), base);
+        cb(m, "kq_mask_rel_pos", il);
+
+        ggml_tensor * s_h = sinks ? ggml_view_1d(ctx0, sinks, 1, h*sinks->nb[0]) : nullptr;
+
+        ggml_tensor * o = build_attn_mha(q_h, k_h, v_h, nullptr, m, s_h, nullptr, 0, kq_scale, il);
+
+        cur = cur ? ggml_concat(ctx0, cur, o, 0) : o;
+    }
+
+    cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
+    cb(cur, "kqv_out", il);
+
+    if (v_rot) {
+        cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
+    }
+
+    if (wo) {
+        cur = build_lora_mm(wo, cur, wo_s);
+    }
+
+    if (wo_b) {
+        cur = ggml_add(ctx0, cur, wo_b);
+    }
+
+    return cur;
+}
+
 void llm_graph_context::build_dense_out(
     ggml_tensor * dense_2,
     ggml_tensor * dense_2_b,

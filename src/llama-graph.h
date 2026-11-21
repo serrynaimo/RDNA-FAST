@@ -1566,6 +1566,24 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    // [RDNA-FAST] the same attention from the bias table [n_extent + 1, n_head_q, n_tokens] (the per-query sink folded
+    // in), gathered by the query-to-cell distance. A bias that fits RDNA_REL_BIAS_DENSE_MAX as the dense
+    // [n_kv, n_tokens, n_head_q] F32 tensor is built that way (vanilla's numbers: decode, the SWA layers, short contexts);
+    // a bigger one (128k cells x 512 tokens x 24 heads = 6 GiB) goes one query head at a time, each head with its own
+    // single-head mask on the plain flash attention path, so the compute buffer holds one head's bias
+    ggml_tensor * build_attn_rel_table(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
+            ggml_tensor * table, // [n_extent + 1, n_head_q, n_tokens]
+            ggml_tensor * sinks, // [n_head_q]
+                  float   kq_scale,
+                    int   il) const;
+
     //
     // pooling
     //
