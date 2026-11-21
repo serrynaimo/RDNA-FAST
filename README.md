@@ -27,11 +27,10 @@ formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
   Johar, for the stock 4-bit quants as well as the ROCmFPX formats.
   [More](#prompts-through-a-wmma-gemm)
 
-- **96k tokens of context on a 20 GB card** with
-  [Swift 1.5 IQ4_XS](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf),
-  UkisAI's Qwen3.8-27B fine-tune, our recommended model. For slightly faster
-  prompts, our ROCmFPX-optimised quant of the same model:
-  [ROCmFP4-FP6 recipe](docs/rocmfpx/swift-1.5-qwen3.8-27b-rocmfp4-fp6.md)
+- **A choice of models, each with a tested recipe.** Swift 1.5 27B for fast,
+  reliable agents with 96k tokens of context on a 20 GB card; Swift 1.5
+  Flash-Next, a 125B MoE, for the most knowledge; Inkling 2 Mini with 128k.
+  [Models](#quick-start)
 
 - **MoE models bigger than the card.** Expert handoff keeps the experts in
   system RAM and the ones the conversation uses most in VRAM, while the CPU
@@ -83,8 +82,8 @@ grows from 4k to 41k tokens, a 10k-token worker is called twice in between):
 <sub>October and November 2026. Both run Swift 1.5 IQ4_XS at `-c 98304` with MTP drafting,
 flash attention, a q4_0 KV cache and two sessions, the best run for each value
 (LM Studio: best of two runs, this runtime: best of nine runs, all on ROCm 10.1). LM Studio is its
-ROCm llama.cpp runtime 2.69.0 with batch 2048 / 1024; this runtime runs the quick
-start below on ROCm 10.1.
+ROCm llama.cpp runtime 2.69.0 with batch 2048 / 1024; this runtime runs the
+[Swift 1.5 27B recipe](docs/models/swift-1.5-27b.md) on ROCm 10.1.
 The edit row is the text copy boost, n-gram drafting, the best of the twenty-four edits in those runs;
 LM Studio cannot run it, as its API does not switch Swift 1.5's thinking
 off.</sub>
@@ -129,20 +128,17 @@ runs:
 
 ## Quick start
 
-**1. Model.**
-[`Swift-1.5-Qwen3.8-27B-IQ4_XS`](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/blob/main/Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf)
-(15.5 GB): [UkisAI's Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b),
-a Qwen3.8-27B fine-tune, with its MTP head, plus the
-[BF16 `mmproj`](https://huggingface.co/lmstudio-community/Qwen3.8-27B-GGUF/blob/main/mmproj-Qwen3.8-27B-BF16.gguf)
-of the base model for vision. Against the model's Q8_0 it picks the same top token 93.5% of
-the time (mean KL divergence 0.021, wikitext-2).
+**1. Pick a model.** Each recipe has the files, the command, its speed on an
+RX 7900 XT and what we learned running it.
 
-The ROCmFPX-optimised alternative is our quant of the same model,
-`Swift-1.5-Qwen3.8-27B-ROCmFP4-FP6` (16.1 GB): ROCmFP4 weights with 61
-sensitive tensors in `Q6_0_ROCMFPX`. Its prompts run about 2% faster, at 92.8%
-the same top token (KL divergence 0.026). The
-[recipe and its tensor policy file](docs/rocmfpx/swift-1.5-qwen3.8-27b-rocmfp4-fp6.md)
-are in this repository.
+| Model | Good for | Download | Context on 20 GB | Answers | |
+|---|---|---:|---:|---:|---|
+| **Swift 1.5 27B** IQ4_XS | Agent work: the fastest, most reliable tool calls, vision | 15.5 GB | 96k | 60-70 t/s | [Recipe](docs/models/swift-1.5-27b.md) |
+| **Swift 1.5 Flash-Next** Q2_0 | The most knowledge: a 125B MoE, bigger than the card; needs 32 GB of RAM | 66.5 GB | 64k | 35-55 t/s | [Recipe](docs/models/swift-1.5-flash-next.md) |
+| **Inkling 2 Mini** IQ4_NL | Thinking Machines' 26B MoE with vision and a long context | 17.6 GB | 128k | ~40 t/s | [Recipe](docs/models/inkling-2-mini.md) |
+
+Not sure? Start with Swift 1.5 27B: it is what the [Speed](#speed) numbers
+above measure.
 
 **2. Build** with ROCm 10.1 (Ninja; about 6 minutes). AMD ships ROCm 10 for
 Windows as a tarball, without an installer:
@@ -181,29 +177,9 @@ RDNA-FAST web UI, with its live status page, from this repository's releases
 and embeds it. To build the UI from source instead (needs Node.js), add
 `-DLLAMA_BUILD_UI=ON -DLLAMA_USE_PREBUILT_UI=OFF`.
 
-**3. Run:**
-
-```
-set "PATH=C:\TheRock\rocm-10.1\bin;%PATH%"
-set GGML_CUDA_NO_PINNED=1
-set LLAMA_MAX_QUEUED=3
-set ROCMFPX_DRAFT_VOCAB=24576
-
-llama-server -m Swift-1.5-Qwen3.8-27B-IQ4_XS.gguf --mmproj mmproj-Qwen3.8-27B-BF16.gguf ^
-  -dev ROCm0 -ngl 999 -fa on --jinja --load-mode dio --gpu-keepalive-ms 2000 ^
-  -c 98304 -np 2 --kv-unified --kv-unified-reserve 12288 --no-cache-idle-slots ^
-  -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -b 2048 -ub 2048 --no-mmproj-offload ^
-  --ctx-checkpoints 8 --checkpoint-min-step 2048 ^
-  --cache-ram 0 --cache-disk D:\llama-cache --cache-disk-limit 65536 --cache-disk-checkpoints 4 ^
-  --spec-type "draft-mtp,ngram-map-k4v" --spec-draft-n-max 4 --spec-draft-p-min 0.60 ^
-  --chat-template-kwargs "{\"reasoning_effort\":\"low\"}" ^
-  --reasoning-budget 4096 --reasoning-budget-message "I have thought enough, so I will act on my plan now." ^
-  --reasoning-preserve --temp 1 ^
-  --alias qwen/qwen3.8-27b --host 0.0.0.0 --port 1234 --api-key-file api-keys.txt
-```
-
-The server speaks the usual OpenAI-compatible API on `/v1`. Every flag and
-variable above is explained in [docs/FLAGS.md](docs/FLAGS.md).
+**3. Run** the command on your model's recipe page. The server speaks the
+usual OpenAI-compatible API on `/v1`. Every flag and variable is explained in
+[docs/FLAGS.md](docs/FLAGS.md).
 
 **4. Open the UI and run the bench.** Open `http://127.0.0.1:1234/` in a
 browser for the RDNA-FAST web UI. With `--api-key-file` set, it asks for one of
@@ -220,7 +196,7 @@ downloads, and a chart against earlier runs.
 
 ## Flags and switches
 
-Every flag and variable of the quick start, the flags this runtime adds (expert handoff among them) and
+Every flag and variable of the model recipes, the flags this runtime adds (expert handoff among them) and
 its switches, with what each does and where it helps: [docs/FLAGS.md](docs/FLAGS.md).
 
 ## Other cards

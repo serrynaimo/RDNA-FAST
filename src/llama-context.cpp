@@ -3104,9 +3104,12 @@ uint32_t llama_context::graph_max_nodes() const {
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_MINIMAX_01 ||
         model.arch == LLM_ARCH_MINIMAX_M3 ||
-        model.arch == LLM_ARCH_HY_V4 ||
-        model.arch == LLM_ARCH_INKLING2) {
+        model.arch == LLM_ARCH_HY_V4) {
         res = std::max<uint32_t>(1024u, 32u * model.n_tensors());
+    } else if (model.arch == LLM_ARCH_INKLING2 || model.arch == LLM_ARCH_INKLING2_LOOP) {
+        // [RDNA-FAST] plus the relative-position attention of a big batch, one query head at a time
+        // (build_attn_rel_table, ~20 nodes per head and attention layer; 32 to be safe)
+        res = std::max<uint32_t>(1024u, 32u * model.n_tensors() + 32u * model.hparams.n_head(0) * model.hparams.n_layer());
     } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
         // DFlash2's convolutions and selector are shape work rather than matmuls,
         // so they cost ~8.6 nodes per tensor against ~5.9 for a plain DFlash draft
