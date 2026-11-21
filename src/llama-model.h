@@ -1081,6 +1081,23 @@ struct llama_model_base : public llama_model {
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
 
+    // [RDNA-FAST] [TAG_DERIVED_WEIGHTS] F32 weights computed from loaded ones once the data is in (a fold or a pad of a
+    // loaded weight), in the buffer type of the weight they come from, one buffer per type, owned by the model. A dry
+    // run (no_alloc) loads no data and makes none: the graph keeps its unfolded form where a derived weight is missing.
+    struct derived_f32 {
+        const ggml_tensor * src;  // the loaded weight whose buffer type the derived one takes
+        std::string         name;
+        int64_t             ne0;
+        int64_t             ne1;
+        std::vector<float>  data; // ne0*ne1 values
+        ggml_tensor **      dst;
+    };
+    void make_derived_f32(std::vector<derived_f32> & items);
+
+    // after the weights are loaded: make the derived weights (make_derived_f32)
+    virtual void load_arch_post() {}
+
+
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
 

@@ -2150,7 +2150,52 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
+    load_arch_post();
+
     return true;
+}
+
+void llama_model_base::make_derived_f32(std::vector<derived_f32> & items) {
+    std::map<ggml_backend_buffer_type_t, std::vector<derived_f32 *>> by_buft;
+    for (auto & it : items) {
+        GGML_ASSERT(it.src && it.src->buffer && (int64_t) it.data.size() == it.ne0*it.ne1);
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(it.src->buffer);
+        // CPU extra buffer types (e.g. CPU_REPACK) only accept tensors they can repack
+        if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                buft = ggml_backend_dev_buffer_type(dev);
+            }
+        }
+        by_buft[buft].push_back(&it);
+    }
+    for (auto & [buft, group] : by_buft) {
+        ggml_init_params params = {
+            /*.mem_size   =*/ group.size()*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx { ggml_init(params) };
+        if (!ctx) {
+            throw std::runtime_error("failed to create the derived weights context");
+        }
+        for (auto * it : group) {
+            *it->dst = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, it->ne0, it->ne1);
+            ggml_set_name(*it->dst, it->name.c_str());
+        }
+        ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+        if (!buffer) {
+            throw std::runtime_error(format("unable to allocate the %s derived weights buffer", ggml_backend_buft_name(buft)));
+        }
+        ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        for (auto * it : group) {
+            ggml_backend_tensor_set(*it->dst, it->data.data(), 0, it->data.size()*sizeof(float));
+        }
+        LLAMA_LOG_INFO("%s: %zu derived weights, %s buffer size = %.2f MiB\n", __func__, group.size(),
+                ggml_backend_buffer_name(buffer.get()), ggml_backend_buffer_get_size(buffer.get())/1024.0/1024.0);
+        std::vector<ggml_backend_buffer_ptr> buffers;
+        buffers.emplace_back(std::move(buffer));
+        pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+    }
 }
 
 // ROCmFPX [TAG_PLE_DIRECT_WIN] every lazy mode but off reads such a table with explicit reads (auto: when the table is

@@ -827,6 +827,10 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
+    // [RDNA-FAST] the input masks in F32 for the dense bias, cast once per graph and shared by its layers
+    ggml_tensor * kq_mask_f32     = nullptr;
+    ggml_tensor * kq_mask_swa_f32 = nullptr;
+
     const uint32_t extent;
     const uint32_t extent_swa;
 
