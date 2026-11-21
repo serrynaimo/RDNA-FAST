@@ -2454,23 +2454,47 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * ctrl_down[LOOP_CTRL_COUNT]   = {};
         ggml_tensor * ctrl_gain[LOOP_CTRL_COUNT]   = {};
         ggml_tensor * ctrl_forget[LOOP_CTRL_COUNT] = {};
+        // [RDNA-FAST] [TAG_INKLING_FOLDS] gain over forget [rank, 2*n_embd], derived after the load: one product and
+        // one tanh for both (null in a dry run)
+        ggml_tensor * ctrl_gain_forget[LOOP_CTRL_COUNT] = {};
     };
+
+    // [RDNA-FAST] [TAG_INKLING_FOLDS] weights derived once the data is loaded, per physical layer (none in a dry run:
+    // the graph then keeps the unfolded form). Each is an exact rewrite of the per-token ops it replaces.
+    struct derived_layer {
+        ggml_tensor * k_conv    = nullptr; // attn_k_conv with the residual folded into the tap of the current input
+        ggml_tensor * v_conv    = nullptr; // attn_v_conv, the same
+        ggml_tensor * attn_post = nullptr; // attn_post_conv with the residual and the 1/sqrt(n_conv + 1) scale
+        ggml_tensor * ffn_post  = nullptr; // ffn_post_conv, the same
+        ggml_tensor * rel_bias  = nullptr; // attn_rel_bias padded by the zero row, times the relative clip threshold
+    };
+    std::vector<derived_layer> derived;
+
+    void load_arch_post() override;
 
     struct graph : public llm_graph_context {
         const llama_model & model;
 
         graph(const llama_model & model, const llm_graph_params & params);
         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
-        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
+        // rows of (scale * cur) divided by max(L2 norm, floor): clip(x, t) = t * norm_floor(x, t), and the clip of a
+        // scaled c * x is t * norm_floor(x, t / c)
+        ggml_tensor * norm_floor(ggml_tensor * cur, ggml_tensor * scale, float floor);
+        // folded: the derived weight with the residual (and the scale) inside; else the residual is added and the
+        // result scaled by scale
         ggml_tensor * convolve(
                 ggml_tensor * cur,
                 ggml_tensor * weight,
+                ggml_tensor * folded,
+                float scale,
                 ggml_tensor * dynamic,
                 ggml_tensor * state,
                 ggml_tensor * history,
                 llm_graph_input_rs * inp,
                 int64_t offset);
-        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
+        // cur_n and message_n: the RMS-normalized cur and message
+        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * cur_n, ggml_tensor * message, ggml_tensor * message_n,
+                const loop_layer & loop, int ctrl);
 
     protected:
         // the helpers alone, a derived graph builds its own body
@@ -2490,6 +2514,7 @@ struct llama_model_inkling2 : public llama_model_base {
 
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
+        ggml_tensor * sinks0      = nullptr; // the zero sinks, one per graph
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
@@ -2500,6 +2525,7 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
     llama_model_inkling2_loop(const struct llama_model_params & params) : llama_model_inkling2(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+    void load_arch_post() override;
 
     int n_layer_phys() const override { return n_phys; }
     int layer_phys(int il) const;

@@ -28,6 +28,7 @@ llama-server -m Inkling-2-Mini-IQ4_NL.gguf --mmproj mmproj-Inkling-2-Mini-Q8_0.g
   -dev ROCm0 -ngl 999 -fa on --jinja --load-mode dio --gpu-keepalive-ms 2000 ^
   -c 131072 -np 2 --kv-unified --kv-unified-reserve 12288 --no-cache-idle-slots ^
   -ctk q4_0 -ctv q4_0 -b 2048 -ub 512 ^
+  --spec-type ngram-map-k4v --spec-draft-n-max 4 ^
   --ctx-checkpoints 8 --checkpoint-min-step 2048 ^
   --cache-ram 0 --cache-disk D:\llama-cache --cache-disk-limit 65536 --cache-disk-checkpoints 4 ^
   --reasoning-budget 4096 --reasoning-budget-message "I have thought enough, so I will act on my plan now." ^
@@ -38,14 +39,14 @@ Sampling comes from the model file (Thinking Machines' defaults), so there is no
 
 ## Speed
 
-RX 7900 XT 20 GB, ROCm 10.1, the command above, November 2026.
+RX 7900 XT 20 GB, ROCm 10.2, the command above, November 2026.
 
 | | |
 | --- | ---: |
-| 37.7k-token prompt | 591 t/s |
-| Answers | 38-42 t/s |
-| Answers after the 37.7k-token prompt | 37.1 t/s |
-| VRAM | 18.6 GB, nothing spilled to shared memory |
+| 15.5k-token prompt | 1,005 t/s |
+| Answers | 46 t/s |
+| Answers that copy from the context | 59-69 t/s |
+| VRAM | 18.8 GB, nothing spilled to shared memory |
 
 ## What we learned
 
@@ -53,10 +54,15 @@ RX 7900 XT 20 GB, ROCm 10.1, the command above, November 2026.
   distance between tokens. llama.cpp builds it for all 24 heads at once, which takes 51 GB at 128k tokens of context
   and 2048-token batches, and 13 GB at 64k and 1024 (which ran, 10 GB of it in system RAM, at 164 t/s on a long
   prompt). RDNA-FAST builds it one head at a time for long batches, with the same results, which makes 128k fit.
+- **One gather for the distance bias.** RDNA-FAST gathers the bias straight into the layout the attention reads;
+  llama.cpp transposes the table, gathers, and transposes the result back. Prompts run 13-49% faster.
 - **Keep `-ub 512` at 128k.** The batch size sets the size of that bias. Projected VRAM: 18.1 GB at `-ub 256`,
   18.5 GB at 512, 19.5 GB at 1024 (too close to the card's 20 GB beside a desktop).
-- **No drafting.** The GGUF has no draft head, so every token is a full step: answers at about 40 t/s, against
-  60-70 t/s for Swift 1.5 27B with MTP.
+- **N-gram drafting.** The GGUF has no draft head. `--spec-type ngram-map-k4v` drafts from the context where the
+  answer repeats it: an answer that copies a list runs at 59-69 t/s instead of 46 (127 t/s with one slot). Other
+  answers get no drafts and lose nothing.
+- **Experts in the short-row shape.** At one token the RX 7900 XT ran each expert row with 8 warps, most of them idle
+  on Inkling's short rows; one warp per row and four rows per block made answers 7% faster.
 - **Tool calls work for plain requests.** Asked to "check the weather in Singapore", it calls the tool. Asked to say
   what it will do first and then call the tool, it writes the sentence and ends its turn without the call (0 of 3).
   Two things change that: `"tool_choice": "required"` makes it call every time (3 of 3, after the sentence), and a

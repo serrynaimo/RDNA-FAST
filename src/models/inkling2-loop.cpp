@@ -67,6 +67,29 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
     }
 }
 
+// [RDNA-FAST] [TAG_INKLING_FOLDS] the gain and forget projections of each controller stacked into one weight, after
+// the layer folds of the base model
+void llama_model_inkling2_loop::load_arch_post() {
+    llama_model_inkling2::load_arch_post();
+
+    std::vector<derived_f32> items;
+    for (auto & l : loop_layers) {
+        for (int c = 0; c < LOOP_CTRL_COUNT; ++c) {
+            const ggml_tensor * g = l.ctrl_gain[c];
+            const ggml_tensor * f = l.ctrl_forget[c];
+            if (!g || !f || !g->buffer || !f->buffer || g->type != GGML_TYPE_F32 || f->type != GGML_TYPE_F32 ||
+                    !ggml_is_contiguous(g) || !ggml_is_contiguous(f) || !ggml_are_same_shape(g, f)) {
+                continue;
+            }
+            std::vector<float> v(ggml_nelements(g) + ggml_nelements(f));
+            ggml_backend_tensor_get(g, v.data(),                     0, ggml_nbytes(g));
+            ggml_backend_tensor_get(f, v.data() + ggml_nelements(g), 0, ggml_nbytes(f));
+            items.push_back({ g, std::string(g->name) + ".with_forget", g->ne[0], 2*g->ne[1], std::move(v), &l.ctrl_gain_forget[c] });
+        }
+    }
+    make_derived_f32(items);
+}
+
 std::unique_ptr<llm_graph_context> llama_model_inkling2_loop::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(*this, params);
 }

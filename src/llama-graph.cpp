@@ -4441,9 +4441,16 @@ ggml_tensor * llm_graph_context::build_attn(
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
     ggml_tensor * kq_mask = is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask();
     if (kq_mask->type != GGML_TYPE_F32) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        // [RDNA-FAST] one cast per graph, shared by the layers of this kind
+        ggml_tensor *& kq_mask_f32 = is_swa ? inp->kq_mask_swa_f32 : inp->kq_mask_f32;
+        if (!kq_mask_f32) {
+            kq_mask_f32 = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        }
+        kq_mask = kq_mask_f32;
     }
-    kq_mask = ggml_add(ctx0, kq_b, kq_mask);
+    // [RDNA-FAST] in place: kq_b is this layer's own bias, and the gather's reshaped result is a view the allocator
+    // would not reuse (a second [n_kv, n_tokens, n_head] buffer)
+    kq_mask = ggml_add_inplace(ctx0, kq_b, kq_mask);
     if (cparams.flash_attn) {
         kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
     }
@@ -4482,12 +4489,28 @@ ggml_tensor * llm_graph_context::build_attn_rel_table(
         (size_t) n_kv * n_tokens * n_head * sizeof(float) > RDNA_REL_BIAS_DENSE_MAX;
 
     if (!per_head) {
-        // vanilla: the whole bias [n_kv, n_tokens/n_stream, n_head, n_stream]
-        ggml_tensor * t = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
+        // the whole bias [n_kv, n_tokens/n_stream, n_head, n_stream]
+        ggml_tensor * kq_b = nullptr;
+        if (n_stream == 1) {
+            // [RDNA-FAST] one gather that writes the mask layout: the table [n_extent + 1, n_head, n_tokens] seen as
+            // single-value rows [1, n_extent + 1, n_tokens, n_head], the distances [n_kv, n_tokens] broadcast over the
+            // heads by a zero stride (the view is widened after it is made: a view may not be bigger than its
+            // source). Vanilla transposes the table, gathers [n_head, n_kv, n_tokens] and transposes that back.
+            ggml_tensor * rows = ggml_view_4d(ctx0, table, 1, table->ne[0], n_tokens, n_head,
+                    table->nb[0], table->nb[2], table->nb[1], 0);
+            ggml_tensor * dist = ggml_view_2d(ctx0, rel_pos, n_kv, n_tokens, rel_pos->nb[1], 0);
+            dist->ne[2] = n_head;
+            dist->nb[2] = 0;
+            dist->nb[3] = 0;
+            kq_b = ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, rows, dist), n_kv, n_tokens, n_head, 1);
+        } else {
+            // vanilla
+            ggml_tensor * t = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
 
-        ggml_tensor * kq_b = ggml_get_rows(ctx0, t, rel_pos);
-        kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
-        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+            kq_b = ggml_get_rows(ctx0, t, rel_pos);
+            kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
+            kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+        }
         cb(kq_b, "kq_b", il);
 
         return build_attn(inp, wo, wo_b, wo_s, q_cur, k_cur, v_cur, kq_b, sinks, kq_scale, il);
