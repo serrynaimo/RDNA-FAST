@@ -43,9 +43,9 @@ RX 7900 XT 20 GB, ROCm 10.2, the command above, November 2026.
 
 | | |
 | --- | ---: |
-| 15.5k-token prompt | 1,004 t/s |
-| Answers | 42 t/s |
-| Answers that copy from the context | 69 t/s |
+| 15.5k-token prompt | 1,005 t/s |
+| Answers | 46 t/s |
+| Answers that copy from the context | 59-69 t/s |
 | VRAM | 18.8 GB, nothing spilled to shared memory |
 
 ## What we learned
@@ -59,8 +59,10 @@ RX 7900 XT 20 GB, ROCm 10.2, the command above, November 2026.
 - **Keep `-ub 512` at 128k.** The batch size sets the size of that bias. Projected VRAM: 18.1 GB at `-ub 256`,
   18.5 GB at 512, 19.5 GB at 1024 (too close to the card's 20 GB beside a desktop).
 - **N-gram drafting.** The GGUF has no draft head. `--spec-type ngram-map-k4v` drafts from the context where the
-  answer repeats it: an answer that copies a list runs at 69 t/s instead of 42 (127 t/s with one slot). Other answers
-  get no drafts and lose nothing.
+  answer repeats it: an answer that copies a list runs at 59-69 t/s instead of 46 (127 t/s with one slot). Other
+  answers get no drafts and lose nothing.
+- **Experts in the short-row shape.** At one token the RX 7900 XT ran each expert row with 8 warps, most of them idle
+  on Inkling's short rows; one warp per row and four rows per block made answers 7% faster.
 - **Tool calls work for plain requests.** Asked to "check the weather in Singapore", it calls the tool. Asked to say
   what it will do first and then call the tool, it writes the sentence and ends its turn without the call (0 of 3).
   Two things change that: `"tool_choice": "required"` makes it call every time (3 of 3, after the sentence), and a

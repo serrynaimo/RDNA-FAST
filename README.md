@@ -135,7 +135,7 @@ RX 7900 XT and what we learned running it.
 |---|---|---:|---:|---:|---|
 | **Swift 1.5 27B** IQ4_XS | Agent work: the fastest, most reliable tool calls, vision | 15.5 GB | 96k | 60-70 t/s | [Recipe](docs/models/swift-1.5-27b.md) |
 | **Swift 1.5 Flash-Next** Q2_0 | The most knowledge: a 125B MoE, bigger than the card; needs 32 GB of RAM | 66.5 GB | 64k | 35-55 t/s | [Recipe](docs/models/swift-1.5-flash-next.md) |
-| **Inkling 2 Mini** IQ4_NL | Thinking Machines' 26B MoE with vision and a long context | 17.6 GB | 128k | ~42 t/s | [Recipe](docs/models/inkling-2-mini.md) |
+| **Inkling 2 Mini** IQ4_NL | Thinking Machines' 26B MoE with vision and a long context | 17.6 GB | 128k | ~46 t/s | [Recipe](docs/models/inkling-2-mini.md) |
 
 Not sure? Start with Swift 1.5 27B: it is what the [Speed](#speed) numbers
 above measure.

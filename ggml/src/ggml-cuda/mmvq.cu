@@ -1740,11 +1740,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 (GGML_CUDA_CC_IS_RDNA(cc) && !GGML_CUDA_CC_IS_RDNA3_0(cc) && !GGML_CUDA_CC_IS_RDNA4(cc))) {
             use = false;   // RDNA3.0 and RDNA4 have their own short-row shape ([TAG_HC_SKINNY], calc_nwarps)
         }
-        // [TAG_HC_SKINNY] only rows that keep one warp busy, plain products only (expert matmuls keep their measured
-        // shape), and the kernel reads every row of its block, so the rows must fill the last block
+        // [TAG_HC_SKINNY] only rows that keep one warp busy, and the kernel reads every row of its block, so the rows
+        // must fill the last block. [TAG_MMVQ_RDNA3_0_IDS_SHORT] expert products at one token take the same shape on
+        // RDNA3.0: Inkling 2 Mini's IQ4_NL experts (K 2304 and 1152 = 72 and 36 blocks) left 8 warps x 16 blocks per
+        // pass 56% and 28% busy; one warp x 4 rows took them from 170/154 to 110/88 us per call (op profile) and its
+        // decode from 43.1 to 46.1-46.6 t/s on the RX 7900 XT (2026-11-22; KL divergence of the decode path to an f16
+        // reference 0.0145, before 0.0194). RDNA4 keeps the 8-warp expert shape (not measured).
         if ((GGML_CUDA_CC_IS_RDNA3_0(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) &&
-                (blocks_per_row_x >= GGML_CUDA_RDNA_SHORT_ROW_PASSES * blocks_per_iter_1warp || has_ids ||
-                 nrows_x % GGML_CUDA_RDNA_SHORT_ROW_RPB != 0)) {
+                (blocks_per_row_x >= GGML_CUDA_RDNA_SHORT_ROW_PASSES * blocks_per_iter_1warp ||
+                 (has_ids && !GGML_CUDA_CC_IS_RDNA3_0(cc)) || nrows_x % GGML_CUDA_RDNA_SHORT_ROW_RPB != 0)) {
             use = false;
         }
 
