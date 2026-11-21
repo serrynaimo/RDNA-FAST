@@ -140,18 +140,18 @@ RX 7900 XT and what we learned running it.
 Not sure? Start with Swift 1.5 27B: it is what the [Speed](#speed) numbers
 above measure.
 
-**2. Build** with ROCm 10.1 (Ninja; about 6 minutes). AMD ships ROCm 10 for
+**2. Build** with ROCm 10.2 (Ninja; about 6 minutes). AMD ships ROCm 10 for
 Windows as a tarball, without an installer:
-`therock-dist-windows-gfx110X-all-10.1.0.tar.gz` for RDNA3, `gfx120X-all` for
+`therock-dist-windows-gfx110X-all-10.2.0.tar.gz` for RDNA3, `gfx120X-all` for
 RDNA4, `gfx1151` for Strix Halo ([AMD's install guide](https://rocm.docs.amd.com/en/latest/install/rocm.html)).
 Unpack it anywhere; nothing is set system-wide.
 
 ```
-curl -L -o therock.tar.gz https://stable.repo.amd.com/rocm/core/tarball/therock-dist-windows-gfx110X-all-10.1.0.tar.gz
-mkdir C:\TheRock\rocm-10.1
-tar -xzf therock.tar.gz -C C:\TheRock\rocm-10.1 --strip-components=1
+curl -L -o therock.tar.gz https://stable.repo.amd.com/rocm/core/tarball/therock-dist-windows-gfx110X-all-10.2.0.tar.gz
+mkdir C:\TheRock\rocm-10.2
+tar -xzf therock.tar.gz -C C:\TheRock\rocm-10.2 --strip-components=1
 
-set "ROCM=C:\TheRock\rocm-10.1"
+set "ROCM=C:\TheRock\rocm-10.2"
 set "HIP_PATH=%ROCM%"
 set "ROCM_PATH=%ROCM%"
 set "HIP_PLATFORM=amd"
@@ -167,12 +167,12 @@ cmake -S . -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release ^
 cmake --build build-hip --target llama-server -j 12
 ```
 
-ROCm 10.1 brings no resource compiler or manifest tool, so the build takes the
+ROCm 10.2 brings no resource compiler or manifest tool, so the build takes the
 Windows SDK's `rc.exe` and `mt.exe` (use the SDK version folder you have, with
 forward slashes for `rc.exe`). The build
 copies ROCm's HIP runtime (`amdhip64_7.dll`, `amd_comgr.dll`, `rocm_kpack.dll`)
 next to `llama-server.exe`: Windows would otherwise load the AMD driver's older
-runtime, on which ROCm 10.1's rocBLAS fails. The build also downloads the
+runtime, on which ROCm 10's rocBLAS fails. The build also downloads the
 RDNA-FAST web UI, with its live status page, from this repository's releases
 and embeds it. To build the UI from source instead (needs Node.js), add
 `-DLLAMA_BUILD_UI=ON -DLLAMA_USE_PREBUILT_UI=OFF`.

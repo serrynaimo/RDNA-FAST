@@ -27,11 +27,11 @@ in the release archives is compiled by CI but not run on a card here.
 builds and tests:
 
 - `rdna-fast-linux-x86_64.tar.gz`: a reproducible Linux CPU archive;
-- `rdna-fast-windows-rocm-10.1-<family>.zip` and
-  `rdna-fast-linux-rocm-10.1-<family>.tar.gz`, HIP builds with ROCm 10.1 for
+- `rdna-fast-windows-rocm-10.2-<family>.zip` and
+  `rdna-fast-linux-rocm-10.2-<family>.tar.gz`, HIP builds with ROCm 10.2 for
   `gfx110X` (`gfx1100`-`gfx1103`), `gfx115X` (`gfx1150`-`gfx1152`) and
   `gfx120X` (`gfx1200`, `gfx1201`). The Windows archives carry the HIP runtime
-  DLLs; both still need ROCm 10.1 at run time (on Windows its `bin` folder, for
+  DLLs; both still need ROCm 10.2 at run time (on Windows its `bin` folder, for
   hipBLAS and rocBLAS);
 - `rdna-fast-ui.tar.gz`, the web UI the builds embed;
 - the OCI image `ghcr.io/serrynaimo/rdna-fast:<tag>` (a Vulkan build, entrypoint

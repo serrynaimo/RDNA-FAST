@@ -14,7 +14,7 @@ cd RDNA-FAST
 This guide comes from ROCmFPX, whose proof target was Strix Halo. RDNA-FAST is
 tuned and measured on an RX 7900 XT (`gfx1100`); on `gfx1151` it is checked to
 build (see [Other cards](../README.md#other-cards) in the README). On Windows,
-build with ROCm 10.1 as in the [README quick start](../README.md#quick-start),
+build with ROCm 10.2 as in the [README quick start](../README.md#quick-start),
 using the `gfx1151` tarball and target.
 
 ## Target Hardware

@@ -97,7 +97,7 @@ This repository is RDNA-FAST (`origin`: `serrynaimo/RDNA-FAST`), a fork of ROCmF
 - Push only to `origin`, and only when the owner asks. Never push to, open pull requests in, or comment on `ROCmFPX/ROCmFPX` or `ggml-org/llama.cpp` from this repository.
 - RDNA-FAST's own changes carry `[TAG_...]` markers in code comments and commit subjects. Keep them when you edit those lines, and use them to find related code.
 - Commits made with an AI assistant in this fork end with a `Co-Authored-By:` trailer naming the assistant, as in the existing history. The `Assisted-by` rule below is ROCmFPX's, for its own automation.
-- Build and measure with ROCm 10.1, as in the README's quick start.
+- Build and measure with ROCm 10.2, as in the README's quick start.
 
 ### Owner-authorized ROCmFPX downstream automation
 

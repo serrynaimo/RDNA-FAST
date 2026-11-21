@@ -9,7 +9,7 @@ GPUs. RDNA-FAST tunes and measures the HIP backend on an RX 7900 XT (`gfx1100`);
 the regression scripts below keep ROCmFPX's Strix Halo (`gfx1151`) defaults.
 
 The scripts in this guide are Linux (bash) builds inherited from ROCmFPX.
-RDNA-FAST itself builds with ROCm 10.1; the Windows build is the
+RDNA-FAST itself builds with ROCm 10.2; the Windows build is the
 [README quick start](../README.md#quick-start).
 
 ---
@@ -23,7 +23,7 @@ RDNA-FAST itself builds with ROCm 10.1; the Windows build is the
 | **RDNA3** | RX 7600, RX 7900 XTX, RX 7800 XT | `scripts/build-rdna3.sh` | `build-rdna3/` |
 | **RDNA4** | RX 9070 XT | `scripts/build-rdna4.sh` | `build-rdna4/` |
 | **Vega 20 / gfx906 experimental** | Radeon Instinct MI50 / MI60 | `scripts/build-gfx906.sh` | `build-gfx906/` |
-| **Windows** | RX 7000 / 9000, Strix Halo | ROCm 10.1 `cmake` command in the [README quick start](../README.md#quick-start) | `build-hip/` |
+| **Windows** | RX 7000 / 9000, Strix Halo | ROCm 10.2 `cmake` command in the [README quick start](../README.md#quick-start) | `build-hip/` |
 | **Vulkan only** | Any AMD GPU with Vulkan drivers | see [Vulkan-only build](#vulkan-only-no-hip-arch-needed) | `build-vulkan/` |
 
 All Linux scripts accept `JOBS=16` to control parallel compile jobs:
@@ -214,7 +214,7 @@ If HIP support is unreliable on a specific ROCm version, try the
 
 ### Windows
 
-Build with ROCm 10.1 as in the [README quick start](../README.md#quick-start):
+Build with ROCm 10.2 as in the [README quick start](../README.md#quick-start):
 AMD's TheRock tarball for your GPU family (`gfx110X-all` for RDNA3, `gfx120X-all`
 for RDNA4, `gfx1151` for Strix Halo), then the `cmake` command shown there with
 your target in `-DGPU_TARGETS` and `-DCMAKE_HIP_ARCHITECTURES`. Binaries land in
@@ -332,5 +332,5 @@ env JOBS=16 scripts/build-rdna2.sh   # RX 6000
 env JOBS=16 scripts/build-rdna3.sh   # RX 7000
 env JOBS=16 scripts/build-rdna4.sh   # RX 9000
 
-# Windows: ROCm 10.1 cmake command in the README quick start
+# Windows: ROCm 10.2 cmake command in the README quick start
 ```

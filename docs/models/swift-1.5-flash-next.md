@@ -22,7 +22,7 @@ compression. Prompts and answers run at about half the 27B's speed.
 ## Run
 
 ```
-set "PATH=C:\TheRock\rocm-10.1\bin;%PATH%"
+set "PATH=C:\TheRock\rocm-10.2\bin;%PATH%"
 set GGML_CUDA_NO_PINNED=1
 set LLAMA_MAX_QUEUED=3
 

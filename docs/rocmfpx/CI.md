@@ -8,7 +8,7 @@ Many of the llama.cpp ones triggered on pushes to `master` only, so they never r
 
 RDNA-FAST's own:
 
-- `rdna-fast-release.yml` ("RDNA-FAST release"): on `v*.*.*` tags and by hand. Takes the web UI from `rdna-fast-ui.yml` and builds the Linux CPU archive, the OCI image, and ROCm 10.1 archives for Windows and Linux per GPU family; a tag run publishes them as a GitHub prerelease, a run started by hand publishes nothing. See [RELEASES.md](RELEASES.md).
+- `rdna-fast-release.yml` ("RDNA-FAST release"): on `v*.*.*` tags and by hand. Takes the web UI from `rdna-fast-ui.yml` and builds the Linux CPU archive, the OCI image, and ROCm 10.2 archives for Windows and Linux per GPU family; a tag run publishes them as a GitHub prerelease, a run started by hand publishes nothing. See [RELEASES.md](RELEASES.md).
 - `rdna-fast-publish.yml` ("RDNA-FAST publish"): by hand. Publishes a successful release run that was started by hand: creates the tag at that run's commit and the prerelease with its archives, and pushes the image.
 - `rdna-fast-ui.yml` ("RDNA-FAST UI"): on pushes to `main` that touch `tools/ui`, by hand, and from the release workflow. Keeps the rolling `ui-latest` release current, the prebuilt UI that `-DLLAMA_USE_PREBUILT_UI=ON` (the default) downloads.
 

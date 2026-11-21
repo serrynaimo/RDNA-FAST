@@ -22,7 +22,7 @@ faster, at 92.8% the same top token (KL divergence 0.026):
 ## Run
 
 ```
-set "PATH=C:\TheRock\rocm-10.1\bin;%PATH%"
+set "PATH=C:\TheRock\rocm-10.2\bin;%PATH%"
 set GGML_CUDA_NO_PINNED=1
 set LLAMA_MAX_QUEUED=3
 set ROCMFPX_DRAFT_VOCAB=24576
