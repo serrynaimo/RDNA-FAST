@@ -3347,7 +3347,7 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
-    copy_experts.reset();
+    copy_experts.reset(gf);
 
     // [TAG_EXPERT_HANDOFF] the host pool must be spinning before the device sends it a layer
     if (expert_handoff) {
@@ -3397,8 +3397,31 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     const int64_t n_expert    = src->ne[2];
     const size_t  expert_size = src->nb[2];
 
-    // [TAG_EH_COPY_ENGINE] a batch routed to nearly every expert: queued before the graph, no routing to read
     const llama_expert_handoff * ehu = lctx->get_expert_handoff();
+
+    // [TAG_SHARED_EXPERT_COPY] the scheduler makes one copy of a host weight per graph, filled before the first split
+    // that reads it; a later split that reads the same weight finds the copy as it is. Inkling's looped layers run
+    // their experts three times per token with three different routings, so a copy of only the experts routed by the
+    // first reader left the others as whatever the compute buffer held (NaN logits with experts in RAM + op offload).
+    // A copy that more than one MUL_MAT_ID of the graph reads is copied whole, once
+    if (st.gf != nullptr) {
+        if (!st.shared_known) {
+            std::unordered_map<const ggml_tensor *, int> n_readers;
+            for (int i = 0; i < ggml_graph_n_nodes(st.gf); ++i) {
+                const ggml_tensor * t = ggml_graph_node(st.gf, i);
+                if (t->op == GGML_OP_MUL_MAT_ID && ++n_readers[t->src[0]] == 2) {
+                    st.shared.insert(t->src[0]);
+                }
+            }
+            st.shared_known = true;
+        }
+        if (st.shared.count(dst) > 0) {
+            // the handoff's engine uploads whole tensors only for a batch that routes to nearly every expert
+            return ehu && ehu->upload(backend, src, dst, nullptr);
+        }
+    }
+
+    // [TAG_EH_COPY_ENGINE] a batch routed to nearly every expert: queued before the graph, no routing to read
     if (ehu && ehu->upload(backend, src, dst, nullptr)) {
         return true;
     }
