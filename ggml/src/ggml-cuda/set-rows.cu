@@ -2,6 +2,7 @@
 #include "cpy-utils.cuh"
 
 #include <cmath>
+#include <type_traits>
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -738,7 +739,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_Q4_0_ROCMFP4) {
-        set_rows_cuda_quant<idx_t, block_rocmfp4, QK_ROCMFP4, quantize_f32_rocmfp4_block>(
+        set_rows_cuda_quant<src_t, idx_t, block_rocmfp4, QK_ROCMFP4, quantize_f32_rocmfp4_block>(
             src0_d, src1_d, (block_rocmfp4*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
@@ -749,17 +750,21 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         );
     } else if (dst->type == GGML_TYPE_TURBO3_0) {
         // FWHT-aware 128-thread kernels for correct TurboQuant encoding
-        set_rows_cuda_turbo3<idx_t>(
-            src0_d, src1_d, (block_turbo3_0*)dst->data,
-            ne00, ne01, ne02, ne03,
-            ne10, ne11, ne12, ne13,
-            nb01, nb02, nb03,
-            nb10, nb11, nb12,
-            nb1, nb2, nb3,
-            stream
-        );
+        if constexpr (std::is_same_v<src_t, float>) {
+            set_rows_cuda_turbo3<idx_t>(
+                src0_d, src1_d, (block_turbo3_0*)dst->data,
+                ne00, ne01, ne02, ne03,
+                ne10, ne11, ne12, ne13,
+                nb01, nb02, nb03,
+                nb10, nb11, nb12,
+                nb1, nb2, nb3,
+                stream
+            );
+        } else {
+            GGML_ABORT("TURBO3_0 rows from %s", ggml_type_name(src0->type));
+        }
     } else if (dst->type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
-        set_rows_cuda_quant<idx_t, block_rocmfp4_fast, QK_ROCMFP4, quantize_f32_rocmfp4_fast_block>(
+        set_rows_cuda_quant<src_t, idx_t, block_rocmfp4_fast, QK_ROCMFP4, quantize_f32_rocmfp4_fast_block>(
             src0_d, src1_d, (block_rocmfp4_fast*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
@@ -769,7 +774,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_Q3_0_ROCMFPX) {
-        set_rows_cuda_quant<idx_t, block_rocmfp3, QK_ROCMFP3, quantize_f32_rocmfpx_fp3_block>(
+        set_rows_cuda_quant<src_t, idx_t, block_rocmfp3, QK_ROCMFP3, quantize_f32_rocmfpx_fp3_block>(
             src0_d, src1_d, (block_rocmfp3*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
@@ -779,7 +784,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_Q6_0_ROCMFPX) {
-        set_rows_cuda_quant<idx_t, block_rocmfp6_device, QK_ROCMFP6,
+        set_rows_cuda_quant<src_t, idx_t, block_rocmfp6_device, QK_ROCMFP6,
 #if GGML_ROCMFP6_EXPANDED_DEVICE
             quantize_f32_rocmfpx_fp6_expanded_block
 #else
@@ -795,7 +800,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_Q8_0_ROCMFPX) {
-        set_rows_cuda_quant<idx_t, block_rocmfp8, QK_ROCMFP8, quantize_f32_rocmfpx_fp8_block>(
+        set_rows_cuda_quant<src_t, idx_t, block_rocmfp8, QK_ROCMFP8, quantize_f32_rocmfpx_fp8_block>(
             src0_d, src1_d, (block_rocmfp8*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
@@ -806,15 +811,19 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         );
     } else if (dst->type == GGML_TYPE_TURBO4_0) {
         // FWHT-aware 128-thread kernels for correct TurboQuant encoding
-        set_rows_cuda_turbo4<idx_t>(
-            src0_d, src1_d, (block_turbo4_0*)dst->data,
-            ne00, ne01, ne02, ne03,
-            ne10, ne11, ne12, ne13,
-            nb01, nb02, nb03,
-            nb10, nb11, nb12,
-            nb1, nb2, nb3,
-            stream
-        );
+        if constexpr (std::is_same_v<src_t, float>) {
+            set_rows_cuda_turbo4<idx_t>(
+                src0_d, src1_d, (block_turbo4_0*)dst->data,
+                ne00, ne01, ne02, ne03,
+                ne10, ne11, ne12, ne13,
+                nb01, nb02, nb03,
+                nb10, nb11, nb12,
+                nb1, nb2, nb3,
+                stream
+            );
+        } else {
+            GGML_ABORT("TURBO4_0 rows from %s", ggml_type_name(src0->type));
+        }
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
     }
