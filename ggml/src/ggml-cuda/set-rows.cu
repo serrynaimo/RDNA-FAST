@@ -894,11 +894,8 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-<<<<<<< HEAD
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && (dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F8_E4M3)));
-=======
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16 || (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16));
->>>>>>> 7fce5439f (ggml : add BF16 support to ROPE and SET_ROWS (CPU, CUDA) (#32387))
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_BF16 && dst->type != GGML_TYPE_F8_E4M3) ||
+                (src0->type == GGML_TYPE_F16 && (dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F8_E4M3)));
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
 
     if (src0->type == GGML_TYPE_F32) {
