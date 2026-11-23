@@ -62,21 +62,18 @@ void llama_model_domyn_edge::load_arch_tensors(llama_model_loader &) {
     }
 }
 
-llama_rope_params llama_model_domyn_edge::get_rope_params(const llama_cparams & cparams, int il) const {
-    auto res = llama_model::get_rope_params(cparams, il);
-
-    // the SWA layers use the global base and scale
-    res.freq_base  = cparams.rope_freq_base;
-    res.freq_scale = cparams.rope_freq_scale;
-
-    return res;
-}
-
-llama_model_domyn_edge::graph::graph(const llm_graph_params & params)
+llama_model_domyn_edge::graph::graph(const llama_model & model, const llm_graph_params & params)
     : llm_graph_context(params) {
     ggml_tensor * cur;
     ggml_tensor * inpL    = build_inp_embd(model.tok_embd);
     ggml_tensor * inp_pos = build_inp_pos();
+
+    // [RDNA-FAST] vanilla's build_rope (#31683) as ggml_rope_ext: our graph API predates it; the SWA layers use the
+    // global base and scale as well (vanilla's get_rope_params override of this model)
+    auto rope = [&](ggml_tensor * x, int il) {
+        return hparams.has_rope(il) ? ggml_rope_ext(ctx0, x, inp_pos, model.get_rope_factors(cparams, il), hparams.n_rot(il), rope_type,
+                n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow) : x;
+    };
 
     auto * inp_attn = build_attn_inp_kv_iswa();
 
@@ -106,10 +103,10 @@ llama_model_domyn_edge::graph::graph(const llm_graph_params & params)
         cb(Kcur, "Kcur_normed", il);
 
         // build_rope already applies RoPE only if the current layer is a RoPE layer
-        Qcur = build_rope(Qcur, inp_pos, il);
+        Qcur = rope(Qcur, il);
         cb(Qcur, "Qcur_rope", il);
 
-        Kcur = build_rope(Kcur, inp_pos, il);
+        Kcur = rope(Kcur, il);
         cb(Kcur, "Kcur_rope", il);
 
         cur = build_attn(inp_attn,
@@ -160,5 +157,5 @@ llama_model_domyn_edge::graph::graph(const llm_graph_params & params)
 }
 
 std::unique_ptr<llm_graph_context> llama_model_domyn_edge::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(params);
+    return std::make_unique<graph>(*this, params);
 }

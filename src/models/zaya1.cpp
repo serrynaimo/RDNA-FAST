@@ -221,8 +221,14 @@ ggml_tensor * llama_model_zaya1::graph::build_cca_block(const llama_model & mode
     cb(Qcur, "cca_q", il);
     cb(Kcur, "cca_k", il);
 
-    Qcur = build_rope(Qcur, inp_pos, il);
-    Kcur = build_rope(Kcur, inp_pos, il);
+    // [RDNA-FAST] vanilla's build_rope (#31683) as ggml_rope_ext: our graph API predates it
+    auto rope = [&](ggml_tensor * x) {
+        return hparams.has_rope(il) ? ggml_rope_ext(ctx0, x, inp_pos, model.get_rope_factors(cparams, il), hparams.n_rot(il), rope_type,
+                n_ctx_orig, model.get_rope_freq_base(cparams, il), model.get_rope_freq_scale(cparams, il),
+                ext_factor, attn_factor, beta_fast, beta_slow) : x;
+    };
+    Qcur = rope(Qcur);
+    Kcur = rope(Kcur);
 
     // value heads: head 0 = current token, head 1 = previous token
     ggml_tensor * v_prev = ggml_view_3d(ctx0, v_del_ext, n_v_half, n_seq_tokens, n_seqs,
