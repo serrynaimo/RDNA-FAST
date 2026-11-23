@@ -1371,8 +1371,8 @@ bool server_realtime_slot::duplex_frame() {
     h_state.assign(fb, fb + h_state.size());
     n_decoded++;
 
-    common_chat_input content;
-    content.append(piece(sampled), sampled);
+    // [RDNA-FAST] our realtime API sends text (vanilla #31978 common_chat_input not taken)
+    std::string content = piece(sampled);
     std::vector<float> audio;
     int32_t sample_rate = 0;
     const char * data   = nullptr;
