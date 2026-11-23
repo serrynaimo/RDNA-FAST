@@ -3127,9 +3127,10 @@ uint32_t llama_context::graph_max_nodes() const {
         res = std::max<uint32_t>(1024u, 12u*model.n_tensors());
     } else {
         res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
-        for (const auto & lora : model.loras) {
-            res += lora->get_n_nodes();
-        }
+    }
+    // vanilla #32648 (652d559ed): the LoRA adapter nodes for every architecture
+    for (const auto & lora : model.loras) {
+        res += lora->get_n_nodes();
     }
 
     // the MoE cache adds a lookup to each MoE layer, and a second expert path with a CPU share (up to ~16 tensors per layer),
