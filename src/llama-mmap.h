@@ -92,7 +92,6 @@ using llama_memory_ranges = std::vector<llama_memory_range>;
 // Prefetch the host pages covering these memory ranges.
 void llama_prefetch(llama_memory_ranges mr);
 
-size_t llama_path_max();
 
 // ROCmFPX [TAG_EH_FILE_READ] copy the file src to dst (replaced if there), keeping its modification time; without
 // passing it through the page cache where the system can. False with err set on a failure.

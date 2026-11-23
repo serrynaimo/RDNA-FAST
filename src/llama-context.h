@@ -14,6 +14,7 @@
 
 #include <array>
 #include <map>
+#include <unordered_set>
 #include <vector>
 
 struct llama_model;
@@ -423,10 +424,18 @@ private:
         std::vector<int32_t> ids_data;
         std::vector<bool>    used;
 
-        void reset() {
+        // [TAG_SHARED_EXPERT_COPY] the graph being computed, and its expert copies that more than one MUL_MAT_ID reads
+        ggml_cgraph * gf = nullptr;
+        bool shared_known = false;
+        std::unordered_set<const ggml_tensor *> shared;
+
+        void reset(ggml_cgraph * graph = nullptr) {
             ids = nullptr;
             ids_data.clear();
             used.clear();
+            gf = graph;
+            shared_known = false;
+            shared.clear();
         }
     };
 

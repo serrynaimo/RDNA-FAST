@@ -106,7 +106,7 @@ const char * llama_ftype_name(llama_ftype ftype) {
 static std::vector<std::string> llama_get_list_splits(const std::string & path, const int idx, const int n_split) {
     std::vector<std::string> paths;
     std::string split_prefix;
-    std::vector<char> buf(llama_path_max(), 0);
+    std::vector<char> buf(path.size() + 1, 0);
 
     {
         int ret = llama_split_prefix(buf.data(), buf.size(), path.c_str(), idx, n_split);

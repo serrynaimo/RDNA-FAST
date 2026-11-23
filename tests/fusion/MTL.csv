@@ -56,6 +56,8 @@ deepseek32          ,0   ,any     ,NORM+MUL+ADD                ,      2
 deepseek32          ,0   ,any     ,RMS_NORM+MUL                ,      9
 deepseek4           ,0   ,any     ,MUL+ADD                     ,      8
 deepseek4           ,0   ,any     ,RMS_NORM+MUL                ,     20
+domynedge           ,0   ,any     ,RMS_NORM+MUL                ,      8
+domynedge           ,0   ,any     ,RMS_NORM+MUL+ADD            ,      3
 dots1               ,0   ,any     ,ADD+ADD                     ,      1
 dots1               ,0   ,any     ,MUL+ADD                     ,      2
 dots1               ,0   ,any     ,RMS_NORM+MUL                ,      9
@@ -208,6 +210,7 @@ mistral3            ,0   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,
 mistral4            ,0   ,any     ,ADD+ADD                     ,      1
 mistral4            ,0   ,any     ,MUL+ADD                     ,      2
 mistral4            ,0   ,any     ,RMS_NORM+MUL                ,      9
+moshi               ,0   ,any     ,RMS_NORM+MUL                ,      5
 mpt                 ,0   ,any     ,NORM+MUL+ADD                ,      5
 muse-glimmer        ,0   ,any     ,RMS_NORM+MUL                ,     10
 muse-glimmer        ,0   ,any     ,RMS_NORM+MUL+ADD            ,      3
@@ -301,6 +304,7 @@ xing4_0             ,0   ,any     ,ADD+ADD+ADD                 ,      1
 xing4_0             ,0   ,any     ,MUL+ADD                     ,      2
 xing4_0             ,0   ,any     ,RMS_NORM+MUL                ,      9
 xverse              ,0   ,any     ,RMS_NORM+MUL                ,      5
+zaya1               ,0   ,any     ,RMS_NORM+MUL                ,      7
 zonos3              ,0   ,any     ,GATED_DELTA_NET+CPY         ,      1
 zonos3              ,0   ,any     ,MUL+ADD                     ,      2
 zonos3              ,0   ,any     ,RMS_NORM+MUL                ,     12

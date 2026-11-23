@@ -19,7 +19,7 @@
 #include "ggml-cuda/arange.cuh"
 #include "ggml-cuda/argmax.cuh"
 #include "ggml-cuda/argsort.cuh"
-#include "ggml-cuda/batch-get.cuh"
+#include "ggml-cuda/batch-copy.cuh"
 #include "ggml-cuda/binbcast.cuh"
 #include "ggml-cuda/clamp.cuh"
 #include "ggml-cuda/col2im-1d.cuh"
@@ -63,6 +63,7 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx, const 
 #include "ggml-cuda/rope.cuh"
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
+#include "ggml-cuda/sleep.cuh"
 #include "ggml-cuda/snake.cuh"
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
@@ -1030,6 +1031,11 @@ static void ggml_backend_cuda_buffer_set_tensor_n(ggml_backend_buffer_t buffer, 
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+
+    if (!ggml_cuda_pinned_memory_disabled() &&
+            ggml_cuda_set_tensor_n(ctx->device, tensors, data, offsets, sizes, n_tensors)) {
+        return;
+    }
 
     for (size_t i = 0; i < n_tensors; i++) {
         if (sizes[i] == 0) {
@@ -2743,6 +2749,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ggml_tensor dst_slice;
         memset(&dst_slice, 0, sizeof(dst_slice));
         memcpy(dst_slice.op_params, dst->op_params, sizeof(dst_slice.op_params));
+        dst_slice.op     = GGML_OP_MUL_MAT; // ggml_prec_get_acc/ggml_prec_get_src check the op
         dst_slice.buffer = dst->buffer;
         dst_slice.type   = type_dst_sorted;
         dst_slice.ne[0]  = ne0;
@@ -3141,6 +3148,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
             break;
+        case GGML_OP_SLEEP:
+            ggml_cuda_op_sleep(ctx, dst);
+            break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
             break;
@@ -3517,7 +3527,12 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
         return false;
     }
 
-    if (set_rows->type != GGML_TYPE_F32 && set_rows->type != GGML_TYPE_F16) {
+    if (set_rows->type != GGML_TYPE_F32 && set_rows->type != GGML_TYPE_F16 && set_rows->type != GGML_TYPE_BF16) {
+        return false;
+    }
+
+    // BF16 rope fuses into an F16 or BF16 cache, other ropes not into a BF16 cache
+    if (rope->type == GGML_TYPE_BF16 ? set_rows->type == GGML_TYPE_F32 : set_rows->type == GGML_TYPE_BF16) {
         return false;
     }
 
@@ -4567,6 +4582,26 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
+    }
+
+    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_NORM && ops.begin()[1] == GGML_OP_MUL) {
+        const ggml_tensor * norm   = cgraph->nodes[node_idx];
+        const ggml_tensor * mul    = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * weight = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+        if (norm->src[0]->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+            weight->type != GGML_TYPE_F32 || !ggml_is_vector(weight) || weight->ne[0] != norm->ne[0] ||
+            !ggml_is_contiguous(weight)) {
+            return false;
+        }
+        if (ops.size() == 3) {
+            const ggml_tensor * add  = cgraph->nodes[node_idx + 2];
+            const ggml_tensor * bias = add->src[0] == mul ? add->src[1] : add->src[0];
+            if (ops.begin()[2] != GGML_OP_ADD || add->type != GGML_TYPE_F32 || bias->type != GGML_TYPE_F32 ||
+                !ggml_is_vector(bias) || bias->ne[0] != norm->ne[0] || !ggml_is_contiguous(bias)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
@@ -5740,6 +5775,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr);
         return 2;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
+        ggml_cuda_op_norm(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL }, {})) {
+        ggml_cuda_op_norm(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
@@ -7579,7 +7624,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                                op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
                                op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
                                op->type == GGML_TYPE_F8_E4M3 /* [TAG_FP8_KV] */) &&
-                               op->src[0]->type == GGML_TYPE_F32
+                               (op->src[0]->type == GGML_TYPE_F32 || (op->src[0]->type == GGML_TYPE_BF16 && op->type != GGML_TYPE_F8_E4M3))
                            ) || (
                                (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F8_E4M3) && op->src[0]->type == GGML_TYPE_F16
                            )
@@ -7821,7 +7866,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16) && op->type == op->src[0]->type &&
                    ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_CLAMP:
-            return ggml_is_contiguous_rows(op->src[0]);
+            return ggml_is_contiguous_rows(op->src[0]) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
@@ -7871,7 +7916,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return false;
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK: {
-            return op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && ggml_is_contiguous_2(op->src[0]);
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16) &&
+                   op->type == op->src[0]->type &&
+                   op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && ggml_is_contiguous_2(op->src[0]);
         }
         case GGML_OP_IM2COL:
         case GGML_OP_IM2COL_3D:
@@ -7921,13 +7968,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_PAD_REFLECT_1D:
         case GGML_OP_ARANGE:
         case GGML_OP_TIMESTEP_EMBEDDING:
+            return true;
         case GGML_OP_LEAKY_RELU:
+            return op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_GATED_LINEAR_ATTN:
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            return true;
+            return ggml_are_same_stride(op->src[0], op->src[1]);
         case GGML_OP_GATED_DELTA_NET_REPLAY:
             // RDNA3.5 keeps the snapshots: its tiled kernel for 16+ token batches has no replay variant
             return !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[dev_ctx->device].cc);
@@ -7952,13 +8001,21 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_FILL:
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:
+            return true;
         case GGML_OP_DIAG:
+            return op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16;
         case GGML_OP_SOLVE_TRI:
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
         case GGML_OP_TOP_K_MASK:
             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
+        case GGML_OP_SLEEP:
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+            return false;
+#else
+            return true;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 
         default:
             return false;

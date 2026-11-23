@@ -128,6 +128,8 @@ LLAMA_API uint32_t llama_kv_lanes_merge_max(const struct llama_context * ctx);
 // false gives every sequence its own pass again, true restores the default. No effect elsewhere.
 LLAMA_API void llama_kv_lanes_set_merge(struct llama_context * ctx, bool enable);
 
+LLAMA_API std::vector<ggml_tensor *> llama_memory_get_tensors(const llama_memory_t mem);
+
 // the backend buffers that a state write of this memory would touch - empty caches report none
 LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
 

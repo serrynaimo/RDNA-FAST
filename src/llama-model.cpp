@@ -137,6 +137,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen3tts(params);
         case LLM_ARCH_POCKETTTS:
             return new llama_model_pockettts(params);
+        case LLM_ARCH_MOSHI:
+            return new llama_model_moshi(params);
         case LLM_ARCH_ZONOS3:
             return new llama_model_zonos3(params);
         case LLM_ARCH_KOKORO:
@@ -341,6 +343,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_lfm2moe(params);
         case LLM_ARCH_LFM3:
             return new llama_model_lfm3(params);
+        case LLM_ARCH_ZAYA1:
+            return new llama_model_zaya1(params);
         case LLM_ARCH_SMALLTHINKER:
             return new llama_model_smallthinker(params);
         case LLM_ARCH_GROVEMOE:
@@ -399,6 +403,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_k2_horizon(params);
         case LLM_ARCH_KOLIBRI1:
             return new llama_model_kolibri1(params);
+        case LLM_ARCH_DOMYN_EDGE:
+            return new llama_model_domyn_edge(params);
         default:
             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
@@ -1862,6 +1868,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
                 layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                if (layer.ffn_up_exps_s && layer.ffn_gate_up_exps) {
+                    throw std::runtime_error(format("ffn_up_exps.scale and ffn_gate_up_exps.weight both exist for layer %d", i));
+                }
+            }
+            if (!layer.ffn_up_exps_s && layer.ffn_gate_up_exps) {
+                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
 
             // recurrent / linear-attention weight scales (per-tensor, shape {1})
@@ -1962,6 +1974,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 output_in_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "input_scale"), {1}, TENSOR_NOT_REQUIRED);
             }
         }
+        post_arch_tensors(ml);
     }
     ml.done_getting_tensors(true);
 
@@ -3275,6 +3288,27 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* filter_recr       */ std::move(filter_recr),
                     /* filter_idx        */ std::move(filter_idx));
             } break;
+        case LLM_ARCH_MOSHI:
+            {
+                // every layer attends to the same sliding window: one cache that masks it, the cells past the window are reused
+                res = new llama_kv_cache(
+                        *this,
+                        hparams,
+                        params.type_k,
+                        params.type_v,
+                        !cparams.flash_attn,
+                        cparams.offload_kqv,
+                        cparams.kv_unified,
+                        cparams.n_ctx_seq,
+                        cparams.n_seq_max,
+                        1, // [RDNA-FAST] our ctor: n_pad, no no_alloc
+                        hparams.n_swa,
+                        LLAMA_SWA_TYPE_STANDARD,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        nullptr);
+            } break;
         case LLM_ARCH_HY_V4:
             {
                 if (hparams.indexer_top_k == 0) {
@@ -3504,7 +3538,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // a null filter_idx means the GGUF has no indexer tensors
                     llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
                     const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
-                    if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
+                    if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP || arch == LLM_ARCH_ZAYA1) {
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
@@ -3946,6 +3980,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DOTS3NOTE:
         case LLM_ARCH_NANBEIGE:
         case LLM_ARCH_POCKETTTS:
+        case LLM_ARCH_MOSHI:
         case LLM_ARCH_ZONOS3:
         case LLM_ARCH_LIMITE:
         case LLM_ARCH_TINY_VOCA:
@@ -4018,6 +4053,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_LFM2:
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_LFM3:
+        case LLM_ARCH_ZAYA1:
         case LLM_ARCH_SMALLTHINKER:
         case LLM_ARCH_SEED_OSS:
         case LLM_ARCH_GROVEMOE:
@@ -4041,6 +4077,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_HRM_TEXT:
         case LLM_ARCH_BEAM:
         case LLM_ARCH_KOLIBRI1:
+        case LLM_ARCH_DOMYN_EDGE:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_DFLASH:

@@ -12011,7 +12011,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_TRANSPOSE:
             return true;
         case GGML_OP_DIAG:
-            return true;
+            return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_ROPE: {
             const int mode = ((const int32_t *) op->op_params)[2];
             const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
@@ -12030,7 +12030,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 }
                 return false;
             }
-            return true;
+            return op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16;
         }
         case GGML_OP_SOLVE_TRI:
             return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);

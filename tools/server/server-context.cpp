@@ -5165,7 +5165,9 @@ private:
 
                     if (!slot.can_split()) {
                         // cannot fit the prompt in the current batch - will try next iter
-                        if (batch.size() + slot.task->n_tokens() > n_batch) {
+                        // with non-causal attention the whole batch must fit in one ubatch, see llama_decode
+                        const int32_t n_batch_max = llama_get_causal_attn(ctx_tgt) ? n_batch : std::min(n_batch, n_ubatch);
+                        if (batch.size() + slot.task->n_tokens() > n_batch_max) {
                             return;
                         }
                     }
@@ -7188,6 +7190,9 @@ void server_routes::init_routes() {
     // audio is PCM16 mono at the model sample rate, sent as base64 in input_audio_buffer.append events
     // input_audio_buffer.commit with "final": true ends the input, closing the socket also ends it
     this->ws_realtime = [this](const server_http_req & req, server_http_context::ws_conn & conn) {
+        // make sure sleep state is handled by create_response()
+        auto res = create_response();
+
         auto send_event = [&conn](json ev) {
             ev["event_id"] = "event_" + random_string();
             conn.send(safe_json_to_str(ev));
@@ -7207,7 +7212,7 @@ void server_routes::init_routes() {
         // models that answer after the audio hold a conversation, see server-realtime.h
         // live transcription: Voxtral Realtime (no chat), or an "asr" model in a session opened with ?intent=transcription
         const bool live_asr = !ctx_server.asr_prompt.empty() && req.get_param("intent") == "transcription";
-        if (ctx_server.mtmd_cap.audio_stream && ctx_server.mtmd_cap.chat && !live_asr) {
+        if (ctx_server.mtmd_cap.audio_duplex || (ctx_server.mtmd_cap.audio_stream && ctx_server.mtmd_cap.chat && !live_asr)) {
             server_realtime_conversation({queue_tasks, queue_results, *meta, params, ctx_server.mctx, ctx_server.mtmd_cap, ctx_server.vocab}, conn);
             return;
         }
@@ -7232,7 +7237,6 @@ void server_routes::init_routes() {
             }}}},
         };
 
-        auto res = create_response();
         auto & rd = res->rd;
         {
             server_task task(SERVER_TASK_TYPE_TRANSCRIBE_RT);
@@ -7564,7 +7568,7 @@ void server_routes::init_routes() {
         }
 
         const json body = json::parse(req.body);
-        const auto questions = decision.parse_questions(body);
+        const auto questions = decision.parse_questions(body, ctx_server.chat_params.allow_audio);
 
         std::vector<raw_buffer> files;
         const json state = decision.prepare_state(decision.parse_state(body, files));

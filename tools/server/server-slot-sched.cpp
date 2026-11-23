@@ -1908,6 +1908,8 @@ bool server_prompt_cache::load(
     if (it_best_ram != states.end()) {
         SRV_TRC(" - found better RAM prompt with eff = %zu, lcp = %zu\n", eff_best, lcp_selected);
 
+        const int64_t t_start = ggml_time_us();
+
         {
             auto & data = it_best_ram->data.main;
 
@@ -1949,6 +1951,8 @@ bool server_prompt_cache::load(
         prompt = std::move(it_best_ram->prompt);
 
         states.erase(it_best_ram);
+
+        SRV_TRC("slot %d: prompt cache restore took %.2f ms\n", id_slot, (ggml_time_us() - t_start) / 1000.0);
     }
 
     return true;

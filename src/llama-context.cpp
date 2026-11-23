@@ -439,6 +439,15 @@ llama_context::llama_context(
         }
     }
 
+    {
+        const char * LLAMA_MOE_RANDOM_ROUTING = getenv("LLAMA_MOE_RANDOM_ROUTING");
+        cparams.moe_random_routing = LLAMA_MOE_RANDOM_ROUTING ? (atoi(LLAMA_MOE_RANDOM_ROUTING) != 0) : false;
+
+        if (cparams.moe_random_routing && hparams.n_expert > 0) {
+            LLAMA_LOG_WARN("%s: MoE random routing enabled - the output is not valid, use for benchmarks only\n", __func__);
+        }
+    }
+
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
@@ -3109,16 +3118,25 @@ uint32_t llama_context::graph_max_nodes() const {
     } else if (model.arch == LLM_ARCH_INKLING2 || model.arch == LLM_ARCH_INKLING2_LOOP) {
         // [RDNA-FAST] plus the relative-position attention of a big batch, one query head at a time
         // (build_attn_rel_table, ~20 nodes per head and attention layer; 32 to be safe)
-        res = std::max<uint32_t>(1024u, 32u * model.n_tensors() + 32u * model.hparams.n_head(0) * model.hparams.n_layer());
+        // (a vocab-only model has no layers: n_head(0) would abort, llama-tokenize)
+        const uint32_t n_head0 = model.hparams.n_layer_all > 0 ? model.hparams.n_head(0) : 0;
+        res = std::max<uint32_t>(1024u, 32u * model.n_tensors() + 32u * n_head0 * model.hparams.n_layer());
     } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
         // DFlash2's convolutions and selector are shape work rather than matmuls,
         // so they cost ~8.6 nodes per tensor against ~5.9 for a plain DFlash draft
         res = std::max<uint32_t>(1024u, 12u*model.n_tensors());
     } else {
         res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
-        for (const auto & lora : model.loras) {
-            res += lora->get_n_nodes();
-        }
+    }
+    // vanilla #32648 (652d559ed): the LoRA adapter nodes for every architecture
+    for (const auto & lora : model.loras) {
+        res += lora->get_n_nodes();
+    }
+
+    // the MoE cache adds a lookup to each MoE layer, and a second expert path with a CPU share (up to ~16 tensors per layer),
+    // which the per-tensor estimates above do not cover for models with few tensors per layer
+    if (cparams.moe_cache_size > 0) {
+        res += 32u*model.hparams.n_layer_all;
     }
 
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
@@ -3347,7 +3365,7 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
-    copy_experts.reset();
+    copy_experts.reset(gf);
 
     // [TAG_EXPERT_HANDOFF] the host pool must be spinning before the device sends it a layer
     if (expert_handoff) {
@@ -3389,6 +3407,9 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         return false;
     }
 
+    // vanilla #32807 (5bacb7c86) returns false here for every LLM_ARCH_INKLING2_LOOP weight; [TAG_SHARED_EXPERT_COPY]
+    // below copies whole only the tensors that several MUL_MAT_IDs read (the looped layers), any architecture
+
     const ggml_tensor * ids = node->src[2];
     if (ggml_nelements(ids) == 0) {
         return true;
@@ -3397,8 +3418,31 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     const int64_t n_expert    = src->ne[2];
     const size_t  expert_size = src->nb[2];
 
-    // [TAG_EH_COPY_ENGINE] a batch routed to nearly every expert: queued before the graph, no routing to read
     const llama_expert_handoff * ehu = lctx->get_expert_handoff();
+
+    // [TAG_SHARED_EXPERT_COPY] the scheduler makes one copy of a host weight per graph, filled before the first split
+    // that reads it; a later split that reads the same weight finds the copy as it is. Inkling's looped layers run
+    // their experts three times per token with three different routings, so a copy of only the experts routed by the
+    // first reader left the others as whatever the compute buffer held (NaN logits with experts in RAM + op offload).
+    // A copy that more than one MUL_MAT_ID of the graph reads is copied whole, once
+    if (st.gf != nullptr) {
+        if (!st.shared_known) {
+            std::unordered_map<const ggml_tensor *, int> n_readers;
+            for (int i = 0; i < ggml_graph_n_nodes(st.gf); ++i) {
+                const ggml_tensor * t = ggml_graph_node(st.gf, i);
+                if (t->op == GGML_OP_MUL_MAT_ID && ++n_readers[t->src[0]] == 2) {
+                    st.shared.insert(t->src[0]);
+                }
+            }
+            st.shared_known = true;
+        }
+        if (st.shared.count(dst) > 0) {
+            // the handoff's engine uploads whole tensors only for a batch that routes to nearly every expert
+            return ehu && ehu->upload(backend, src, dst, nullptr);
+        }
+    }
+
+    // [TAG_EH_COPY_ENGINE] a batch routed to nearly every expert: queued before the graph, no routing to read
     if (ehu && ehu->upload(backend, src, dst, nullptr)) {
         return true;
     }
