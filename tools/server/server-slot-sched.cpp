@@ -1952,8 +1952,7 @@ bool server_prompt_cache::load(
 
         states.erase(it_best_ram);
 
-        SRV_TRC("slot %d: prompt cache restore took %.2f ms
-", id_slot, (ggml_time_us() - t_start) / 1000.0);
+        SRV_TRC("slot %d: prompt cache restore took %.2f ms\n", id_slot, (ggml_time_us() - t_start) / 1000.0);
     }
 
     return true;
