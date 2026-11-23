@@ -3293,7 +3293,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 // every layer attends to the same sliding window: one cache that masks it, the cells past the window are reused
                 res = new llama_kv_cache(
                         *this,
-                        params.no_alloc,
                         hparams,
                         params.type_k,
                         params.type_v,
@@ -3302,6 +3301,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         cparams.kv_unified,
                         cparams.n_ctx_seq,
                         cparams.n_seq_max,
+                        1, // [RDNA-FAST] our ctor: n_pad, no no_alloc
                         hparams.n_swa,
                         LLAMA_SWA_TYPE_STANDARD,
                         nullptr,
