@@ -48,10 +48,10 @@ void llama_model_moshi::load_arch_tensors(llama_model_loader & ml) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_moshi::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(params);
+    return std::make_unique<graph>(*this, params);
 }
 
-llama_model_moshi::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_moshi::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -61,6 +61,12 @@ llama_model_moshi::graph::graph(const llm_graph_params & params) : llm_graph_con
     ggml_tensor * inpL = build_inp_embd(model.tok_embd);
 
     ggml_tensor * inp_pos = build_inp_pos();
+    // [RDNA-FAST] vanilla's build_rope (#31683) as ggml_rope_ext: our graph API predates it
+    auto rope = [&](ggml_tensor * x, int il) {
+        return hparams.has_rope(il) ? ggml_rope_ext(ctx0, x, inp_pos, model.get_rope_factors(cparams, il), hparams.n_rot(il), rope_type,
+                n_ctx_orig, model.get_rope_freq_base(cparams, il), model.get_rope_freq_scale(cparams, il),
+                ext_factor, attn_factor, beta_fast, beta_slow) : x;
+    };
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -73,8 +79,8 @@ llama_model_moshi::graph::graph(const llm_graph_params & params) : llm_graph_con
         {
             auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur, n_embd_head, n_head, n_head_kv, il);
 
-            Qcur = build_rope(Qcur, inp_pos, il);
-            Kcur = build_rope(Kcur, inp_pos, il);
+            Qcur = rope(Qcur, il);
+            Kcur = rope(Kcur, il);
 
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
