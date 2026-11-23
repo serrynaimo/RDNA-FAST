@@ -5218,6 +5218,14 @@ struct test_gated_delta_net : public test_case {
     const bool    padded_q;
     const bool    permuted_k;
 
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET";
+    }
+
+    // compare only the view returned by build_graph, not the full op output
+    bool run_whole_graph() override { return K > 1 && n_seq_tokens > K; }
+
     std::string vars() override {
         return VARS_TO_STR13(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, correlated, padded_v, padded_q, permuted_k);
     }
@@ -5271,6 +5279,10 @@ struct test_gated_delta_net : public test_case {
             k = ggml_cpy(ctx, k, k_permuted);
         }
         ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        if (K > 1 && n_seq_tokens > K) {
+            // n_tokens > K: only slot 0 is guaranteed, so keep the scores and slot 0
+            out = ggml_view_2d(ctx, out, out->ne[0], out->ne[1] - (K - 1) * head_size * n_seqs, out->nb[1], 0);
+        }
         return out;
     }
 
