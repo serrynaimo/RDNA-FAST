@@ -2489,6 +2489,17 @@ struct llama_model_inkling2 : public llama_model_base {
 
         graph(const llama_model & model, const llm_graph_params & params);
         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
+
+        // [RDNA-FAST] [TAG_INKLING_FUSIONS] RMS-normalized rows, newest block first, [n_embd, n, n_tokens] and transposed
+        // [n, n_embd, n_tokens]: each block is normalized once per graph, each block list stacked once and shared by
+        // every mix over it (vanilla re-stacks and re-normalizes all blocks in every mix)
+        struct block_stack {
+            ggml_tensor * states   = nullptr;
+            ggml_tensor * states_t = nullptr;
+        };
+        std::map<std::vector<ggml_tensor *>, block_stack> block_stacks; // per block list
+        std::map<std::vector<ggml_tensor *>, block_stack> mix_states;   // per block list + the mixed state
+        const block_stack * stack(const std::vector<ggml_tensor *> & blocks);
         // rows of (scale * cur) divided by max(L2 norm, floor): clip(x, t) = t * norm_floor(x, t), and the clip of a
         // scaled c * x is t * norm_floor(x, t / c)
         ggml_tensor * norm_floor(ggml_tensor * cur, ggml_tensor * scale, float floor);

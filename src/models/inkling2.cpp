@@ -229,26 +229,52 @@ ggml_tensor * llama_model_inkling2::graph::norm_floor(ggml_tensor * cur, ggml_te
     return ggml_l2_norm(ctx0, cur, floor);
 }
 
-// attention over the depth: mix the earlier block outputs and cur with learned queries
-ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
-    ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
-    for (ggml_tensor * block : blocks) {
-        states = ggml_concat(ctx0, ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens), states, 1);
+// [RDNA-FAST] [TAG_INKLING_FUSIONS] the normalized stack of a block list, newest block first (the order of vanilla's
+// concatenations): the stack of the list without its newest block, with that block's normalized row on top
+const llama_model_inkling2::graph::block_stack * llama_model_inkling2::graph::stack(const std::vector<ggml_tensor *> & blocks) {
+    if (blocks.empty()) {
+        return nullptr;
     }
-    states = ggml_rms_norm(ctx0, states, 1e-6f);
+    auto it = block_stacks.find(blocks);
+    if (it != block_stacks.end()) {
+        return &it->second;
+    }
+    const block_stack * prev = stack(std::vector<ggml_tensor *>(blocks.begin(), blocks.end() - 1));
 
-    ggml_tensor * scores = nullptr;
-    if (query->ne[1] == 1) {
-        // [RDNA-FAST] one query: it broadcasts over the tokens as the first operand, [1, k + 1, n_tokens] is the
-        // [k + 1, 1, n_tokens] of vanilla's repeated queries (no REPEAT)
-        scores = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, query, states), states->ne[1], 1, n_tokens);
-    } else {
-        ggml_tensor * queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
-        scores = ggml_mul_mat(ctx0, states, queries);
+    ggml_tensor * normed   = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, blocks.back(), n_embd, 1, n_tokens), 1e-6f);
+    ggml_tensor * normed_t = ggml_reshape_3d(ctx0, normed, 1, n_embd, n_tokens);
+
+    block_stack st;
+    st.states   = prev ? ggml_concat(ctx0, normed,   prev->states,   1) : normed;
+    st.states_t = prev ? ggml_concat(ctx0, normed_t, prev->states_t, 0) : normed_t;
+    return &block_stacks.emplace(blocks, st).first->second;
+}
+
+// attention over the depth: mix the earlier block outputs and cur with learned queries
+// [RDNA-FAST] [TAG_INKLING_FUSIONS] rows [blocks.back(), ..., blocks.front(), cur] as vanilla's, each RMS-normalized (the
+// norm is per row, so normalizing the rows one by one gives the same values), from the shared stacks; on the GPU the
+// concatenations, the scores, the softmax and the mix run as one kernel (depth mix fusion)
+ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
+    std::vector<ggml_tensor *> key = blocks;
+    key.push_back(cur);
+    block_stack & all = mix_states[key];
+    if (!all.states) {
+        ggml_tensor * normed   = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), 1e-6f);
+        ggml_tensor * normed_t = ggml_reshape_3d(ctx0, normed, 1, n_embd, n_tokens);
+
+        const block_stack * st = stack(blocks);
+        all.states   = st ? ggml_concat(ctx0, st->states,   normed,   1) : normed;
+        all.states_t = st ? ggml_concat(ctx0, st->states_t, normed_t, 0) : normed_t;
     }
+
+    // one token: the queries broadcast as they are
+    ggml_tensor * queries = n_tokens == 1 ? query :
+        ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
+
+    ggml_tensor * scores = ggml_mul_mat(ctx0, all.states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
-    return ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
+    return ggml_mul_mat(ctx0, all.states_t, scores);
 }
 
 // causal short convolution with a residual; dynamic adds input-dependent taps per head
@@ -317,10 +343,11 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     ggml_tensor * gain   = nullptr;
     ggml_tensor * forget = nullptr;
     if (loop.ctrl_gain_forget[ctrl]) {
-        // [RDNA-FAST] [TAG_INKLING_FOLDS] both projections in one product and one tanh, [2*n_embd, n_tokens]
-        ggml_tensor * both = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain_forget[ctrl], gate));
-        gain   = ggml_view_2d(ctx0, both, n_embd, n_tokens, both->nb[1], 0);
-        forget = ggml_view_2d(ctx0, both, n_embd, n_tokens, both->nb[1], n_embd*ggml_element_size(both));
+        // [RDNA-FAST] [TAG_INKLING_FOLDS] both projections in one product, [2*n_embd, n_tokens]; a tanh per half, so that
+        // each tanh-mul-sub/add below is one kernel on the GPU ([TAG_INKLING_FUSIONS], the same values)
+        ggml_tensor * both = build_lora_mm(loop.ctrl_gain_forget[ctrl], gate);
+        gain   = ggml_tanh(ctx0, ggml_view_2d(ctx0, both, n_embd, n_tokens, both->nb[1], 0));
+        forget = ggml_tanh(ctx0, ggml_view_2d(ctx0, both, n_embd, n_tokens, both->nb[1], n_embd*ggml_element_size(both)));
     } else {
         gain   = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl],   gate));
         forget = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_forget[ctrl], gate));
