@@ -10,7 +10,9 @@
 #include "llama-memory.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -5019,38 +5021,46 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     return ctx->get_embeddings_seq(seq_id);
 }
 
+// [TAG_KV_LANES] the cache of a memory that can have slot ranges: the plain cache, the attention cache of a hybrid
+// memory, the full-attention cache of an SWA cache and of a hybrid SWA memory (their SWA caches have no ranges)
+static llama_kv_cache * llama_kv_lanes_cache(llama_memory_t mem) {
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hybrid->get_mem_attn();
+    }
+
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        return kv;
+    }
+
+    if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        return iswa->get_base();
+    }
+
+    if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        return hybrid_iswa->get_mem_attn()->get_base();
+    }
+
+    return nullptr;
+}
+
 // [TAG_KV_LANES]
 bool llama_kv_lanes_enabled(const llama_context * ctx) {
-    llama_memory_t mem = llama_get_memory(ctx);
+    const llama_kv_cache * kv = llama_kv_lanes_cache(llama_get_memory(ctx));
 
-    if (const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(mem)) {
-        return hybrid->get_mem_attn()->get_lanes();
-    }
-
-    if (const auto * kv = dynamic_cast<const llama_kv_cache *>(mem)) {
-        return kv->get_lanes();
-    }
-
-    return false;
+    return kv != nullptr && kv->get_lanes();
 }
 
 // [TAG_SHARED_PASS]
 uint32_t llama_kv_lanes_merge_max(const llama_context * ctx) {
-    llama_memory_t mem = llama_get_memory(ctx);
+    const llama_kv_cache * kv = llama_kv_lanes_cache(llama_get_memory(ctx));
 
-    if (const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(mem)) {
-        return hybrid->get_mem_attn()->get_lanes_merge();
-    }
-
-    return 0;
+    return kv != nullptr ? kv->get_lanes_merge() : 0;
 }
 
 // [TAG_SHARED_PASS]
 void llama_kv_lanes_set_merge(llama_context * ctx, bool enable) {
-    llama_memory_t mem = llama_get_memory(ctx);
-
-    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
-        hybrid->get_mem_attn()->set_lanes_merge(enable);
+    if (llama_kv_cache * kv = llama_kv_lanes_cache(llama_get_memory(ctx))) {
+        kv->set_lanes_merge(enable);
     }
 }
 

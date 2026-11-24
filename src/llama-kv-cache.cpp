@@ -779,10 +779,13 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
     do {
         balloc.split_reset();
 
+        // [TAG_KV_LANES] one sequence per ubatch, so that each ubatch attends only to its own lane
+        // [TAG_SHARED_PASS] unless the batch is sequences of equal length that fit one small ubatch: they share the pass
+        const uint32_t n_seq_cap = balloc.seqs_equal_len(lanes_merge) ? 0 : 1;
+
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            // [TAG_KV_LANES] one sequence per ubatch, so that each ubatch attends only to its own lane
-            auto ubatch = lanes         ? balloc.split_equal(n_ubatch, false, 0, 1) :
+            auto ubatch = lanes         ? balloc.split_equal(n_ubatch, false, 0, n_seq_cap) :
                           n_stream == 1 ? balloc.split_simple(n_ubatch) :
                           embd_all      ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
 
@@ -2185,7 +2188,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
-void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t kv_off) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(n_stream == 1 && "TODO: support multiple streams");
@@ -2202,7 +2205,9 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
         for (int i = 0; i < n_tokens; ++i) {
             for (int j = 0; j < n_kv; ++j) {
                 // the position when the cells is empty is irrelevant - it will be masked out later in the attention
-                const llama_pos p0 = cells.is_empty(j) ? -1 : cells.pos_get(j);
+                // [TAG_KV_LANES] j is relative to the attended range
+                const uint32_t  jc = kv_off + j;
+                const llama_pos p0 = cells.is_empty(jc) ? -1 : cells.pos_get(jc);
 
                 data[h*(n_kv*n_tokens) + i*n_kv + j] = llama_relative_position_bucket(p0, ubatch->pos[i], hparams.n_rel_attn_bkts, false);
             }
@@ -2215,15 +2220,23 @@ bool llama_kv_cache::has_cell_ext() const {
     return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
 }
 
-void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent, uint32_t kv_off,
+        uint32_t i_tok0, uint32_t n_tok) const {
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
-    const int64_t n_kv = dst->ne[0];
-    std::vector<int32_t> data(n_kv * ubatch->n_tokens);
-    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+    // [TAG_SHARED_PASS] a block of the ubatch, or all of it
+    GGML_ASSERT(i_tok0 + n_tok <= ubatch->n_tokens);
+    const uint32_t n_tokens = n_tok > 0 ? n_tok : ubatch->n_tokens;
+    const int64_t  n_kv     = dst->ne[0];
+    GGML_ASSERT(ggml_nelements(dst) == n_kv * (int64_t) n_tokens);
+    std::vector<int32_t> data(n_kv * n_tokens);
+    for (uint32_t r = 0; r < n_tokens; ++r) {
+        const uint32_t i = i_tok0 + r;
         const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[i][0]));
         for (int64_t j = 0; j < n_kv; ++j) {
-            const int64_t distance = cells.is_empty(j) ? -1 : int64_t(ubatch->pos[i]) - cells.pos_get(j);
-            data[i*n_kv + j] = distance >= 0 && distance < extent ? distance : extent;
+            // [TAG_KV_LANES] j is relative to the attended range
+            const uint32_t jc       = kv_off + (uint32_t) j;
+            const int64_t  distance = cells.is_empty(jc) ? -1 : int64_t(ubatch->pos[i]) - cells.pos_get(jc);
+            data[r*n_kv + j] = distance >= 0 && distance < extent ? distance : extent;
         }
     }
     ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
@@ -3295,6 +3308,13 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il, uint
     return kv->get_v(ctx, il, get_n_kv(s), sinfos[i_cur], get_kv_off(s));
 }
 
+// [TAG_SHARED_PASS] the distances of the tokens of block s to the cells of the range of block s
+void llama_kv_cache_context::set_input_relative_pos_seq(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent, uint32_t s) const {
+    const uint32_t n_tok = ubatch->n_tokens / get_n_ranges();
+
+    kv->set_input_relative_pos(dst, ubatch, extent, get_kv_off(s), s*n_tok, n_tok);
+}
+
 void llama_kv_cache_context::set_input_kq_mask_seq(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t s) const {
     const uint32_t n_tok = ubatch->n_tokens / get_n_ranges();
 
@@ -3366,11 +3386,11 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
-    kv->set_input_pos_bucket(dst, ubatch);
+    kv->set_input_pos_bucket(dst, ubatch, kv_off);
 }
 
 void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
-    kv->set_input_relative_pos(dst, ubatch, extent);
+    kv->set_input_relative_pos(dst, ubatch, extent, kv_off);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

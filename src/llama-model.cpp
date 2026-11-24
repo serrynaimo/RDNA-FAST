@@ -3637,10 +3637,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
 
                     // [TAG_SHARED_PASS] sequences that decode batches of equal length share one pass. On by default
-                    // wherever the cache has slot ranges (llama_kv_lanes_set_merge() switches it off). Qwen3.x only:
-                    // its graph builds attention per sequence range.
+                    // wherever the cache has slot ranges (llama_kv_lanes_set_merge() switches it off): the generic
+                    // attention builds it per sequence range (2026-11-24: every hybrid, was Qwen3.x only; the parity
+                    // test checks it bit for bit on the tiny test model of every architecture). Not the K-only (MLA) input,
+                    // nor PLaMo-2, whose shared pass of 2 tokens per sequence differs from the multi-stream cache there.
                     // LLAMA_KV_LANES_MERGE=n overrides the token limit of such a pass for experiments, 0 = never share.
-                    if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
+                    if (!hparams.is_mla() && arch != LLM_ARCH_PLAMO2) {
                         const char * env = getenv("LLAMA_KV_LANES_MERGE");
                         auto * hybrid = dynamic_cast<llama_memory_hybrid *>(res);
                         if (hybrid) {
@@ -3760,6 +3762,44 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
                 }
             }
+    }
+
+    // [TAG_KV_LANES] slot ranges for every unified cache that several sequences share (see kv_lane_head()), so that a
+    // ubatch attends only to the cells of its own sequence instead of paying for the conversations of the other slots:
+    // the plain cache and the full-attention cache of the SWA caches (an SWA cache is window-sized, its tax is small).
+    // The hybrid memory turns them on itself, the MTP drafts above; caches with an indexer keep the cell-for-cell layout.
+    if (res != nullptr && params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+        if (auto * kv = dynamic_cast<llama_kv_cache *>(res)) {
+            kv->set_lanes(true);
+
+            // [TAG_SHARED_PASS] sequences that decode batches of equal length share one pass: the generic attention
+            // builds it per sequence range. Not for the K-only (MLA) input, which has no per-range masks, nor for T5,
+            // whose position bias is one tensor for the whole ubatch.
+            // LLAMA_KV_LANES_MERGE=n overrides the token limit of such a pass for experiments, 0 = never share.
+            // CogVLM: its three-sequence pass of 2 tokens each differs from the multi-stream cache in the parity test
+            if (!hparams.is_mla() && arch != LLM_ARCH_T5 && arch != LLM_ARCH_COGVLM) {
+                const char * env = getenv("LLAMA_KV_LANES_MERGE");
+                kv->set_lanes_merge_limit(env ? (uint32_t) std::max(0, atoi(env)) : llama_kv_cache::LANES_MERGE_LIMIT_DEFAULT);
+            }
+        } else if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(res)) {
+            iswa->get_base()->set_lanes(true);
+
+            // [TAG_SHARED_PASS] the SWA attention builds a merged ubatch per sequence range of the full-attention cache
+            // (not the K-only input)
+            if (!hparams.is_mla()) {
+                const char * env = getenv("LLAMA_KV_LANES_MERGE");
+                iswa->get_base()->set_lanes_merge_limit(env ? (uint32_t) std::max(0, atoi(env)) : llama_kv_cache::LANES_MERGE_LIMIT_DEFAULT);
+            }
+        } else if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(res)) {
+            hybrid_iswa->get_mem_attn()->get_base()->set_lanes(true);
+
+            // [TAG_SHARED_PASS] as above; Inkling 2's relative-position attention builds it per range too
+            if (!hparams.is_mla()) {
+                const char * env = getenv("LLAMA_KV_LANES_MERGE");
+                hybrid_iswa->get_mem_attn()->get_base()->set_lanes_merge_limit(
+                        env ? (uint32_t) std::max(0, atoi(env)) : llama_kv_cache::LANES_MERGE_LIMIT_DEFAULT);
+            }
+        }
     }
 
     return res;

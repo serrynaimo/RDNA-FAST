@@ -587,6 +587,21 @@ public:
     std::vector<ggml_tensor *> self_k_rot_swa;
     std::vector<ggml_tensor *> self_v_rot_swa;
 
+    // [TAG_KV_LANES] the first cell of the K/V views that this graph was built with (full-attention and SWA cache)
+    uint32_t kv_off     = 0;
+    uint32_t kv_off_swa = 0;
+
+    // [TAG_SHARED_PASS] a ubatch that merges sequences: the full-attention cache has slot ranges, so one mask per
+    // sequence block against its own range (self_kq_mask is not created then); the window-sized SWA cache has none
+    std::vector<ggml_tensor *> seq_kq_mask; // F32/F16 [n_kv(s), n_batch/n_blocks]
+    std::vector<uint32_t>      seq_kv_off;
+
+    // the full-attention masks: per sequence block of a merged ubatch, else the one mask
+    void build_base_masks(ggml_context * ctx0, const llama_ubatch & ubatch);
+    // mctx_cur: the current context (a hybrid memory's own input holds it, not this one)
+    void set_input_base_masks(const llama_kv_cache_iswa_context * mctx_cur, const llama_ubatch * ubatch) const;
+    bool can_reuse_base_masks(const llama_kv_cache_iswa_context * mctx_cur, const llm_graph_params & params) const;
+
     const llama_hparams hparams;
     const llama_cparams cparams;
 
@@ -625,6 +640,10 @@ public:
 
     std::vector<ggml_tensor *> self_k_rot;
     std::vector<ggml_tensor *> self_k_rot_swa;
+
+    // [TAG_KV_LANES] the first cell of the K views that this graph was built with (full-attention and SWA cache)
+    uint32_t kv_off     = 0;
+    uint32_t kv_off_swa = 0;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -841,6 +860,10 @@ public:
     // distance from the token to the cell, extent for the empty, future and more distant cells
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
+
+    // [TAG_SHARED_PASS] a merged ubatch: the distances per sequence block against its own range (self_rel_pos is not
+    // created then), like the masks of the attention input
+    std::vector<ggml_tensor *> seq_rel_pos; // I32 [n_kv(s), n_batch/n_blocks]
 
     // [RDNA-FAST] the input masks in F32 for the dense bias, cast once per graph and shared by its layers
     ggml_tensor * kq_mask_f32     = nullptr;
@@ -1477,7 +1500,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
                     int   il,
-            ggml_tensor * kq_mask = nullptr) const;
+            ggml_tensor * kq_mask = nullptr,
+            const std::vector<ggml_tensor *> * kq_mask_seq = nullptr) const; // [TAG_SHARED_PASS] per sequence block
 
     llm_graph_input_attn_k_iswa * build_attn_inp_k_iswa() const;
 

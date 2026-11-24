@@ -157,9 +157,15 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdo
 }
 
 llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+    // [TAG_KV_LANES] with slot ranges in the full-attention cache every ubatch holds one sequence (equal split below), so
+    // that it attends only to the cells of its own range
+    // [TAG_SHARED_PASS] unless the batch is sequences of equal length that fit one small ubatch: they share the pass
+    const bool     lanes     = kv_base->get_lanes();
+    const uint32_t n_seq_cap = !lanes ? 0 : (balloc.seqs_equal_len(kv_base->get_lanes_merge()) ? 0 : 1);
+
     // first try simple split
     do {
-        if (!unified) {
+        if (!unified || lanes) {
             // requires equal splits, so we skip the simple split
             break;
         }
@@ -204,7 +210,7 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, !unified, 0);
+            auto ubatch = embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, !unified, 0, n_seq_cap);
 
             if (ubatch.n_tokens == 0) {
                 break;

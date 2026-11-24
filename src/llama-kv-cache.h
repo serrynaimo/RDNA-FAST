@@ -276,8 +276,10 @@ public:
     // [TAG_SHARED_PASS] with n_tok > 0 the mask covers the n_tok tokens from i_tok0 on, dst is [n_kv, n_tok]
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t kv_off = 0,
                               uint32_t i_tok0 = 0, uint32_t n_tok = 0) const;
-    void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
-    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    // [TAG_KV_LANES] kv_off: the first cell of the attended range
+    void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t kv_off = 0) const;
+    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent, uint32_t kv_off = 0,
+                                uint32_t i_tok0 = 0, uint32_t n_tok = 0) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
@@ -470,6 +472,8 @@ public:
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t s) const;
     // the mask of the tokens of block s against the range of block s, dst is [get_n_kv(s), n_tokens/get_n_ranges()]
     void set_input_kq_mask_seq(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t s) const;
+    // [TAG_SHARED_PASS] the relative distances of block s, dst is [get_n_kv(s), n_tokens/get_n_ranges()] (Inkling 2)
+    void set_input_relative_pos_seq(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent, uint32_t s) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
