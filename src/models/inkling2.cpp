@@ -294,6 +294,13 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
     const int64_t n_seqs       = ubatch.n_seqs;
 
+    // [RDNA-FAST] [TAG_INKLING_CONV_CHAIN] the inputs first and the output at the end, so that the chain from the
+    // concatenation to the output is consecutive in the graph (one kernel on the GPU)
+    ggml_build_forward_expand(gf, cur);
+    if (dynamic) {
+        ggml_build_forward_expand(gf, dynamic);
+    }
+
     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
 
     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
@@ -331,6 +338,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     if (!folded && scale != 1.0f) {
         out = ggml_scale(ctx0, out, scale);
     }
+    ggml_build_forward_expand(gf, out);
     return out;
 }
 

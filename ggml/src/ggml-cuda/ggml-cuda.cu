@@ -56,6 +56,7 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx, const 
 #include "ggml-cuda/elem-fuse.cuh"
 #include "ggml-cuda/situ.cuh"
 #include "ggml-cuda/depth-mix.cuh"
+#include "ggml-cuda/conv-chain.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
 #include "ggml-cuda/out-prod.cuh"
@@ -4942,6 +4943,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (n > 0) {
             ggml_cuda_op_row_norm_div(*cuda_ctx, match);
             return n - 1;
+        }
+    }
+    // [TAG_INKLING_CONV_CHAIN] Inkling's short convolution with its state store and dynamic taps
+    if (node->op == GGML_OP_CONCAT) {
+        static const bool conv_chain_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_CONV_CHAIN_FUSION");
+        const int n_fused = conv_chain_disabled ? 0 : ggml_cuda_try_fuse_conv_chain(*cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused;
         }
     }
 

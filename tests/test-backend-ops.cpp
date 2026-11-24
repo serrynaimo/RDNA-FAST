@@ -4732,6 +4732,104 @@ struct test_depth_mix_fuse : public test_case {
     }
 };
 
+// [TAG_INKLING_CONV_CHAIN] the short convolution of our Inkling 2 graph (convolve): CONCAT(past, transpose(cur)), one CPY
+// per rollback slot of the window into the state, SSM_CONV, the optional residual ADD(cur, .), the optional dynamic taps
+// (per lag CONT(transpose(window)), MUL, ADD) and the SCALE of the unfolded form
+struct test_conv_chain_fuse : public test_case {
+    const int64_t C;
+    const int64_t T;      // tokens per sequence
+    const int64_t ns;     // sequences
+    const int64_t nc;     // conv width
+    const int64_t n_head; // 0: no dynamic taps
+    const int64_t K;      // rollback slots (windows stored)
+    const bool    res;    // unfolded: ADD(cur, .) and SCALE
+
+    std::vector<ggml_tensor *> nodes;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONV_CHAIN_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return nodes; }
+
+    std::string vars() override {
+        return VARS_TO_STR7(C, T, ns, nc, n_head, K, res);
+    }
+
+    test_conv_chain_fuse(int64_t C = 256, int64_t T = 1, int64_t ns = 1, int64_t nc = 4, int64_t n_head = 0, int64_t K = 1, bool res = false)
+        : C(C), T(T), ns(ns), nc(nc), n_head(n_head), K(K), res(res) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->view_src) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_cols = nc - 1;
+        const int64_t n_ch   = C + 64; // channels of the whole state row, this conv at channel offset 32
+
+        ggml_tensor * hist = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_cols, n_ch, ns);
+        ggml_set_name(hist, "hist");
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T*ns);
+        ggml_set_name(cur, "cur");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nc, C);
+        ggml_set_name(w, "w");
+        ggml_tensor * dyn = nullptr;
+        if (n_head > 0) {
+            dyn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nc*n_head, T*ns);
+            ggml_set_name(dyn, "dyn");
+        }
+        ggml_build_forward_expand(gf, cur);
+        if (dyn) {
+            ggml_build_forward_expand(gf, dyn);
+        }
+
+        ggml_tensor * past = ggml_view_3d(ctx, hist, n_cols, C, ns, hist->nb[1], hist->nb[2], 32*hist->nb[1]);
+        ggml_tensor * x = ggml_concat(ctx, past, ggml_transpose(ctx, ggml_reshape_3d(ctx, cur, C, T, ns)), 0);
+
+        // the state: rows of n_cols*n_ch floats, mem cells per slot, this ubatch at cell 1, this conv at channel 32
+        const int64_t mem  = ns + 2;
+        const size_t  offs = 32*n_cols*sizeof(float);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_cols*n_ch, mem*K);
+        ggml_set_name(s, "state");
+        for (int64_t t = 1; t <= K; ++t) {
+            const int64_t s_idx  = std::max<int64_t>(0, T - K + t);
+            const int64_t s_slot = K - t;
+            ggml_tensor * last = ggml_view_3d(ctx, x, n_cols, C, ns, x->nb[1], x->nb[2], ggml_row_size(x->type, s_idx));
+            ggml_tensor * cell = ggml_view_2d(ctx, s, n_cols*C, ns, s->nb[1], (s_slot*mem + 1)*s->nb[1] + offs);
+            ggml_tensor * st = ggml_cpy(ctx, last, cell);
+            nodes.push_back(st);
+            ggml_build_forward_expand(gf, st);
+        }
+
+        ggml_tensor * out = ggml_reshape_2d(ctx, ggml_ssm_conv(ctx, x, w), C, T*ns);
+        if (res) {
+            out = ggml_add(ctx, cur, out);
+        }
+        if (dyn) {
+            ggml_tensor * d3 = ggml_reshape_3d(ctx, dyn, nc, n_head, T*ns);
+            for (int64_t lag = 0; lag < nc; ++lag) {
+                ggml_tensor * tap = ggml_view_3d(ctx, d3, 1, n_head, T*ns, d3->nb[1], d3->nb[2], lag*d3->nb[0]);
+                ggml_tensor * win = ggml_view_3d(ctx, x, T, C, ns, x->nb[1], x->nb[2], (nc - 1 - lag)*x->nb[0]);
+                win = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_transpose(ctx, win)), C/n_head, n_head, T*ns);
+                out = ggml_add(ctx, out, ggml_reshape_2d(ctx, ggml_mul(ctx, win, tap), C, T*ns));
+            }
+        }
+        if (res) {
+            out = ggml_scale(ctx, out, 1.0f/sqrtf((dyn ? 2 : 1)*nc + 1));
+        }
+        ggml_set_name(out, "out");
+        nodes.push_back(out);
+        return out;
+    }
+};
+
 // y = c -/+ tanh(a)*b (the loop controller of Inkling 2): UNARY(TANH), MUL, SUB/ADD
 struct test_tanh_mul_addsub_fuse : public test_case {
     const std::array<int64_t, 4> ne;
@@ -11200,6 +11298,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_situ_fuse({1152, 8,   1}));
     test_cases.emplace_back(new test_situ_fuse({1152, 8, 512}));
     test_cases.emplace_back(new test_situ_fuse({  33, 3,   7}));
+
+    // [TAG_INKLING_CONV_CHAIN] decode, batched decode, verify, several sequences, rollback slots, prefill (unfused),
+    // the unfolded form (residual and scale; with the dynamic taps it stays unfused)
+    for (int64_t n_head : { 0, 8 }) {
+        for (int64_t K : { 1, 5 }) {
+            for (int64_t T : { 1, 2, 3, 5, 8, 32 }) {
+                test_cases.emplace_back(new test_conv_chain_fuse(1024, T, 1, 4, n_head, K));
+            }
+            test_cases.emplace_back(new test_conv_chain_fuse(1024, 1, 4, 4, n_head, K));
+            test_cases.emplace_back(new test_conv_chain_fuse(1024, 3, 2, 4, n_head, K));
+            test_cases.emplace_back(new test_conv_chain_fuse(2304, 4, 2, 4, n_head, K));
+            test_cases.emplace_back(new test_conv_chain_fuse( 384, 2, 3, 3, n_head, K));
+            test_cases.emplace_back(new test_conv_chain_fuse(1024, 64, 1, 4, n_head, K));
+            test_cases.emplace_back(new test_conv_chain_fuse(2304, 1, 1, 4, n_head, K, true));
+            test_cases.emplace_back(new test_conv_chain_fuse(2304, 3, 2, 5, n_head, K, true));
+        }
+    }
 
     // depth mix fusion: decode (1-8 tokens) and prefill rows, odd stacks (second product not MMVF), 1/3/4 queries
     // (4: the first product is not MMVF on Ampere+), row lengths for every rms_norm launch and MMVF block size
