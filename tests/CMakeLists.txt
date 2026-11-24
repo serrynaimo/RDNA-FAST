@@ -168,7 +168,7 @@ set(LLAMA_CONTEXT_TEST_SRC
 )
 llama_build(${LLAMA_CONTEXT_TEST_SRC})
 
-# [TAG_KV_LANES] [TAG_SHARED_PASS] needs a Qwen3.x hybrid model: test-rocmfpx-seq-parity -m <model.gguf>
+# [TAG_KV_LANES] [TAG_SHARED_PASS] needs a model with slot ranges (most since 2026-11-24): test-rocmfpx-seq-parity -m <model.gguf>
 llama_build(test-rocmfpx-seq-parity.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)

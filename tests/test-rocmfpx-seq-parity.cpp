@@ -20,7 +20,8 @@
 // matmuls then drives two such runs as far apart as two independent roundings (several tenths of a logit). The checks
 // above compare only runs with the same pass width and the same cell order, where every bit must match.
 //
-// Needs a Qwen3.x hybrid model (the slot ranges belong to its memory); other models are skipped.
+// Needs a model whose memory has slot ranges (plain, SWA, hybrid and hybrid SWA caches since 2026-11-24); others are
+// skipped.
 // usage: test-rocmfpx-seq-parity -m <model.gguf> [-t <threads>]
 
 #include "llama.h"
@@ -216,10 +217,24 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "failed to load %s\n", path);
         return 1;
     }
-    if (!llama_model_is_hybrid(model)) {
-        printf("not a hybrid model: the slot ranges do not apply, nothing to test\n");
-        llama_model_free(model);
-        return 0;
+    // [TAG_KV_LANES] any model whose memory has slot ranges: the plain cache, the SWA caches, the hybrid memories
+    {
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx           = 1024;
+        cp.n_seq_max       = 2;
+        cp.kv_unified      = true;
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        cp.offload_kqv     = false;
+        llama_context * ctx = llama_init_from_model(model, cp);
+        const bool lanes = ctx != nullptr && llama_kv_lanes_enabled(ctx);
+        if (ctx) {
+            llama_free(ctx);
+        }
+        if (!lanes) {
+            printf("the memory of this model has no slot ranges, nothing to test\n");
+            llama_model_free(model);
+            return 0;
+        }
     }
 
     const std::string text =
@@ -245,20 +260,41 @@ int main(int argc, char ** argv) {
         printf("%s  cache %-4s  k %d  %s\n", ok ? "ok  " : "FAIL", type, k, what);
         n_fail += ok ? 0 : 1;
     };
+    // a comparison across pass widths: bit-exact only where every kernel is width-invariant (Qwen3.x with quantized
+    // weights); the f16/f32 matmuls of the tiny test models take other kernels at 2 columns than at 1. Logged only.
+    const auto info = [&](bool ok, const char * type, int k, const char * what) {
+        printf("%s  cache %-4s  k %d  %s\n", ok ? "ok  " : "info", type, k, what);
+    };
 
     typedef std::vector<std::vector<float>> rows;
 
     for (const ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_F16 }) {
         const char * tn = ggml_type_name(type);
 
-        // the shared pass is on by default in a pool with slot ranges, and can be switched off
+        // a K/V cache of this type for the head size of the model (q4_0 needs heads of whole blocks)
+        {
+            rows r;
+            if (!run(model, { true, { 0 }, true, 1, false, false, type, {} }, toks, n_threads, r)) {
+                printf("skip  cache %-4s  no context with this cache type for the model\n", tn);
+                continue;
+            }
+        }
+
+        // the shared pass is on by default in a pool with slot ranges where the model's attention builds it per
+        // range, and can be switched off; models without it get the slot-range checks only
+        bool shared = false;
         {
             rows r;
             uint32_t n_on = 0, n_off = 0, n_stream = 0;
             bool ok = run(model, { true,  { 0, 1 }, true,  1, true, false, type, {} }, toks, n_threads, r, &n_on);
             ok = ok && run(model, { true,  { 0, 1 }, false, 1, true, false, type, {} }, toks, n_threads, r, &n_off);
             ok = ok && run(model, { false, { 0, 1 }, true,  1, true, false, type, {} }, toks, n_threads, r, &n_stream);
-            check(ok && n_on > 0 && n_off == 0 && n_stream == 0, tn, 1, "the shared pass is on by default with slot ranges, off on request, absent without them");
+            shared = n_on > 0;
+            if (shared) {
+                check(ok && n_off == 0 && n_stream == 0, tn, 1, "the shared pass is on by default with slot ranges, off on request, absent without them");
+            } else {
+                check(ok && n_stream == 0, tn, 1, "no shared pass for this model (slot ranges only): one pass per sequence");
+            }
         }
 
         // 1. the same tokens in two bottom-up ranges of the shared pool
@@ -274,19 +310,34 @@ int main(int argc, char ** argv) {
 
             bool ok = run(model, { true,  { 0, 1 }, true,  k, false, false, type, {} }, toks, n_threads, apart);
             ok = ok && run(model, { true,  { 0, 1 }, false, k, true,  false, type, {} }, toks, n_threads, joint);
+
+            check(ok && same_bits(apart[0], joint[0]) && same_bits(apart[1], joint[1]), tn, k,
+                    "one decode per sequence == one decode for both with the shared pass off");
+
+            if (!shared) {
+                // with rollbacks, one pass per sequence
+                if (k >= 2) {
+                    rows rb_apart, rb_joint;
+                    const std::vector<int> rb = { 1, k - 1 };
+                    bool rok = run(model, { true,  { 0, 1 }, true,  k, false, false, type, rb }, toks, n_threads, rb_apart);
+                    rok = rok && run(model, { true,  { 0, 1 }, false, k, true,  false, type, rb }, toks, n_threads, rb_joint);
+                    check(rok && same_bits(rb_apart[0], rb_joint[0]) && same_bits(rb_apart[1], rb_joint[1]), tn, k,
+                            "with rollbacks: one decode per sequence == one decode for both with the shared pass off");
+                }
+                continue;
+            }
+
             ok = ok && run(model, { true,  { 0, 2 }, true,  k, true,  false, type, {} }, toks, n_threads, merged02);
             ok = ok && run(model, { true,  { 0, 1 }, true,  k, true,  false, type, {} }, toks, n_threads, merged01);
             ok = ok && run(model, { false, { 0, 1 }, true,  k, true,  false, type, {} }, toks, n_threads, stream);
 
-            check(ok && same_bits(apart[0], joint[0]) && same_bits(apart[1], joint[1]), tn, k,
-                    "one decode per sequence == one decode for both with the shared pass off");
             check(ok && same_bits(merged02[0], stream[0]) && same_bits(merged02[1], stream[1]), tn, k,
                     "shared pass on two bottom-up ranges == stock multi-stream cache, both texts");
             check(ok && same_bits(merged01[0], stream[0]), tn, k,
                     "shared pass on slots 0 and 1 == stock multi-stream cache, the bottom-up text");
             if (k == 1) {
-                check(ok && same_bits(merged01[0], apart[0]) && same_bits(merged01[1], apart[1]), tn, k,
-                        "shared pass on slots 0 and 1 == one decode per sequence, both texts");
+                info(ok && same_bits(merged01[0], apart[0]) && same_bits(merged01[1], apart[1]), tn, k,
+                        "shared pass on slots 0 and 1 == one decode per sequence, both texts (across pass widths)");
             }
 
             // 3. rejected draft tokens: 1 token of the first text and k - 1 of the second after every step

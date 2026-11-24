@@ -85,7 +85,13 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                // [TAG_KV_LANES] with slot ranges in the full-attention cache: one sequence per ubatch, so that it
+                // attends only to the cells of its own range
+                // [TAG_SHARED_PASS] unless the batch is sequences of equal length that fit one small ubatch
+                const auto *   base      = mem_attn->get_base();
+                const uint32_t n_seq_cap = !base->get_lanes() ? 0 : (balloc.seqs_equal_len(base->get_lanes_merge()) ? 0 : 1);
+
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, n_seq_cap);
             }
 
             if (ubatch.n_tokens == 0) {
