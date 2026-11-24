@@ -2460,6 +2460,29 @@ private:
         return res;
     }
 
+    // save idle slots (except id_slot_keep) to the prompt cache; with a unified KV cache, also clear them
+    void cache_idle_slots(int32_t id_slot_keep = -1) {
+        if (!params_base.cache_idle_slots) {
+            return;
+        }
+
+        for (auto & slot : slots) {
+            if (slot.id != id_slot_keep && !slot.is_processing()) {
+                SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
+
+                if (slot.prompt_save(*prompt_cache)) {
+                    SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
+                    prompt_cache->update();
+                }
+
+                if (params_base.kv_unified) {
+                    // [TAG_IDLE_SLOT_CLEAR]
+                    slot.prompt_clear();
+                }
+            }
+        }
+    }
+
     // call only when the task is sure to launch on the slot
     void update_prompt_cache(server_slot & slot, const server_task & task, const server_slot_plan & plan) {
         if (plan.update_cache) {
@@ -2469,8 +2492,22 @@ private:
 
             slot.prompt_save(*prompt_cache);
 
-            if (!slot.prompt_load(*prompt_cache, task.tokens, get_task_lora(task))) {
+            const auto lora = get_task_lora(task);
+
+            if (!slot.prompt_load(*prompt_cache, task.tokens, lora)) {
                 slot.prompt_clear();
+
+                // with a unified KV cache, the restore can fail because idle slots still hold the cells it needs
+                // the cache entry is kept on failure, so free those slots and retry once
+                if (params_base.kv_unified && params_base.cache_idle_slots) {
+                    cache_idle_slots(slot.id);
+
+                    SLT_INF(slot, "%s", "retrying prompt restore after clearing idle slots\n");
+
+                    if (!slot.prompt_load(*prompt_cache, task.tokens, lora)) {
+                        slot.prompt_clear();
+                    }
+                }
             }
 
             prompt_cache->update();
@@ -3762,23 +3799,7 @@ private:
                         break; // drop the task
                     }
 
-                    if (params_base.cache_idle_slots) {
-                        for (auto & slot : slots) {
-                            if (!slot.is_processing()) {
-                                SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
-
-                                if (slot.prompt_save(*prompt_cache)) {
-                                    SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-                                    prompt_cache->update();
-                                }
-
-                                if (params_base.kv_unified) {
-                                    // [TAG_IDLE_SLOT_CLEAR]
-                                    slot.prompt_clear();
-                                }
-                            }
-                        }
-                    }
+                    cache_idle_slots();
 
                     // [TAG_KV_POOL] [TAG_REQUEST_PRIORITY] requests below xhigh wait behind a waiting xhigh one even
                     // while a slot is free, and a release starts only one waiting request: once a request has
