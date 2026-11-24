@@ -53,6 +53,10 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx, const 
                                          const ggml_tensor * expert_scale, const ggml_tensor * weights,
                                          ggml_tensor * dst, const ggml_tensor * merge);
 #include "ggml-cuda/norm.cuh"
+#include "ggml-cuda/elem-fuse.cuh"
+#include "ggml-cuda/situ.cuh"
+#include "ggml-cuda/depth-mix.cuh"
+#include "ggml-cuda/conv-chain.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
 #include "ggml-cuda/out-prod.cuh"
@@ -4471,6 +4475,62 @@ static bool ggml_cuda_hc_combine_norm_alias_ok(const ggml_cuda_hc_combine_norm_a
 
 #include "hc-match.inc"
 
+// [TAG_INKLING_FUSIONS] (unslothai/llama.cpp #402, MIT) the number of nodes after node i taken by a fused SiTU gate,
+// 0 if the nodes at i do not form one
+static int ggml_cuda_try_fuse_situ(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const ggml_op ops[10] = {
+        GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
+        GGML_OP_VIEW,  GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
+    const int n = 10;
+    if (i + n > cgraph->n_nodes) {
+        return 0;
+    }
+    for (int k = 0; k < n; ++k) {
+        const ggml_tensor * t = cgraph->nodes[i + k];
+        if (t->op != ops[k] || t->type != GGML_TYPE_F32) {
+            return 0;
+        }
+    }
+    ggml_tensor ** nd = cgraph->nodes + i;
+    if (ggml_get_unary_op(nd[1]) != GGML_UNARY_OP_TANH || ggml_get_unary_op(nd[3]) != GGML_UNARY_OP_SIGMOID ||
+        ggml_get_unary_op(nd[7]) != GGML_UNARY_OP_TANH) {
+        return 0;
+    }
+    const ggml_tensor * g = nd[0]->src[0];
+    const ggml_tensor * u = nd[5];
+    // a = nd[2], sigmoid(g) = nd[3], sigmoid(g)*a = nd[4], b = nd[8], out = nd[9]
+    if (nd[1]->src[0] != nd[0] || nd[2]->src[0] != nd[1] || nd[3]->src[0] != g ||
+        nd[4]->src[0] != nd[2] || nd[4]->src[1] != nd[3] || nd[6]->src[0] != u || nd[7]->src[0] != nd[6] ||
+        nd[8]->src[0] != nd[7] || nd[9]->src[0] != nd[4] || nd[9]->src[1] != nd[8]) {
+        return 0;
+    }
+    // g and u: same-shape row views of one tensor, rows contiguous, the rows evenly strided
+    if (g->type != GGML_TYPE_F32 || u->type != GGML_TYPE_F32 || !ggml_are_same_shape(g, u) || !ggml_are_same_shape(g, nd[9]) ||
+        g->nb[0] != sizeof(float) || u->nb[0] != sizeof(float) || g->nb[1] != u->nb[1] ||
+        g->nb[2] != g->nb[1]*g->ne[1] || u->nb[2] != u->nb[1]*u->ne[1] || g->ne[3] != 1 || !ggml_is_contiguous(nd[9])) {
+        return 0;
+    }
+    float scales[8];
+    memcpy(scales + 0, nd[0]->op_params, 2*sizeof(float));
+    memcpy(scales + 2, nd[2]->op_params, 2*sizeof(float));
+    memcpy(scales + 4, nd[6]->op_params, 2*sizeof(float));
+    memcpy(scales + 6, nd[8]->op_params, 2*sizeof(float));
+
+    // the u view reads the gate_up product outside the chain, so it is checked here and left out of the subgraph test
+    if (ggml_node_get_use_count(cgraph, i + 5) != 1) {
+        return 0;
+    }
+    const int idxs[9]   = { i, i + 1, i + 2, i + 3, i + 4, i + 6, i + 7, i + 8, i + 9 };
+    const ggml_op ops9[9] = { ops[0], ops[1], ops[2], ops[3], ops[4], ops[6], ops[7], ops[8], ops[9] };
+    const int out_idx = i + n - 1;
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 9, ops9, &out_idx, 1) ||
+        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n, &out_idx, 1)) {
+        return 0;
+    }
+    ggml_cuda_op_situ_fused(*cuda_ctx, g, u, scales, nd[9]);
+    return n - 1;
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -4845,6 +4905,54 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }();
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // [TAG_INKLING_FUSIONS] from unslothai/llama.cpp #402 and #412 (MIT): Inkling 2's SiTU gate, the tanh-mul-sub/add
+    // of its loop controllers and its normalized router weights, each one kernel rounding like the separate ones
+    if (node->op == GGML_OP_SCALE) {
+        static const bool situ_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_SITU_FUSION");
+        const int n_fused = situ_disabled ? 0 : ggml_cuda_try_fuse_situ(cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused;
+        }
+    }
+    if (node->op == GGML_OP_UNARY) {
+        static const bool tanh_mul_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_TANH_MUL_ADDSUB_FUSION");
+        ggml_cuda_tanh_mul_addsub_match match;
+        // the elementwise kernel may run in place: the matcher checks the overlaps
+        const int n = tanh_mul_disabled ? 0 : ggml_cuda_match_tanh_mul_addsub(cgraph, i, match);
+        if (n > 0) {
+            ggml_cuda_op_tanh_mul_addsub(*cuda_ctx, match);
+            return n - 1;
+        }
+    }
+    // (unslothai/llama.cpp #414, MIT) the depth mix after an RMS_NORM: CONCAT, CONCAT, [REPEAT,] MUL_MAT, SOFT_MAX, [MUL_MAT]
+    if (node->op == GGML_OP_CONCAT) {
+        static const bool depth_mix_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_DEPTH_MIX_FUSION");
+        const int n_fused = depth_mix_disabled ? 0 : ggml_cuda_try_fuse_depth_mix(cuda_ctx, cgraph, i,
+            [](const ggml_cgraph * g, int idx, int cnt, const int * outs, int n_outs) {
+                return ggml_cuda_check_fusion_memory_ranges(g, idx, cnt, outs, n_outs);
+            });
+        if (n_fused > 0) {
+            return n_fused;
+        }
+    }
+    if (node->op == GGML_OP_SUM_ROWS) {
+        static const bool row_norm_div_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_ROW_NORM_DIV_FUSION");
+        ggml_cuda_row_norm_div_match match;
+        const int n = row_norm_div_disabled ? 0 : ggml_cuda_match_row_norm_div(cgraph, i, match);
+        if (n > 0) {
+            ggml_cuda_op_row_norm_div(*cuda_ctx, match);
+            return n - 1;
+        }
+    }
+    // [TAG_INKLING_CONV_CHAIN] Inkling's short convolution with its state store and dynamic taps
+    if (node->op == GGML_OP_CONCAT) {
+        static const bool conv_chain_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_CONV_CHAIN_FUSION");
+        const int n_fused = conv_chain_disabled ? 0 : ggml_cuda_try_fuse_conv_chain(*cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused;
+        }
+    }
 
     if (fuse_mask & (1u << 0)) {
     if ((fuse_mask0 & (1u << 0)) && (node->op == GGML_OP_CONCAT || node->op == GGML_OP_CONT)) {
@@ -5893,11 +6001,11 @@ static void ggml_cuda_op_profile_add(const std::string & key, double us) {
     prof.cur->n_kernels++;
 }
 
-static void ggml_cuda_op_profile_end() {
+static void ggml_cuda_op_profile_end(int every = -1) {
     auto & prof = ggml_cuda_op_profile_get();
     auto & tab  = *prof.cur;
     prof.cur = nullptr;
-    if (++tab.n_graphs < prof.every) {
+    if (++tab.n_graphs < (every >= 0 ? every : prof.every)) {
         return;
     }
     std::string name;
@@ -5912,13 +6020,72 @@ static void ggml_cuda_op_profile_end() {
     GGML_LOG_WARN("op profile [%s]: %d graphs, %.3f ms and %.0f kernels per graph\n", name.c_str(), tab.n_graphs, 1e-3 * tab.us / n, (double) tab.n_kernels / n);
     int n_rows = 0;
     for (const auto & it : rows) {
-        if (++n_rows > 28) {
+        if (++n_rows > 48) {
             break;
         }
         GGML_LOG_WARN("op profile row: %-46s %8.3f ms %5.1f%% calls %6.1f each %7.1f us\n", it.first.c_str(), 1e-3 * it.second.us / n,
                 100.0 * it.second.us / tab.us, (double) it.second.n / n, it.second.us / (double) it.second.n);
     }
     tab = ggml_cuda_op_profile::table();
+}
+
+// [TAG_OP_PROFILE_TS] GGML_CUDA_OP_PROFILE_TS=N: the graph runs as in production (captured graphs on, no waits between
+// nodes) with a one-thread kernel before every launched node or fused group that stores the device clock; after the
+// graph the host waits once, reads the clocks and adds the differences per kind of node into the TAG_OP_PROFILE tables,
+// printed every N graphs. The row "(clock kernel)" is the cost of the clock kernel itself, measured back to back at the
+// start of every graph: it is inside every other row once, so subtract it per call.
+struct ggml_cuda_op_profile_ts {
+    std::vector<std::string> keys;     // per launched node or fused group, rebuilt whenever the graph is evaluated
+    uint64_t *               d_ticks = nullptr;
+    int                      cap     = 0;
+};
+
+static int ggml_cuda_op_profile_ts_every() {
+    static const int every = [] {
+        const char * env = getenv("GGML_CUDA_OP_PROFILE_TS");
+        return env ? atoi(env) : 0;
+    }();
+    return every;
+}
+
+static ggml_cuda_op_profile_ts * ggml_cuda_op_profile_ts_cur = nullptr;
+
+static __global__ void ggml_cuda_op_profile_ts_kernel(uint64_t * ticks, const int idx) {
+#if defined(GGML_USE_HIP)
+    ticks[idx] = wall_clock64();
+#elif defined(GGML_USE_MUSA)
+    ticks[idx] = clock64();
+#else
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    ticks[idx] = t;
+#endif
+}
+
+static void ggml_cuda_op_profile_ts_mark(ggml_backend_cuda_context * cuda_ctx) {
+    ggml_cuda_op_profile_ts * ts = ggml_cuda_op_profile_ts_cur;
+    if (ts == nullptr || (int) ts->keys.size() + 1 >= ts->cap) {
+        return;
+    }
+    ggml_cuda_op_profile_ts_kernel<<<1, 1, 0, cuda_ctx->stream()>>>(ts->d_ticks, (int) ts->keys.size());
+}
+
+// device clock ticks per microsecond
+static double ggml_cuda_op_profile_ts_rate(const int device) {
+#if defined(GGML_USE_HIP)
+    int khz = 0;
+    if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, device) != hipSuccess || khz <= 0) {
+        (void) hipGetLastError();
+        khz = 100000;
+    }
+    return khz / 1000.0;
+#elif defined(GGML_USE_MUSA)
+    GGML_UNUSED(device);
+    return 2000.0;
+#else
+    GGML_UNUSED(device);
+    return 1000.0;
+#endif
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
@@ -5963,6 +6130,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
+
+            // [TAG_OP_PROFILE_TS] the keys follow this evaluation; two clocks back to back first: the clock kernel's cost
+            if (ggml_cuda_op_profile_ts_cur) {
+                ggml_cuda_op_profile_ts_cur->keys.clear();
+                ggml_cuda_op_profile_ts_mark(cuda_ctx);
+                ggml_cuda_op_profile_ts_cur->keys.push_back("(clock kernel)");
+            }
 
             if (stream_ctx.concurrent_events.size() > 0) {
                 should_launch_concurrent_events = true;
@@ -6085,7 +6259,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 const bool    op_prof    = ggml_cuda_op_profile_get().cur != nullptr;
                 const int64_t op_prof_t0 = op_prof ? ggml_time_us() : 0;
 
+                ggml_cuda_op_profile_ts * op_ts = ggml_cuda_op_profile_ts_cur;
+                if (op_ts) {
+                    ggml_cuda_op_profile_ts_mark(cuda_ctx);
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+
+                if (op_ts) {
+                    op_ts->keys.push_back(nodes_to_skip != 0 ?
+                            "fused " + ggml_cuda_op_profile_key(node) + " .. " + ggml_op_desc(cgraph->nodes[i + nodes_to_skip]) + " (" +
+                                std::to_string(nodes_to_skip + 1) + " nodes)" :
+                            ggml_cuda_op_profile_key(node));
+                }
 
                 if (nodes_to_skip != 0) {
                     if (op_prof) {
@@ -6133,6 +6319,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+            }
+            // [TAG_OP_PROFILE_TS] the clock after the last node
+            if (ggml_cuda_op_profile_ts_cur) {
+                ggml_cuda_op_profile_ts_mark(cuda_ctx);
             }
         }
 
@@ -6444,6 +6634,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         cuda_graph_update_required = false;
     }
 
+    // [TAG_OP_PROFILE_TS] one clock buffer per captured graph (its kernels keep the address), made before a capture
+    static std::unordered_map<const void *, ggml_cuda_op_profile_ts> op_ts_graphs;
+    ggml_cuda_op_profile_ts * op_ts = nullptr;
+    if (ggml_cuda_op_profile_ts_every() > 0 && ggml_cuda_op_profile_get().every == 0) {
+        op_ts = &op_ts_graphs[graph_key];
+        const int need = cgraph->n_nodes + 2;
+        if (op_ts->cap < need) {
+            // the old buffer stays allocated: a captured graph may still write to it
+            op_ts->cap = 2*need;
+            CUDA_CHECK(cudaMalloc((void **) &op_ts->d_ticks, op_ts->cap*sizeof(uint64_t)));
+            op_ts->keys.clear();
+        }
+        ggml_cuda_op_profile_ts_cur = op_ts;
+    }
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -6464,6 +6669,23 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     if (op_profile) {
         ggml_cuda_op_profile_end();
+    }
+
+    // [TAG_OP_PROFILE_TS] one wait per graph, then the clock differences per launched node or fused group
+    if (op_ts) {
+        ggml_cuda_op_profile_ts_cur = nullptr;
+        const size_t n_keys = op_ts->keys.size();
+        if (n_keys > 0 && (int) n_keys + 1 <= op_ts->cap) {
+            std::vector<uint64_t> ticks(n_keys + 1);
+            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+            CUDA_CHECK(cudaMemcpy(ticks.data(), op_ts->d_ticks, ticks.size()*sizeof(uint64_t), cudaMemcpyDeviceToHost));
+            const double per_us = ggml_cuda_op_profile_ts_rate(cuda_ctx->device);
+            ggml_cuda_op_profile_begin(cgraph);
+            for (size_t k = 0; k < n_keys; ++k) {
+                ggml_cuda_op_profile_add(op_ts->keys[k], (double) (int64_t) (ticks[k + 1] - ticks[k]) / per_us);
+            }
+            ggml_cuda_op_profile_end(ggml_cuda_op_profile_ts_every());
+        }
     }
 
     cuda_ctx->mmb_marks_after_compute = true;
