@@ -2205,8 +2205,7 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
     // request diverges from it; the cache can still hold a better start (e.g. a longer version of the conversation the
     // slot holds a prefix of), so ask it and probe (restore without saving the slot) when it does
     if (cacheable && !update_cache && !probe_cache && prompt_cache->has_better(*ret->prompt, task.tokens, lora)) {
-        SLT_INF(*ret, "%s", "the prompt cache holds a better start - looking for it
-");
+        SLT_INF(*ret, "%s", "the prompt cache holds a better start - looking for it\n");
         probe_cache = true;
     }
 
