@@ -1,8 +1,6 @@
 #include "models.h"
 #include "../llama-memory-hybrid-iswa.h"
 
-#include <cstdlib>
-
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
@@ -276,20 +274,13 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     ggml_tensor * scores = ggml_mul_mat(ctx0, all.states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
-    // [A/B 11-25, to be removed] vanilla 396ed2cce's order (the scores as src0, n_embd the long dimension) instead of the
-    // depth-mix fusion for prompt batches (more than 32 tokens; decode and drafts stay fused):
-    //   LLAMA_INKLING_MIX_PROMPT=1 the loop-message mixes (4 queries), =2 every mix; unset/0: fused everywhere
-    //   LLAMA_INKLING_MIX_SCORES_SRC0=1 (window w1 arm B): the 4-query mixes at every batch size
-    static const int  mix_prompt  = getenv("LLAMA_INKLING_MIX_PROMPT") ? atoi(getenv("LLAMA_INKLING_MIX_PROMPT")) : 0;
-    static const bool scores_src0 = getenv("LLAMA_INKLING_MIX_SCORES_SRC0") && atoi(getenv("LLAMA_INKLING_MIX_SCORES_SRC0")) != 0;
-    const int64_t n_queries = query->ne[1];
-    const bool use_src0 = (scores_src0 && n_queries > 3) ||
-        (n_tokens > 32 && (mix_prompt >= 2 || (mix_prompt == 1 && n_queries > 3)));
-    if (use_src0) {
+    // [TAG_INKLING_FUSIONS] the loop-message mixes (4 queries) of a prompt batch in vanilla 396ed2cce's order (the scores
+    // as src0, n_embd the long dimension); decode and drafts (up to 32 tokens) and the mixes of 1-3 queries keep the form
+    // of the depth-mix fusion. RX 7900 XT, prod shape (2026-11-25 windows w1 + mix2): prompts 4k / 15k +1.8 / +1.3% over
+    // all unfused, +1.1 / +1.2% over fused prompts; every mix in vanilla's order on prompts +0.5%; answers level; KLD
+    // identical (0.011361)
+    if (query->ne[1] > 3 && n_tokens > 32) {
         ggml_tensor * out = ggml_mul_mat(ctx0, scores, all.states_t); // [n_queries, n_embd, n_tokens]
-        if (n_queries == 1) {
-            return ggml_reshape_3d(ctx0, out, n_embd, 1, n_tokens);   // the same layout as [n_embd, 1, n_tokens]
-        }
         return ggml_cont(ctx0, ggml_permute(ctx0, out, 1, 0, 2, 3));  // [n_embd, n_queries, n_tokens]
     }
 
