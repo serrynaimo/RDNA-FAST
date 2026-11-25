@@ -1742,6 +1742,43 @@ void server_prompt_cache::log_disk_state() const {
             disk_owned_path.c_str());
 }
 
+bool server_prompt_cache::has_better(const server_prompt & prompt, const server_tokens & tokens_new,
+                                     const std::vector<common_adapter_lora_info> & lora_new) const {
+    const bool   is_empty = prompt.tokens.empty() || lora_should_clear_cache(prompt.lora, lora_new);
+    const size_t lcp_base = is_empty ? 0 : prompt.tokens.get_common_prefix(tokens_new);
+    const size_t eff_base = is_empty ? 0 :
+        server_prompt_cache_eff_tokens(prompt.tokens.size(), lcp_base, partial_seq_rm,
+                                       server_prompt_cache_ckpt_at_or_below(prompt.checkpoints, lcp_base));
+
+    for (const auto & st : states) {
+        if (lora_should_clear_cache(st.prompt.lora, lora_new)) {
+            continue;
+        }
+        const size_t lcp_cur = st.prompt.tokens.get_common_prefix(tokens_new);
+        const size_t eff_cur = server_prompt_cache_eff_tokens(st.prompt.tokens.size(), lcp_cur, partial_seq_rm,
+                                                              server_prompt_cache_ckpt_at_or_below(st.prompt.checkpoints, lcp_cur));
+        if (float(eff_cur) / std::max<size_t>(1, st.prompt.tokens.size()) >= 0.25f && eff_cur > eff_base) {
+            return true;
+        }
+    }
+
+    if (!lora_get_enabled_ids(lora_new).empty()) {
+        return false;
+    }
+    for (const auto & st : disk_states) {
+        if (!st.usable) {
+            continue;
+        }
+        const size_t lcp_cur = st.tokens.get_common_prefix(tokens_new);
+        const size_t eff_cur = server_prompt_cache_eff_tokens(st.tokens.size(), lcp_cur, partial_seq_rm, st.ckpt_at_or_below(lcp_cur));
+        if (eff_cur > 0 && eff_cur >= eff_base + disk_min_gain) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool server_prompt_cache::load(
               server_prompt & prompt,
         const server_tokens & tokens_new,
@@ -2163,6 +2200,15 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
     // [RDNA-FAST] cache prompts only for completion tasks: decisions, realtime, transcription and TTS tasks neither
     // write nor restore entries (upstream: every task that is not stateless)
     const bool cacheable = prompt_cache != nullptr && task.type == SERVER_TASK_TYPE_COMPLETION;
+
+    // [RDNA-FAST] vanilla 82dd97047 (#28992): the checks above only tell if the slot's state is worth saving or the
+    // request diverges from it; the cache can still hold a better start (e.g. a longer version of the conversation the
+    // slot holds a prefix of), so ask it and probe (restore without saving the slot) when it does
+    if (cacheable && !update_cache && !probe_cache && prompt_cache->has_better(*ret->prompt, task.tokens, lora)) {
+        SLT_INF(*ret, "%s", "the prompt cache holds a better start - looking for it
+");
+        probe_cache = true;
+    }
 
     return { ret->id, update_cache && cacheable, !update_cache && probe_cache && cacheable };
 }

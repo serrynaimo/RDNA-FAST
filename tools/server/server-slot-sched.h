@@ -317,6 +317,11 @@ struct server_prompt_cache {
     // true when a usable disk entry holds exactly the first n_tokens of `tokens`
     bool has_disk_prefix(const server_tokens & tokens, size_t n_tokens) const;
 
+    // [RDNA-FAST] vanilla 82dd97047 (#28992): true when a RAM or disk entry is a better start for tokens_new than
+    // `prompt` by the rules of load() (no side effects: the disk files are checked only by the load)
+    bool has_better(const server_prompt & prompt, const server_tokens & tokens_new,
+                    const std::vector<common_adapter_lora_info> & lora_new) const;
+
     // restore the most useful entry (RAM or disk) for tokens_new into the slot, if any is
     // better than what the slot already holds. lora_new: the lora config of the new prompt, the states made with
     // another config are skipped; the disk tier holds only states made without an active adapter (its files do not
