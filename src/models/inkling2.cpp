@@ -1,6 +1,8 @@
 #include "models.h"
 #include "../llama-memory-hybrid-iswa.h"
 
+#include <cstdlib>
+
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
@@ -273,6 +275,14 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
 
     ggml_tensor * scores = ggml_mul_mat(ctx0, all.states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
+
+    // [A/B 11-25, to be removed] LLAMA_INKLING_MIX_SCORES_SRC0=1: vanilla 396ed2cce's order (the scores as src0, n_embd
+    // the long dimension) for the mixes the depth-mix fusion does not take (more than 3 queries: the loop messages)
+    static const bool scores_src0 = getenv("LLAMA_INKLING_MIX_SCORES_SRC0") && atoi(getenv("LLAMA_INKLING_MIX_SCORES_SRC0")) != 0;
+    if (scores_src0 && query->ne[1] > 3) {
+        ggml_tensor * out = ggml_mul_mat(ctx0, scores, all.states_t); // [n_queries, n_embd, n_tokens]
+        return ggml_cont(ctx0, ggml_permute(ctx0, out, 1, 0, 2, 3));  // [n_embd, n_queries, n_tokens]
+    }
 
     return ggml_mul_mat(ctx0, all.states_t, scores);
 }

@@ -4,6 +4,7 @@
 #include "ggml-backend-impl.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 #include <algorithm>
@@ -11,7 +12,7 @@
 
 #define DEPTH_MIX_BLOCK 1024
 #define DEPTH_MIX_MAX_N 32
-#define DEPTH_MIX_MAX_NQ 3
+#define DEPTH_MIX_MAX_NQ 4 // [TAG_INKLING_FUSIONS] 4: Inkling 2's loop messages (Q, K, V, FFN)
 #define DEPTH_MIX_MAX_NCOLS 8192
 
 struct depth_mix_params {
@@ -373,7 +374,9 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
         prev->nb[2] % (2*sizeof(float)) != 0) {
         DEPTH_MIX_DECLINE("unaligned stack rows");
     }
-    if (n < 2 || n > DEPTH_MIX_MAX_N || nq < 1 || nq > DEPTH_MIX_MAX_NQ || ncols % 2 != 0 || ncols > DEPTH_MIX_MAX_NCOLS ||
+    // [A/B 11-25, to be removed] GGML_CUDA_DEPTH_MIX_MAX_NQ=3: the loop-message mixes unfused as before
+    static const int max_nq = getenv("GGML_CUDA_DEPTH_MIX_MAX_NQ") ? atoi(getenv("GGML_CUDA_DEPTH_MIX_MAX_NQ")) : DEPTH_MIX_MAX_NQ;
+    if (n < 2 || n > DEPTH_MIX_MAX_N || nq < 1 || nq > std::min(max_nq, DEPTH_MIX_MAX_NQ) || ncols % 2 != 0 || ncols > DEPTH_MIX_MAX_NCOLS ||
         mm1->ne[0] != n || mm1->ne[2] != T) {
         DEPTH_MIX_DECLINE("sizes");
     }
@@ -575,6 +578,7 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
         case 1: ggml_cuda_kernel_launch(depth_mix_f32<1>, launch_params, p); break;
         case 2: ggml_cuda_kernel_launch(depth_mix_f32<2>, launch_params, p); break;
         case 3: ggml_cuda_kernel_launch(depth_mix_f32<3>, launch_params, p); break;
+        case 4: ggml_cuda_kernel_launch(depth_mix_f32<4>, launch_params, p); break;
         default: GGML_ABORT("fatal error");
     }
 

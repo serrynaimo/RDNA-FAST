@@ -11367,6 +11367,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_depth_mix_fuse(1002, 9, 1, 3, false, true));
     test_cases.emplace_back(new test_depth_mix_fuse(2304, 14, 1, 512, false));
     test_cases.emplace_back(new test_depth_mix_fuse(2304, 14, 3, 512, false));
+    // [TAG_INKLING_FUSIONS] 4 queries: the loop messages (Q, K, V, FFN)
+    test_cases.emplace_back(new test_depth_mix_fuse(2304, 14, 4, 512, false));
+    test_cases.emplace_back(new test_depth_mix_fuse(2304, 13, 4, 77, true, true));
+    test_cases.emplace_back(new test_depth_mix_fuse(2304, 32, 4, 3, false, true));
+    test_cases.emplace_back(new test_depth_mix_fuse(2304, 5, 4, 1, false, true));
     test_cases.emplace_back(new test_depth_mix_fuse(2304, 13, 3, 77, true));
     // earlier rows as a view at an odd float offset with an odd row stride: no float2 loads from it
     test_cases.emplace_back(new test_depth_mix_fuse(2304, 8, 1, 1, false, false, 1));
