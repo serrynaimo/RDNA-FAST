@@ -41,6 +41,11 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_DFLASH_CONV_GROUP_SIZE,  hparams.dflash_conv_group_size,  false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_RANK,    hparams.dflash_selector_rank,    false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_TOP_K,   hparams.dflash_selector_top_k,   false);
+    // [TAG_INKLING_DSPARK] the rnn markov head of an Inkling 2 DSpark also reads a mix of the target features (f_rnn)
+    ml.get_key(LLM_KV_DFLASH_HAS_MARKOV_CONTEXT, hparams.dspark_f_rnn, false);
+    if (!hparams.dspark_f_rnn && ml.get_tensor_meta("markov_ctx_norm.weight")) {
+        throw std::runtime_error("DSpark model has 'markov_ctx_norm.weight' but 'has_markov_context' is not true in GGUF metadata");
+    }
     // [TAG_DSPINE] a DSpine draft names its refinement width; the code bridge tensors come with it
     ml.get_key(LLM_KV_DFLASH_DSPINE_TOP_K,     hparams.dflash_dspine_top_k,     false);
     ml.get_key(LLM_KV_DFLASH_DSPINE_EPS,       hparams.dflash_dspine_eps,       false);
@@ -156,6 +161,28 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 
         dspark_conf_proj   = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "weight"), { n_embd + dspark_markov_rank, 1 }, TENSOR_NOT_REQUIRED);
         dspark_conf_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "bias"),   { 1 },             TENSOR_NOT_REQUIRED);
+
+        // [TAG_INKLING_DSPARK] rnn markov head: a gated state carried across the block positions; with f_rnn it also
+        // reads a mix of the target features of the last committed token
+        dspark_markov_w2_b = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "bias"), { n_vocab_draft }, TENSOR_NOT_REQUIRED);
+
+        const int64_t n_joint = (hparams.dspark_f_rnn ? 2*n_embd : n_embd) + 2*dspark_markov_rank;
+
+        dspark_joint_proj   = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ, "weight"), { n_joint, 3*dspark_markov_rank }, TENSOR_NOT_REQUIRED);
+        dspark_joint_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ, "bias"),   { 3*dspark_markov_rank }, dspark_joint_proj ? 0 : TENSOR_NOT_REQUIRED);
+
+        if (hparams.dspark_f_rnn) {
+            if (!dspark_joint_proj) {
+                throw std::runtime_error("DSpark model with a markov context has no rnn head ('joint_proj.weight')");
+            }
+            dspark_markov_ctx_mix  = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_CTX_MIX,  "weight"), { (int64_t) target_layer_ids.size() }, 0);
+            dspark_markov_ctx_norm = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_CTX_NORM, "weight"), { n_embd }, 0);
+        }
+
+        // block [anchor, mask_1, ..., mask_k]: per-slot mask embeddings instead of the mask token
+        if (hparams.dsv4_hc_mult == 0 && hparams.dflash_block_size > 1) {
+            dspark_mask_embd = create_tensor(tn(LLM_TENSOR_DSPARK_MASK_EMBD, "weight"), { n_embd, hparams.dflash_block_size - 1 }, TENSOR_NOT_REQUIRED);
+        }
 
         LLAMA_LOG_INFO("%s: DFlash with DSpark markov head (rank = %lld)\n", __func__, (long long) dspark_markov_rank);
     }
@@ -283,11 +310,17 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         lilicorr_anchor_out_head_b      = create_tensor(tn(LLM_TENSOR_LILICORR_ANCHOR_OUT_HEAD, "bias"), { factor },           0);
     }
 
-    fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
+    // [TAG_INKLING_DSPARK] drafts with per-layer context K/V (ctx_mix) have no shared fc
+    const int fc_flags = ml->get_tensor_meta("blk.0.ctx_mix.weight") ? TENSOR_NOT_REQUIRED : 0;
+
+    fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, fc_flags);
     fc_s            = create_tensor(tn(LLM_TENSOR_FC,              "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
     fc_in_s         = create_tensor(tn(LLM_TENSOR_FC,              "input_scale"), { 1 }, TENSOR_NOT_REQUIRED);
-    output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
+    output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, fc_flags); // encoder hidden_norm (after fc)
     output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
+
+    // [TAG_INKLING_DSPARK] optional: norm of the anchor embedding
+    tok_norm        = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD_NORM, "weight", 0), { n_embd }, TENSOR_NOT_REQUIRED);
 
     // optional: reduced-vocab drafts ship their own lm head, full-vocab drafts can share the target's via ctx_other
     // a draft with its own embeddings + head references no target tensors and can run on devices the target does not use (e.g. -devd with a tensor-split target)
@@ -369,6 +402,17 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), { n_ff, n_embd }, 0);
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), { n_embd, n_ff }, 0);
 
+        // [TAG_INKLING_DSPARK] optional: context K/V from this layer's own mix of the target features
+        layer.dflash_ctx_mix = create_tensor(tn(LLM_TENSOR_DFLASH_CTX_MIX, "weight", i), { (int64_t) target_layer_ids.size() }, TENSOR_NOT_REQUIRED);
+        if (layer.dflash_ctx_mix) {
+            layer.dflash_ctx_norm        = create_tensor(tn(LLM_TENSOR_DFLASH_CTX_NORM,        "weight", i), { n_embd }, 0);
+            layer.dflash_wk_ctx          = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_K_CTX,      "weight", i), { n_embd, n_embd_k_gqa }, 0);
+            layer.dflash_wv_ctx          = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_V_CTX,      "weight", i), { n_embd, n_embd_v_gqa }, 0);
+            layer.dflash_attn_k_ctx_norm = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_K_CTX_NORM, "weight", i), { n_embd_head_k }, 0);
+        } else if (fc == nullptr) {
+            throw std::runtime_error("DFlash draft without fc needs a ctx_mix on every layer");
+        }
+
         if (conv_meta) {
             const int64_t kernel = hparams.dflash_conv_kernel_size;
             const int64_t groups = n_embd / hparams.dflash_conv_group_size;
@@ -412,6 +456,9 @@ ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
 // DFlash Encoder: processes target model features through feature fusion layer
 template <>
 llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+    // [TAG_INKLING_DSPARK] a draft with per-layer ctx_mix has no fc: its features are mixed in the decoder's injection
+    GGML_ASSERT(model.fc != nullptr && "DFlash encoder graph needs the fc of the draft");
+
     ggml_tensor * cur = build_inp_embd_enc();
 
     cur = build_lora_mm(model.fc, cur, model.fc_s);
@@ -426,8 +473,47 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
     ggml_build_forward_expand(gf, cur);
 }
 
+// [TAG_INKLING_DSPARK] DSpark block [anchor, mask_1, ..., mask_k] per sequence: slot k > 0 uses mask row k - 1, the anchor
+// uses its (normed) token embedding (vanilla 33aeb17f8 / 78feec062)
+static ggml_tensor * build_dspark_inp_block(llm_graph_context & g, const llama_model & model, ggml_tensor * tok_embd, ggml_tensor * inp_tokens) {
+    ggml_context * ctx0 = g.ctx0;
+
+    const int64_t n_embd   = g.n_embd;
+    const int64_t n_tokens = g.n_tokens;
+
+    const int64_t n_blocks     = g.ubatch.n_seqs_unq;
+    const int64_t block_drafts = n_blocks > 0 ? n_tokens / n_blocks : 0;
+
+    if (block_drafts == 0 || n_tokens % n_blocks != 0 || block_drafts > (int64_t) g.hparams.dflash_block_size) {
+        // not a draft block (e.g. graph reserve)
+        return ggml_get_rows(ctx0, tok_embd, inp_tokens);
+    }
+
+    ggml_tensor * anchors = ggml_view_2d(ctx0, inp_tokens, 1, n_blocks, (size_t) block_drafts * inp_tokens->nb[0], 0);
+    anchors = ggml_get_rows(ctx0, tok_embd, ggml_cont_1d(ctx0, anchors, n_blocks));
+    if (model.tok_norm) {
+        anchors = g.build_norm(anchors, model.tok_norm, nullptr, LLM_NORM_RMS, -1);
+    }
+
+    ggml_tensor * cur = ggml_reshape_3d(ctx0, anchors, n_embd, 1, n_blocks);
+    if (block_drafts > 1) {
+        ggml_tensor * masks = ggml_view_3d(ctx0, model.dspark_mask_embd, n_embd, block_drafts - 1, 1,
+                model.dspark_mask_embd->nb[1], model.dspark_mask_embd->nb[2], 0);
+        masks = ggml_repeat_4d(ctx0, ggml_cast(ctx0, masks, GGML_TYPE_F32), n_embd, block_drafts - 1, n_blocks, 1);
+        cur = ggml_concat(ctx0, cur, masks, 1);
+    }
+
+    return ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
+}
+
 // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
-static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+// [TAG_INKLING_DSPARK] (vanilla 33aeb17f8) rnn head: a gated state carried across the block positions (joint_proj)
+// rnn_state: [n_embd, n_tokens] per-token state of the Inkling2 rnn head (see llama_batch_ext_select_n_embd_state)
+//   anchor row: f_rnn, an extra rnn input; draft row i: [uniform | 1/temp | 0...] of its draw
+//   each step draws its token at 1/temp (0: argmax) and packs [token, k, ids, probs] into h_nextn
+// softcap_after_bias: softcap(base + bias) instead of leaving the logits uncapped
+static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, ggml_tensor * hidden = nullptr,
+        ggml_tensor * rnn_state = nullptr, bool softcap_after_bias = false) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -437,6 +523,10 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 
     // confidence head is optional
     const bool has_conf = model.dspark_conf_proj != nullptr;
+
+    // rnn head: gated state carried across block positions
+    const bool is_rnn = model.dspark_joint_proj != nullptr;
+    GGML_ASSERT(!is_rnn || hidden != nullptr);
 
     ggml_tensor * base = res->t_logits; // [n_vocab, n_tokens]
     const int64_t n_vocab = base->ne[0];
@@ -467,8 +557,66 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     ggml_tensor * prev = ggml_view_2d(ctx0, tokens, 1, n_blocks, token_stride, 0);
     prev = ggml_cont_1d(ctx0, prev, n_blocks);
 
+    const int64_t n_embd = g.hparams.n_embd;
+
+    // n_rows values from offset off of the state at block position i, [n_rows, n_blocks]
+    const auto state_rows = [&](int64_t n_rows, int64_t off, int64_t i) {
+        return ggml_cont(ctx0, ggml_view_2d(ctx0, rnn_state, n_rows, n_blocks, (size_t) block_drafts * rnn_state->nb[1],
+                i*rnn_state->nb[1] + off*ggml_element_size(rnn_state)));
+    };
+
+    ggml_tensor * f_rnn     = nullptr; // [n_embd, n_blocks]
+    ggml_tensor * inv_temp  = nullptr; // [1, n_blocks]
+    ggml_tensor * is_greedy = nullptr; // [1, n_blocks], 1 when inv_temp is 0
+    if (rnn_state) {
+        // the anchor row holds f_rnn, so it cannot be a draft row
+        GGML_ASSERT(!has_conf && !sample_from_anchor && rnn_state->ne[0] == n_embd);
+        f_rnn = state_rows(n_embd, 0, 0);
+        if (block_drafts > i_draft_beg) {
+            inv_temp  = state_rows(1, 1, i_draft_beg);
+            is_greedy = ggml_scale_bias(ctx0, ggml_step(ctx0, inv_temp), -1.0f, 1.0f);
+        }
+    }
+
+    // the draws keep the top n_cand candidates, q of the verifier is their distribution
+    const int64_t n_cand = std::min<int64_t>(64, n_vocab);
+    GGML_ASSERT(!rnn_state || 2 + 2*n_cand <= n_embd);
+
+    // draw the token of block position i from softmax(top_k(col) * inv_temp), like the backend dist sampler
+    // returns [n_embd, n_blocks] packed rows [token, n_cand, ids, probs] and sets the next prev
+    const auto draw = [&](ggml_tensor * col, int64_t i, ggml_tensor *& next) {
+        ggml_tensor * ids   = ggml_top_k(ctx0, col, n_cand); // [n_cand, n_blocks], unordered
+        ggml_tensor * vals  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, col, 1, n_vocab, n_blocks), ids), n_cand, n_blocks);
+
+        // the top-k order can change between runs, sort by logit so a seed draws the same tokens
+        ggml_tensor * order = ggml_argsort(ctx0, vals, GGML_SORT_ORDER_DESC);
+        ids  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, ids,  1, n_cand, n_blocks), order), n_cand, n_blocks);
+        vals = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, vals, 1, n_cand, n_blocks), order), n_cand, n_blocks);
+
+        ggml_tensor * probs = ggml_soft_max(ctx0, ggml_mul(ctx0, vals, inv_temp));
+
+        // index of the first candidate whose cumulative probability passes the uniform
+        ggml_tensor * n_over = ggml_sum_rows(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ggml_cumsum(ctx0, probs), state_rows(1, 0, i))));
+        ggml_tensor * idx    = ggml_cast(ctx0, ggml_scale_bias(ctx0, ggml_clamp(ctx0, n_over, 1.0f, (float) n_cand), -1.0f, (float) n_cand), GGML_TYPE_I32);
+
+        ggml_tensor * ids_f  = ggml_cast(ctx0, ids, GGML_TYPE_F32);
+        ggml_tensor * drawn  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, ids_f, 1, n_cand, n_blocks), idx), 1, n_blocks);
+        ggml_tensor * argmax = ggml_reshape_2d(ctx0, ggml_cast(ctx0, ggml_argmax(ctx0, col), GGML_TYPE_F32), 1, n_blocks);
+
+        // greedy keeps the exact argmax
+        ggml_tensor * tok = ggml_add(ctx0, drawn, ggml_mul(ctx0, is_greedy, ggml_sub(ctx0, argmax, drawn)));
+        next = ggml_cast(ctx0, ggml_reshape_1d(ctx0, tok, n_blocks), GGML_TYPE_I32);
+
+        ggml_tensor * k_col = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_blocks), (float) n_cand);
+        ggml_tensor * row   = ggml_concat(ctx0, ggml_concat(ctx0, ggml_concat(ctx0, tok, k_col, 0), ids_f, 0), probs, 0);
+        return ggml_pad(ctx0, row, n_embd - row->ne[0], 0, 0, 0);
+    };
+
+    const float softcap = softcap_after_bias ? g.hparams.f_final_logit_softcapping : 0.0f;
+
     ggml_tensor * cat      = nullptr;
     ggml_tensor * cat_conf = nullptr;
+    ggml_tensor * cat_draw = nullptr;
 
     if (!sample_from_anchor) {
         // bonus anchor slot: pass the logits through unbiased, pad the (unread) confidence column
@@ -476,13 +624,48 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         if (has_conf) {
             cat_conf = ggml_sigmoid(ctx0, ggml_view_2d(ctx0, base, 1, n_blocks, base_stride, 0));
         }
+        if (rnn_state) {
+            cat_draw = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_blocks), 0.0f);
+        }
     }
 
-    // TODO: the in-graph chain is greedy (argmax); sampling params affect only the final
+    ggml_tensor * state = nullptr; // [R, n_blocks]
+
+    // TODO: without rnn_state the in-graph chain is greedy (argmax); sampling params affect only the final
     //       token pick, not the Markov conditioning path
     for (int64_t i = i_draft_beg; i < block_drafts; ++i) {
-        ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev);                          // [R, n_blocks]
-        ggml_tensor * bias    = g.build_lora_mm(w2, w1_prev, model.dspark_markov_w2_s); // [n_vocab_draft, n_blocks]
+        ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev); // [R, n_blocks]
+        ggml_tensor * markov  = w1_prev;
+
+        if (is_rnn) {
+            const int64_t rank = w1_prev->ne[0];
+            if (state == nullptr) {
+                state = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, n_blocks), 0.0f);
+            }
+
+            ggml_tensor * hidden_i = ggml_view_2d(ctx0, hidden, hidden->ne[0], n_blocks,
+                                                  (size_t) block_drafts * hidden->nb[1], i*hidden->nb[1]);
+            ggml_tensor * joint = ggml_concat(ctx0, ggml_concat(ctx0, state, w1_prev, 0), ggml_cont(ctx0, hidden_i), 0);
+            if (f_rnn) {
+                joint = ggml_concat(ctx0, joint, f_rnn, 0);
+            }
+            joint = ggml_add(ctx0, ggml_mul_mat(ctx0, model.dspark_joint_proj, joint), model.dspark_joint_proj_b); // [3R, n_blocks]
+
+            const auto chunk = [&](int64_t k) {
+                return ggml_cont(ctx0, ggml_view_2d(ctx0, joint, rank, n_blocks, joint->nb[1], k*rank*ggml_element_size(joint)));
+            };
+            ggml_tensor * gate = ggml_sigmoid(ctx0, chunk(0));
+            ggml_tensor * cand = ggml_tanh(ctx0, chunk(1));
+
+            // state = gate * state + (1 - gate) * cand
+            state  = ggml_add(ctx0, cand, ggml_mul(ctx0, gate, ggml_sub(ctx0, state, cand)));
+            markov = ggml_tanh(ctx0, chunk(2));
+        }
+
+        ggml_tensor * bias = g.build_lora_mm(w2, markov, model.dspark_markov_w2_s); // [n_vocab_draft, n_blocks]
+        if (model.dspark_markov_w2_b) {
+            bias = ggml_add(ctx0, bias, model.dspark_markov_w2_b);
+        }
         if (model.d2t) {
             // reduced draft vocab: scatter the bias to the target rows (base is -inf on the others)
             const int64_t n_draft_vocab = bias->ne[0];
@@ -496,16 +679,19 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         // position i of every block: strided view [n_vocab, n_blocks]
         ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, i*base->nb[1]);
         ggml_tensor * col    = ggml_add(ctx0, base_i, bias);
+        if (softcap > 0.0f) {
+            col = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, col, 1.0f/softcap)), softcap);
+        }
 
         cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
 
         if (has_conf) {
             // confidence head input: predicts per-position acceptance
             ggml_tensor * conf_inp   = res->t_embd; // [n_embd, n_tok]
-            // conf(i) = sigmoid(conf_proj . [conf_inp(i); markov_w1[prev(i)]] + b)  -- [1, n_blocks]
+            // conf(i) = sigmoid(conf_proj . [conf_inp(i); markov(i)] + b)  -- [1, n_blocks]
             ggml_tensor * conf_inp_i = ggml_view_2d(ctx0, conf_inp, conf_inp->ne[0], n_blocks,
                                                     (size_t) block_drafts * conf_inp->nb[1], i*conf_inp->nb[1]);
-            ggml_tensor * feat = ggml_concat(ctx0, ggml_cont(ctx0, conf_inp_i), w1_prev, 0);
+            ggml_tensor * feat = ggml_concat(ctx0, ggml_cont(ctx0, conf_inp_i), markov, 0);
             ggml_tensor * conf = ggml_mul_mat(ctx0, model.dspark_conf_proj, feat);
             if (model.dspark_conf_proj_b) {
                 conf = ggml_add(ctx0, conf, model.dspark_conf_proj_b);
@@ -515,9 +701,20 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             cat_conf = cat_conf ? ggml_concat(ctx0, cat_conf, conf, 1) : conf;
         }
 
-        if (i + 1 < block_drafts) {
+        if (rnn_state) {
+            ggml_tensor * packed = draw(col, i, prev);
+            cat_draw = cat_draw ? ggml_concat(ctx0, cat_draw, packed, 1) : packed;
+        } else if (i + 1 < block_drafts) {
             prev = ggml_argmax(ctx0, col);
         }
+    }
+
+    if (cat_draw) {
+        // position-major like cat; restore ubatch block-major order
+        ggml_tensor * draws = ggml_reshape_3d(ctx0, cat_draw, n_embd, n_blocks, block_drafts);
+        draws = ggml_cont(ctx0, ggml_permute(ctx0, draws, 0, 2, 1, 3));
+        res->t_h_nextn = ggml_reshape_2d(ctx0, draws, n_embd, n_tok);
+        ggml_build_forward_expand(g.gf, res->t_h_nextn);
     }
 
     // cat is position-major; restore ubatch block-major order
@@ -1061,29 +1258,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
         res->add_input(std::move(inp));
 
-        // fuse the target features through the encoder
-        ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
-        inp_g = build_norm(inp_g, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
-        cb(inp_g, "inp_g_embeddings", -1);
-
-        for (int il = 0; il < n_layer; ++il) {
-            const auto & layer = model.layers[il];
-
-            ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g, layer.wk_s);
-            const bool shared_kv = layer.wv == nullptr;
-            ggml_tensor * Vcur = shared_kv ? Kcur : build_lora_mm(layer.wv, inp_g, layer.wv_s);
-
-            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
-
-            Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
-            if (shared_kv) {
-                Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
-            }
-            Kcur = build_rope(Kcur, inp_pos);
-            cb(Kcur, "Kcur_injected", il);
-            cb(Vcur, "Vcur_injected", il);
-
+        // write one layer's injected K/V to its (sub-)cache
+        const auto store_kv = [&](ggml_tensor * Kcur, ggml_tensor * Vcur, int il) {
             if (use_iswa) {
                 // route each layer's K/V to its sub-cache: SWA layers -> sliding cache, full -> dense
                 const bool    is_swa = hparams.is_swa(il);
@@ -1112,6 +1288,70 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
                 ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
             }
+        };
+
+        // [TAG_INKLING_DSPARK] a draft without fc (Inkling 2 DSpark) mixes the raw target features on every layer:
+        // rms_norm(sum_i ctx_mix[i] * target_i) * ctx_norm -> k_ctx / v_ctx; the markov head's own mix (f_rnn) goes out as
+        // h_nextn, the driver keeps the rows of the last positions (vanilla 33aeb17f8)
+        if (model.fc == nullptr) {
+            const int64_t n_target = n_embd_inp / n_embd;
+
+            // [n_target, n_embd, n_tokens]: the mix is a matmul over the target taps
+            ggml_tensor * feats = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, inp_target, n_embd, n_target, n_tokens), 1, 0, 2, 3));
+
+            const auto build_mix = [&](ggml_tensor * mix, ggml_tensor * norm, int il) {
+                ggml_tensor * cur = ggml_reshape_2d(ctx0, ggml_mul_mat(ctx0, mix, feats), n_embd, n_tokens);
+                return build_norm(cur, norm, nullptr, LLM_NORM_RMS, il);
+            };
+
+            if (model.dspark_markov_ctx_mix) {
+                res->t_h_nextn = build_mix(model.dspark_markov_ctx_mix, model.dspark_markov_ctx_norm, -1);
+                cb(res->t_h_nextn, "f_rnn", -1);
+                ggml_build_forward_expand(gf, res->t_h_nextn);
+            }
+
+            for (int il = 0; il < n_layer; ++il) {
+                const auto & layer = model.layers[il];
+
+                ggml_tensor * cur = build_mix(layer.dflash_ctx_mix, layer.dflash_ctx_norm, il);
+
+                ggml_tensor * Kcur = ggml_reshape_3d(ctx0, build_lora_mm(layer.dflash_wk_ctx, cur), n_embd_head, n_head_kv, n_tokens);
+                ggml_tensor * Vcur = ggml_reshape_3d(ctx0, build_lora_mm(layer.dflash_wv_ctx, cur), n_embd_head, n_head_kv, n_tokens);
+
+                Kcur = build_norm(Kcur, layer.dflash_attn_k_ctx_norm, NULL, LLM_NORM_RMS, il);
+                Kcur = build_rope(Kcur, inp_pos);
+                cb(Kcur, "Kcur_injected", il);
+                cb(Vcur, "Vcur_injected", il);
+
+                store_kv(Kcur, Vcur, il);
+            }
+            return;
+        }
+
+        // fuse the target features through the encoder
+        ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
+        inp_g = build_norm(inp_g, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
+        cb(inp_g, "inp_g_embeddings", -1);
+
+        for (int il = 0; il < n_layer; ++il) {
+            const auto & layer = model.layers[il];
+
+            ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g, layer.wk_s);
+            const bool shared_kv = layer.wv == nullptr;
+            ggml_tensor * Vcur = shared_kv ? Kcur : build_lora_mm(layer.wv, inp_g, layer.wv_s);
+
+            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+            Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
+            if (shared_kv) {
+                Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
+            }
+            Kcur = build_rope(Kcur, inp_pos);
+            cb(Kcur, "Kcur_injected", il);
+            cb(Vcur, "Vcur_injected", il);
+
+            store_kv(Kcur, Vcur, il);
         }
 
         res->t_embd = inp_g;
@@ -1139,6 +1379,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     res->t_inp_tokens = inp_tokens;
 
     ggml_tensor * inp_anchor = nullptr;
+    ggml_tensor * rnn_state  = nullptr;
     if (model.lilicorr_pass_hidden_proj && ubatch.embd_state && n_tokens == (int64_t) hparams.dflash_block_size * ubatch.n_seqs_unq) {
         // LiliCorr sets inp_anchor to pass the context features to the lattice scorer
         auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd, n_embd);
@@ -1147,13 +1388,28 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_set_input(inp->h);
         inp_anchor = inp->h;
         res->add_input(std::move(inp));
+    } else if (hparams.dspark_f_rnn && ubatch.embd_state) {
+        // [TAG_INKLING_DSPARK] the Inkling2 rnn head state arrives as the state embedding of the block tokens
+        auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd, n_embd);
+        inp->tokens = inp_tokens;
+        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp->h);
+        rnn_state = inp->h;
+        res->add_input(std::move(inp));
     } else {
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
         inp->tokens = inp_tokens;
         res->add_input(std::move(inp));
     }
 
-    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp_tokens);
+    // [TAG_INKLING_DSPARK] the whole block shares the mask row of its first query (the anchor)
+    if (model.dspark_mask_embd && use_iswa) {
+        inp_attn_iswa->swa_block_uniform = true;
+    }
+
+    ggml_tensor * inpL = model.dspark_mask_embd
+        ? build_dspark_inp_block(*this, model, tok_embd, inp_tokens)
+        : ggml_get_rows(ctx0, tok_embd, inp_tokens);
     if (hparams.f_embedding_scale != 0.0f) {
         inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
     }
@@ -1279,6 +1535,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     res->t_embd = cur;
 
+    ggml_tensor * hidden = cur;
+
     // lm_head from the target model (shared via ctx_other)
     auto * output   = model.output;
     auto * output_s = model.output_s;
@@ -1291,6 +1549,11 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     cur = build_lora_mm(output, cur, output_s);
+
+    // [TAG_INKLING_DSPARK] a padded lm head (e.g. shared from the target): drop the rows past the vocabulary
+    if (!model.d2t && cur->ne[0] > (int64_t) model.vocab.n_tokens()) {
+        cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, model.vocab.n_tokens(), cur->ne[1], cur->nb[1], 0));
+    }
 
     // DFlash2 feeds these logits to the selector, so they need the target's output
     // transforms; DFlash1 and DSpark read them through the sampler instead
@@ -1324,8 +1587,11 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     res->t_logits = cur;
 
     // DSpark: bias the draft logits with the Markov head
-    if (model.dspark_markov_w1) {
-        build_dspark_markov_head(*this, model, inp_tokens);
+    // [TAG_INKLING_DSPARK] the Inkling2 head needs its state rows (draft blocks only, not the graph reserve)
+    if (model.dspark_markov_w1 && !hparams.dspark_f_rnn) {
+        build_dspark_markov_head(*this, model, inp_tokens, hidden);
+    } else if (model.dspark_markov_w1 && rnn_state) {
+        build_dspark_markov_head(*this, model, inp_tokens, hidden, rnn_state, true);
     }
 
     if (dspine) {

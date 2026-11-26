@@ -591,6 +591,10 @@ public:
     uint32_t kv_off     = 0;
     uint32_t kv_off_swa = 0;
 
+    // [TAG_INKLING_DSPARK] every query of a sequence takes the SWA mask row of the first one (DSpark draft blocks see
+    // the window of their anchor, vanilla ca8daad19's block_uniform)
+    bool swa_block_uniform = false;
+
     // [TAG_SHARED_PASS] a ubatch that merges sequences: the full-attention cache has slot ranges, so one mask per
     // sequence block against its own range (self_kq_mask is not created then); the window-sized SWA cache has none
     std::vector<ggml_tensor *> seq_kq_mask; // F32/F16 [n_kv(s), n_batch/n_blocks]

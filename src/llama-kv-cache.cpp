@@ -1939,6 +1939,9 @@ struct args_set_input_kq_mask {
 
     // [TAG_SHARED_PASS] the mask covers the tokens from i_tok0 on, row r of it is token i_tok0 + r
     uint32_t i_tok0;
+
+    // [TAG_INKLING_DSPARK] every token of a sequence takes the mask row of its first token (DSpark draft blocks)
+    bool block_uniform;
 };
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
@@ -1965,10 +1968,15 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     llama_pos seq_pos_min[LLAMA_MAX_SEQ];
     std::fill(seq_pos_min, seq_pos_min + LLAMA_MAX_SEQ, INT32_MAX);
 
+    // [TAG_INKLING_DSPARK] first token of each sequence, for mask rows shared within a sequence
+    uint32_t seq_first[LLAMA_MAX_SEQ];
+    std::fill(seq_first, seq_first + LLAMA_MAX_SEQ, ubatch->n_tokens);
+
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         const llama_seq_id seq_id = ubatch->seq_id[i][0];
 
         seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
+        seq_first[seq_id]   = std::min(seq_first[seq_id],   i);
     }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -1983,12 +1991,15 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
             const auto & cells = v_cells.at(seq_to_stream[seq_id]);
 
+            // [TAG_INKLING_DSPARK] shared mask rows: every query of the sequence uses the row of its first token
+            const uint32_t iq = args.block_uniform ? seq_first[seq_id] : i;
+
                   llama_pos p0 = -1;
-            const llama_pos p1 = ubatch->pos[i];
+            const llama_pos p1 = ubatch->pos[iq];
 
             // for M-RoPE
-            const llama_pos p1_x = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
-            const llama_pos p1_y = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
+            const llama_pos p1_x = is_2d ? ubatch->pos[iq + ubatch->n_tokens*2] : 0;
+            const llama_pos p1_y = is_2d ? ubatch->pos[iq + ubatch->n_tokens]   : 0;
 
             const uint64_t idst = n_kv*(i - args.i_tok0);
 
@@ -2137,7 +2148,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 }
 
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t kv_off,
-        uint32_t i_tok0, uint32_t n_tok) const {
+        uint32_t i_tok0, uint32_t n_tok, bool block_uniform) const {
     // [TAG_SHARED_PASS] a window of the ubatch, or all of it
     GGML_ASSERT(i_tok0 + n_tok <= ubatch->n_tokens);
     const uint32_t n_tokens = n_tok > 0 ? n_tok : ubatch->n_tokens;
@@ -2175,6 +2186,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_tps            =*/ n_tps,
         /*.kv_off           =*/ kv_off,
         /*.i_tok0           =*/ n_tok > 0 ? i_tok0 : 0,
+        /*.block_uniform    =*/ block_uniform,
     };
 
     if (dst->type == GGML_TYPE_F16) {
@@ -3381,8 +3393,8 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
 }
 
-void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv->set_input_kq_mask(dst, ubatch, causal_attn, kv_off);
+void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, bool block_uniform) const {
+    kv->set_input_kq_mask(dst, ubatch, causal_attn, kv_off, 0, 0, block_uniform);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
