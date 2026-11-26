@@ -4,6 +4,7 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>

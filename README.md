@@ -20,7 +20,7 @@ formats) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
 - **Fast Multi-token prediction.** The model's own MTP head drafts tokens
   ahead. When an answer repeats text from the prompt, as code edits do, n-gram
   drafting copies it up to 5x faster.
-  DFlash2 and DSpine drafters are supported too. [More](#other-cards)
+  DFlash2, DSpine and Inkling 2's DSpark drafters are supported too. [More](#other-cards)
 
 - **Prompts on the matrix cores.** Prompt processing runs on RDNA3's WMMA units
   through [rocm_wmma_gemm](https://github.com/adelj88/rocm_wmma_gemm) by Adel
@@ -250,14 +250,18 @@ switch in [Environment variables](docs/FLAGS.md#environment-variables).
   their scales once per tile. Both come from rdna-boosts; they build for
   gfx1201 and the attention passes against the CPU when forced on the RX 7900
   XT, but neither has run on an RDNA4 card here.
-- **Cards with 24 GB or more: DFlash2 and DSpine.** A block drafter (`-md`,
+- **Cards with 24 GB or more: DFlash2, DSpine and DSpark.** A block drafter (`-md`,
   e.g. the Qwen3.8-27B DFlash2 GGUF, Q8_0 2.06 GB) drafts a whole block of
   tokens per pass, for about 3-5 GB of memory on top of the model. On the
   RX 7900 XT at 8k, one slot (1.1 GB still paged out), DFlash2: code 76 t/s
   median, 95 peak (MTP + n-gram at 32k: 76, 86), prose 43 (MTP 51). MTP stays
   the default; DFlash2 is for code-heavy work on a bigger card. Tencent's
   DSpine drafter for Qwen3.8-27B loads the same way: on the CPU it accepts as
-  many tokens per pass as DFlash2; it has not run on a GPU yet.
+  many tokens per pass as DFlash2; it has not run on a GPU yet. Inkling 2
+  Mini's own DSpark drafter (`--spec-type draft-dspark`, 737 MB, 1.6 GB more
+  VRAM) raises greedy answers from 54 to 67 t/s at 16k with one slot (code 74,
+  prose 57), and to 59 at temperature 1 with probabilistic drafting; with two
+  requests at once it is slower than none.
   [Flags](docs/FLAGS.md#block-drafters)
 - **Settings.** `-c`, `-ub 2048` and the VRAM split in this README are sized
   for 20 GB of VRAM. The speed tables are for the RX 7900 XT.
