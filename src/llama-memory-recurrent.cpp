@@ -748,7 +748,14 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 
             std::swap(dst_cell.pos, src_cell.pos);
             std::swap(dst_cell.src, src_cell.src);
+            std::swap(dst_cell.rs_max, src_cell.rs_max);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
+            // vanilla d35dc4d9e (#31656): the rollback depth moves with the sequence; on the snapshot path the
+            // cell moved out gets only its final state copied, its snapshots stay behind. [TAG_RS_REPLAY] reaches
+            // back through row_w of the source row, which moves with cell.src
+            if (!rs_replay) {
+                src_cell.rs_max = 0;
+            }
 
             // swap tails
             for (uint32_t j = 0; j < size; ++j) {

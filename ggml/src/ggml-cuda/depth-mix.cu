@@ -11,7 +11,7 @@
 
 #define DEPTH_MIX_BLOCK 1024
 #define DEPTH_MIX_MAX_N 32
-#define DEPTH_MIX_MAX_NQ 3
+#define DEPTH_MIX_MAX_NQ 4 // [TAG_INKLING_FUSIONS] 4: Inkling 2's loop messages (Q, K, V, FFN)
 #define DEPTH_MIX_MAX_NCOLS 8192
 
 struct depth_mix_params {
@@ -575,6 +575,7 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
         case 1: ggml_cuda_kernel_launch(depth_mix_f32<1>, launch_params, p); break;
         case 2: ggml_cuda_kernel_launch(depth_mix_f32<2>, launch_params, p); break;
         case 3: ggml_cuda_kernel_launch(depth_mix_f32<3>, launch_params, p); break;
+        case 4: ggml_cuda_kernel_launch(depth_mix_f32<4>, launch_params, p); break;
         default: GGML_ABORT("fatal error");
     }
 

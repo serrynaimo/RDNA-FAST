@@ -274,8 +274,9 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
 
     // [TAG_SHARED_PASS] with n_tok > 0 the mask covers the n_tok tokens from i_tok0 on, dst is [n_kv, n_tok]
+    // [TAG_INKLING_DSPARK] block_uniform: every token of a sequence takes the mask row of its first token
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t kv_off = 0,
-                              uint32_t i_tok0 = 0, uint32_t n_tok = 0) const;
+                              uint32_t i_tok0 = 0, uint32_t n_tok = 0, bool block_uniform = false) const;
     // [TAG_KV_LANES] kv_off: the first cell of the attended range
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t kv_off = 0) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent, uint32_t kv_off = 0,
@@ -507,7 +508,7 @@ public:
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, bool block_uniform = false) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
 

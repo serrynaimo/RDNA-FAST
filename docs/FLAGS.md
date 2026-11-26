@@ -45,8 +45,9 @@ Beyond the ones in the quick start:
 
 ## Block drafters
 
-For cards with 24 GB or more, instead of MTP: a separate small model drafts a whole block of tokens per pass. Both
-kinds run with `-md FILE --spec-type draft-dflash`; which one a file is, the server reads from the GGUF. The drafter
+For cards with 24 GB or more, instead of MTP: a separate small model drafts a whole block of tokens per pass. DFlash2
+and DSpine run with `-md FILE --spec-type draft-dflash`; which one a file is, the server reads from the GGUF. Inkling 2
+Mini's DSpark runs with `-md FILE --spec-type draft-dspark`. The drafter
 sees the main model's context through a sliding window, so its cache stays at 80-200 MiB at any context length. Its
 VRAM goes to its weights (~2 GB) and to a compute buffer for full-vocabulary scores: ~2 GB at the default draft batch,
 ~250 MiB with `--spec-draft-n-ubatch 256`. Above temperature 0, `--spec-draft-sampling probabilistic` samples the draft
@@ -56,6 +57,7 @@ and has the main model verify it by rejection sampling.
 |---|---|---|---|
 | DFlash2, e.g. Anbeeld/Qwen3.8-27B-DFlash2-GGUF (Q8_0, 2.06 GB) | `--spec-draft-n-max 7` | a block-diffusion drafter: a block of 8 positions in one pass, then the best chain through each position's candidates; a 2,048-token window | code-heavy work: at 8k with one slot, code 76 t/s median and 95 peak (MTP + n-gram at 32k: 76, 86), prose 43 (MTP 51) |
 | DSpine, tencent/Qwen3.8-27B-DSpine-b16 (Q8_0, 2.16 GB) | `--spec-draft-n-max 15` | DFlash with a code bridge: a block of 16 positions, each passing a code of its predicted token to the next, and the candidates rescored against the position before; an 8,192-token window. Convert with `convert_hf_to_gguf.py DIR --target-model-dir QWEN3.8-27B-DIR --outtype q8_0` (the target's json and tokenizer files are enough) | on the CPU, with the stock Qwen3.8-27B and Swift 1.5: as many accepted tokens per pass as DFlash2 (more on math, fewer on lists), drafting twice as many; at temperature 0 the output is identical to the main model alone. Not run on a GPU yet |
+| DSpark for Inkling 2 Mini, made from thinkingmachines/Inkling-2-Mini's `mtp.safetensors` (BF16, 737 MB) | `--spec-type draft-dspark --spec-draft-n-max 3` | a 3-layer block drafter with a recurrent Markov head: a block of 8 positions per pass from the main model's layers 5, 23 and 41 and its final norm, each drafted token feeding the next one's Markov state; a 1,024-token window. Convert with `convert_hf_to_gguf.py INKLING-2-MINI-DIR --dspark --outtype bf16` (it reads `mtp.safetensors` plus the main model's lm head and embedding norm) | one request at a time: on the RX 7900 XT at 16k with one slot, greedy answers 67-71 t/s mean (code 74-77, prose 57-60, explanation 71-75) instead of 54 without it; at temperature 1 with `--spec-draft-sampling probabilistic` 59. It needs 1.6 GB more VRAM, so 128k with two slots does not fit in 20 GB. With two requests at once it is 16% slower than no drafter |
 
 ## Expert handoff
 

@@ -274,6 +274,16 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     ggml_tensor * scores = ggml_mul_mat(ctx0, all.states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
+    // [TAG_INKLING_FUSIONS] the loop-message mixes (4 queries) of a prompt batch in vanilla 396ed2cce's order (the scores
+    // as src0, n_embd the long dimension); decode and drafts (up to 32 tokens) and the mixes of 1-3 queries keep the form
+    // of the depth-mix fusion. RX 7900 XT, prod shape (2026-11-25 windows w1 + mix2): prompts 4k / 15k +1.8 / +1.3% over
+    // all unfused, +1.1 / +1.2% over fused prompts; every mix in vanilla's order on prompts +0.5%; answers level; KLD
+    // identical (0.011361)
+    if (query->ne[1] > 3 && n_tokens > 32) {
+        ggml_tensor * out = ggml_mul_mat(ctx0, scores, all.states_t); // [n_queries, n_embd, n_tokens]
+        return ggml_cont(ctx0, ggml_permute(ctx0, out, 1, 0, 2, 3));  // [n_embd, n_queries, n_tokens]
+    }
+
     return ggml_mul_mat(ctx0, all.states_t, scores);
 }
 
@@ -570,6 +580,9 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
     cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model.output_res_query), n_embd, n_tokens);
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
+    // DSpark target features: the last one is the final norm output of every token
+    res->t_layer_inp[n_layer] = cur;
+
     if (inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
@@ -600,6 +613,8 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
 
     std::vector<ggml_tensor *> blocks;
     for (int il = 0; il < n_layer; ++il) {
+        // DSpark target features: the partial block at the layer input
+        res->t_layer_inp[il] = cur;
         cur = build_layer(il, il, cur, blocks);
     }
 

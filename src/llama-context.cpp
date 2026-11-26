@@ -3354,12 +3354,15 @@ ggml_status llama_context::graph_compute(
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
+    decltype(ggml_threadpool_pause) * pause_fn = nullptr;
+
     if (backend_cpu != nullptr) {
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
         auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
         if (set_threadpool_fn) {
             set_threadpool_fn(backend_cpu, tp);
         }
+        pause_fn = (decltype(ggml_threadpool_pause) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_pause");
     }
 
     // set the number of threads for all the backends
@@ -3388,6 +3391,11 @@ ggml_status llama_context::graph_compute(
 
     if (expert_handoff) {
         expert_handoff->uploads_end(sched.get());
+    }
+
+    // stop polling while the other backends wrap up
+    if (tp != nullptr && pause_fn != nullptr && ggml_backend_sched_get_n_splits(sched.get()) > 1) {
+        pause_fn(tp);
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
